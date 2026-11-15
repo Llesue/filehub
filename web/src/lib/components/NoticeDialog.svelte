@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { language, t } from '../i18n';
   import { clearNotice, notice } from '../notices';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
@@ -32,17 +33,26 @@
     >
       <header>
         <strong>{$notice.title}</strong>
-        <button type="button" class="icon-button" aria-label="关闭" onclick={clearNotice}>
+        <button
+          type="button"
+          class="icon-button"
+          aria-label={t($language, '关闭')}
+          onclick={clearNotice}
+        >
           <Icon name="close" size={18} />
         </button>
       </header>
       <p>{$notice.message}</p>
       <footer>
         {#if $notice.action}
-          <button type="button" class="secondary" onclick={clearNotice}>取消</button>
-          <button type="button" onclick={runAction}>{$notice.actionLabel ?? '确定'}</button>
+          <button type="button" class="secondary" onclick={clearNotice}
+            >{t($language, '取消')}</button
+          >
+          <button type="button" onclick={runAction}
+            >{$notice.actionLabel ?? t($language, '确定')}</button
+          >
         {:else}
-          <button type="button" onclick={clearNotice}>知道了</button>
+          <button type="button" onclick={clearNotice}>{t($language, '知道了')}</button>
         {/if}
       </footer>
     </section>

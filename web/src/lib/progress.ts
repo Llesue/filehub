@@ -1,4 +1,5 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
+import { language, t } from './i18n';
 
 export type ProgressStatus = 'running' | 'done' | 'error';
 
@@ -30,7 +31,7 @@ export function updateProgress(current: number, detail = ''): void {
   progress.update((value) => ({ ...value, current, detail }));
 }
 
-export function finishProgress(detail = '完成'): void {
+export function finishProgress(detail = t(get(language), '完成')): void {
   progress.update((value) => ({ ...value, current: value.total, detail, status: 'done' }));
   setTimeout(() => progress.set(initial), 1800);
 }

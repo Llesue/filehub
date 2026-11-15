@@ -1,4 +1,5 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
+import { language, t } from './i18n';
 
 export type NoticeKind = 'error' | 'warning' | 'info';
 
@@ -12,7 +13,11 @@ export interface Notice {
 
 export const notice = writable<Notice | null>(null);
 
-export function showNotice(message: string, kind: NoticeKind = 'error', title = '操作失败'): void {
+export function showNotice(
+  message: string,
+  kind: NoticeKind = 'error',
+  title = t(get(language), '操作失败'),
+): void {
   notice.set({ title, message, kind });
 }
 

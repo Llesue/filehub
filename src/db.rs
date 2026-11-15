@@ -654,7 +654,7 @@ impl Db {
                 .optional()?;
             Ok(preferences.unwrap_or_else(|| UserPreferences {
                 theme: "light".to_owned(),
-                language: "zh-CN".to_owned(),
+                language: "en".to_owned(),
                 show_hidden: true,
                 show_thumbnails: true,
                 upload_conflict: "rename".to_owned(),

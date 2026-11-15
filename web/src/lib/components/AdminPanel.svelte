@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import Icon from './Icon.svelte';
+  import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
   import NameDialog from './NameDialog.svelte';
   import {
@@ -97,7 +98,7 @@
     const raw = quotaDrafts[user.id] ?? '';
     const quota = Number(raw);
     if (raw.trim() !== '' && (!Number.isFinite(quota) || quota < 0)) {
-      showNotice('配额必须是非负数字', 'warning', '输入错误');
+      showNotice(t($language, '配额必须是非负数字'), 'warning', t($language, '输入错误'));
       return;
     }
     try {
@@ -162,8 +163,8 @@
     if (selectedUserId === null) return;
     const userId = selectedUserId;
     confirm = {
-      title: '移除存储目录',
-      message: `删除「${root.alias}」？用户将无法再访问该目录。`,
+      title: t($language, '移除存储目录'),
+      message: t($language, '删除「{alias}」？用户将无法再访问该目录。', { alias: root.alias }),
       action: () => {
         void (async () => {
           try {
@@ -190,8 +191,8 @@
 
   function askDeleteServerPath(path: ServerPath): void {
     confirm = {
-      title: '删除存储目录',
-      message: `删除「${path.alias}」？必须先移除所有用户授权。`,
+      title: t($language, '删除存储目录'),
+      message: t($language, '删除「{alias}」？必须先移除所有用户授权。', { alias: path.alias }),
       action: () => {
         void (async () => {
           try {
@@ -232,48 +233,54 @@
   }
 
   function messageOf(err: unknown): string {
-    return err instanceof Error ? err.message : '操作失败';
+    return err instanceof Error ? err.message : t($language, '操作失败');
   }
 </script>
 
 <section class="admin-page" aria-labelledby="admin-title">
   <header class="admin-header">
     <div>
-      <h1 id="admin-title">管理</h1>
-      <span>用户、存储目录、审计与系统设置</span>
+      <h1 id="admin-title">{t($language, '管理')}</h1>
+      <span>{t($language, '用户、存储目录、审计与系统设置')}</span>
     </div>
     <Icon name="shield" size={24} />
   </header>
 
-  <nav class="tabs" aria-label="管理分类">
+  <nav class="tabs" aria-label={t($language, '管理分类')}>
     <button type="button" class:active={tab === 'users'} onclick={() => (tab = 'users')}
-      >用户</button
+      >{t($language, '用户')}</button
     >
     <button type="button" class:active={tab === 'paths'} onclick={() => (tab = 'paths')}
-      >存储目录</button
+      >{t($language, '存储目录')}</button
     >
     <button type="button" class:active={tab === 'audit'} onclick={() => (tab = 'audit')}
-      >审计日志</button
+      >{t($language, '审计日志')}</button
     >
     <button type="button" class:active={tab === 'settings'} onclick={() => (tab = 'settings')}
-      >系统设置</button
+      >{t($language, '系统设置')}</button
     >
   </nav>
 
   <div class="admin-body">
     {#if tab === 'users'}
       <section class="admin-block">
-        <h2>新建用户</h2>
+        <h2>{t($language, '新建用户')}</h2>
         <div class="form-row">
-          <input bind:value={newUsername} placeholder="用户名" />
-          <input bind:value={newPassword} type="password" placeholder="密码（至少 10 位）" />
-          <input bind:value={newQuota} placeholder="配额字节，空=不限制" />
-          <button type="button" disabled={busy} onclick={() => void createUser()}>创建</button>
+          <input bind:value={newUsername} placeholder={t($language, '用户名')} />
+          <input
+            bind:value={newPassword}
+            type="password"
+            placeholder={t($language, '密码（至少 10 位）')}
+          />
+          <input bind:value={newQuota} placeholder={t($language, '配额字节，空=不限制')} />
+          <button type="button" disabled={busy} onclick={() => void createUser()}
+            >{t($language, '创建')}</button
+          >
         </div>
       </section>
 
       <section class="admin-block">
-        <h2>用户列表</h2>
+        <h2>{t($language, '用户列表')}</h2>
         <div class="user-list">
           {#each users as user (user.id)}
             <div class="user-row">
@@ -283,30 +290,30 @@
               <select
                 class="role-select"
                 value={user.role}
-                aria-label={`${user.username} 角色`}
+                aria-label={t($language, '{username} 角色', { username: user.username })}
                 onchange={(event) =>
                   void setRole(user, (event.currentTarget as HTMLSelectElement).value)}
               >
-                <option value="user">用户</option>
-                <option value="admin">管理员</option>
+                <option value="user">{t($language, '用户')}</option>
+                <option value="admin">{t($language, '管理员')}</option>
               </select>
               <span class:disabled={user.disabled} class="status"
-                >{user.disabled ? '已禁用' : '正常'}</span
+                >{user.disabled ? t($language, '已禁用') : t($language, '正常')}</span
               >
               <button type="button" class="small" onclick={() => (passwordTarget = user)}
-                >重置密码</button
+                >{t($language, '重置密码')}</button
               >
               <input
                 class="quota-input"
                 bind:value={quotaDrafts[user.id]}
-                placeholder="不限制"
-                aria-label={`${user.username} 配额`}
+                placeholder={t($language, '不限制')}
+                aria-label={t($language, '{username} 配额', { username: user.username })}
               />
               <button type="button" class="small" onclick={() => void saveQuota(user)}
-                >保存配额</button
+                >{t($language, '保存配额')}</button
               >
               <button type="button" class="small" onclick={() => void toggleDisabled(user)}>
-                {user.disabled ? '启用' : '禁用'}
+                {user.disabled ? t($language, '启用') : t($language, '禁用')}
               </button>
             </div>
           {/each}
@@ -315,29 +322,31 @@
 
       {#if selectedUserId !== null}
         <section class="admin-block">
-          <h2>分配存储目录</h2>
+          <h2>{t($language, '分配存储目录')}</h2>
           <div class="form-row">
             <select bind:value={rootPath}>
-              <option value="">选择存储目录</option>
+              <option value="">{t($language, '选择存储目录')}</option>
               {#each serverPaths as path (path.id)}
                 <option value={path.real_path}>{path.alias} — {path.real_path}</option>
               {/each}
             </select>
-            <input bind:value={rootAlias} placeholder="用户显示名" />
-            <select bind:value={rootReadOnly} aria-label="权限">
-              <option value={false}>读写</option>
-              <option value={true}>只读</option>
+            <input bind:value={rootAlias} placeholder={t($language, '用户显示名')} />
+            <select bind:value={rootReadOnly} aria-label={t($language, '权限')}>
+              <option value={false}>{t($language, '读写')}</option>
+              <option value={true}>{t($language, '只读')}</option>
             </select>
-            <button type="button" onclick={() => void addRoot()}>添加</button>
+            <button type="button" onclick={() => void addRoot()}>{t($language, '添加')}</button>
           </div>
           <div class="user-list">
             {#each roots as root (root.id)}
               <div class="user-row">
                 <span class="mono">{root.alias}</span>
                 <span class="mono path">{root.real_path}</span>
-                <span class="pill">{root.read_only ? '只读' : '读写'}</span>
+                <span class="pill"
+                  >{root.read_only ? t($language, '只读') : t($language, '读写')}</span
+                >
                 <button type="button" class="small danger" onclick={() => askDeleteRoot(root)}
-                  >删除</button
+                  >{t($language, '删除')}</button
                 >
               </div>
             {/each}
@@ -346,15 +355,20 @@
       {/if}
     {:else if tab === 'paths'}
       <section class="admin-block">
-        <h2>存储目录</h2>
+        <h2>{t($language, '存储目录')}</h2>
         <p class="muted">
-          先登记服务器上已经存在且可读的存储目录（例如 /mnt/red →
-          红盘），再到用户页分配。目录不存在时请先在服务器上创建或挂载。
+          {t(
+            $language,
+            '先登记服务器上已经存在且可读的存储目录（例如 /mnt/red → 红盘），再到用户页分配。目录不存在时请先在服务器上创建或挂载。',
+          )}
         </p>
         <div class="form-row">
-          <input bind:value={serverPathReal} placeholder="目录路径，例如 /mnt/red" />
-          <input bind:value={serverPathAlias} placeholder="别名，例如 红盘" />
-          <button type="button" onclick={() => void addServerPath()}>添加</button>
+          <input
+            bind:value={serverPathReal}
+            placeholder={t($language, '目录路径，例如 /mnt/red')}
+          />
+          <input bind:value={serverPathAlias} placeholder={t($language, '别名，例如 红盘')} />
+          <button type="button" onclick={() => void addServerPath()}>{t($language, '添加')}</button>
         </div>
         <div class="user-list">
           {#each serverPaths as path (path.id)}
@@ -362,7 +376,7 @@
               <span class="mono">{path.alias}</span>
               <span class="mono path">{path.real_path}</span>
               <button type="button" class="small danger" onclick={() => askDeleteServerPath(path)}
-                >删除</button
+                >{t($language, '删除')}</button
               >
             </div>
           {/each}
@@ -370,12 +384,12 @@
       </section>
     {:else if tab === 'audit'}
       <section class="admin-block">
-        <h2>最近操作</h2>
+        <h2>{t($language, '最近操作')}</h2>
         <div class="audit-list">
           {#each audit as entry (entry.id)}
             <div class="audit-row">
               <span class="audit-time"
-                >{new Date(entry.created_at * 1000).toLocaleString('zh-CN')}</span
+                >{new Date(entry.created_at * 1000).toLocaleString(localeOf($language))}</span
               >
               <span class="audit-user">{entry.username ?? '—'}</span>
               <span class="pill">{entry.action}</span>
@@ -384,11 +398,11 @@
             </div>
           {/each}
         </div>
-        {#if audit.length === 0}<p class="muted">暂无审计记录。</p>{/if}
+        {#if audit.length === 0}<p class="muted">{t($language, '暂无审计记录。')}</p>{/if}
       </section>
     {:else if tab === 'settings'}
       <section class="admin-block">
-        <h2>开关</h2>
+        <h2>{t($language, '开关')}</h2>
         {#each ['thumbnails.enabled', 'editor.enabled'] as key (key)}
           <div class="setting-row">
             <span class="mono">{key}</span>
@@ -399,16 +413,16 @@
               class="toggle"
               onclick={() => void toggleSetting(key, Boolean(settingValue(key)))}
             >
-              {settingValue(key) ? '已开启' : '已关闭'}
+              {settingValue(key) ? t($language, '已开启') : t($language, '已关闭')}
             </button>
             <button type="button" class="small" onclick={() => void resetSetting(key)}
-              >清除覆盖</button
+              >{t($language, '清除覆盖')}</button
             >
           </div>
         {/each}
       </section>
       <section class="admin-block">
-        <h2>全部生效配置</h2>
+        <h2>{t($language, '全部生效配置')}</h2>
         <pre>{JSON.stringify(settings?.settings ?? {}, null, 2)}</pre>
       </section>
     {/if}
@@ -416,10 +430,10 @@
   {#if passwordTarget}
     <NameDialog
       open
-      title="重置密码"
-      label={`${passwordTarget.username} 的新密码`}
+      title={t($language, '重置密码')}
+      label={t($language, '{username} 的新密码', { username: passwordTarget.username })}
       inputType="password"
-      confirmLabel="更新"
+      confirmLabel={t($language, '更新')}
       onConfirm={(value) => void resetPassword(value)}
       onClose={() => (passwordTarget = null)}
     />
@@ -429,7 +443,7 @@
     open={confirm !== null}
     title={confirm?.title ?? ''}
     message={confirm?.message ?? ''}
-    confirmLabel="删除"
+    confirmLabel={t($language, '删除')}
     danger
     onConfirm={() => {
       confirm?.action();

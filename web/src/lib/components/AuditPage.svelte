@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type AuditEntry } from '../api';
+  import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
   import Icon from './Icon.svelte';
 
@@ -19,7 +20,7 @@
       entries = cursor ? [...entries, ...result.entries] : result.entries;
       nextCursor = result.next_cursor;
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '审计日志加载失败');
+      showNotice(error instanceof Error ? error.message : t($language, '审计日志加载失败'));
     } finally {
       loading = false;
       loadingMore = false;
@@ -37,21 +38,21 @@
   });
 
   function date(value: number): string {
-    return new Date(value * 1000).toLocaleString('zh-CN');
+    return new Date(value * 1000).toLocaleString(localeOf($language));
   }
 </script>
 
 <section class="audit-page">
   <header class="audit-header">
     <div>
-      <h1>审计日志</h1>
-      <p>操作记录，滚动自动加载</p>
+      <h1>{t($language, '审计日志')}</h1>
+      <p>{t($language, '操作记录，滚动自动加载')}</p>
     </div>
     <button type="button" class="back" onclick={onBack}
-      ><Icon name="close" size={16} />返回管理</button
+      ><Icon name="close" size={16} />{t($language, '返回管理')}</button
     >
   </header>
-  {#if loading}<p class="muted">加载中…</p>{:else}
+  {#if loading}<p class="muted">{t($language, '加载中…')}</p>{:else}
     <div class="audit-list">
       {#each entries as entry (entry.id)}
         <div class="audit-row">
@@ -62,10 +63,10 @@
           <span class="path">{entry.path ?? ''}</span>
           <span class="detail">{entry.detail ?? ''}</span>
         </div>
-      {:else}<p class="muted">暂无记录。</p>{/each}
+      {:else}<p class="muted">{t($language, '暂无记录。')}</p>{/each}
     </div>
     <div bind:this={sentinel} class="sentinel">
-      {loadingMore ? '加载中…' : nextCursor ? '继续滚动加载' : ''}
+      {loadingMore ? t($language, '加载中…') : nextCursor ? t($language, '继续滚动加载') : ''}
     </div>
   {/if}
 </section>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, type Root, type User, type UserPreferences } from '../api';
-  import type { Lang } from '../i18n';
+  import { language, t, type Lang } from '../i18n';
   import { showNotice } from '../notices';
   import AvatarCropper from './AvatarCropper.svelte';
   import CssPickerDialog from './CssPickerDialog.svelte';
@@ -35,7 +35,7 @@
       const result = await api.updatePreferences(patch, csrf);
       onPreferences(result.preferences);
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '偏好保存失败');
+      showNotice(error instanceof Error ? error.message : t($language, '偏好保存失败'));
     } finally {
       saving = false;
     }
@@ -54,7 +54,7 @@
       const result = await api.uploadAvatar(blob, csrf);
       onPreferences(result.preferences);
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '头像上传失败');
+      showNotice(error instanceof Error ? error.message : t($language, '头像上传失败'));
     } finally {
       avatarCropSrc = '';
     }
@@ -62,25 +62,25 @@
 
   async function changePassword(current: string, next: string): Promise<void> {
     await api.changePassword(current, next, csrf);
-    showNotice('密码已更新', 'info', '修改成功');
+    showNotice(t($language, '密码已更新'), 'info', t($language, '修改成功'));
   }
 </script>
 
 <section class="preferences-page">
   <header class="page-header">
     <div>
-      <h1>偏好设置</h1>
-      <p>账号、外观和文件浏览行为，修改后即时保存。</p>
+      <h1>{t($language, '偏好设置')}</h1>
+      <p>{t($language, '账号、外观和文件浏览行为，修改后即时保存。')}</p>
     </div>
     <Icon name="settings" size={24} />
   </header>
 
   <section class="pref-card">
-    <h2>账号</h2>
+    <h2>{t($language, '账号')}</h2>
     <div class="profile-row">
       <button type="button" class="avatar-button" onclick={() => avatarInput?.click()}>
         {#if preferences.avatar_version > 0}
-          <img src={api.avatarUrl(preferences.avatar_version)} alt="头像" />
+          <img src={api.avatarUrl(preferences.avatar_version)} alt={t($language, '头像')} />
         {:else}
           {user.username.slice(0, 1).toUpperCase()}
         {/if}
@@ -88,7 +88,9 @@
       </button>
       <div class="profile-info">
         <strong>{user.username}</strong>
-        <button type="button" class="link" onclick={() => (passwordOpen = true)}>修改密码</button>
+        <button type="button" class="link" onclick={() => (passwordOpen = true)}
+          >{t($language, '修改密码')}</button
+        >
       </div>
       <input
         bind:this={avatarInput}
@@ -101,9 +103,9 @@
   </section>
 
   <section class="pref-card">
-    <h2>外观</h2>
+    <h2>{t($language, '外观')}</h2>
     <label class="pref-row">
-      <span>主题</span>
+      <span>{t($language, '主题')}</span>
       <select
         value={preferences.theme}
         onchange={(event) =>
@@ -111,23 +113,23 @@
             theme: (event.currentTarget as HTMLSelectElement).value as 'light' | 'dark',
           })}
       >
-        <option value="light">浅色</option>
-        <option value="dark">深色</option>
+        <option value="light">{t($language, '浅色')}</option>
+        <option value="dark">{t($language, '深色')}</option>
       </select>
     </label>
     <label class="pref-row">
-      <span>语言</span>
+      <span>{t($language, '语言')}</span>
       <select
         value={preferences.language}
         onchange={(event) =>
           void persist({ language: (event.currentTarget as HTMLSelectElement).value as Lang })}
       >
-        <option value="zh-CN">中文</option>
+        <option value="zh-CN">{t($language, '中文')}</option>
         <option value="en">English</option>
       </select>
     </label>
     <div class="pref-row">
-      <span>启用文本文件编辑</span>
+      <span>{t($language, '启用文本文件编辑')}</span>
       <input
         type="checkbox"
         checked={preferences.editor_enabled}
@@ -135,9 +137,11 @@
         onchange={(event) => void persist({ editor_enabled: event.currentTarget.checked })}
       />
     </div>
-    {#if !system.editor}<p class="system-off">系统设置已关闭文本编辑功能。</p>{/if}
+    {#if !system.editor}<p class="system-off">
+        {t($language, '系统设置已关闭文本编辑功能。')}
+      </p>{/if}
     <div class="pref-row">
-      <span>启用终端</span>
+      <span>{t($language, '启用终端')}</span>
       <input
         type="checkbox"
         checked={preferences.terminal_enabled}
@@ -145,19 +149,19 @@
         onchange={(event) => void persist({ terminal_enabled: event.currentTarget.checked })}
       />
     </div>
-    {#if !system.terminal}<p class="system-off">系统设置已关闭终端功能。</p>{/if}
+    {#if !system.terminal}<p class="system-off">{t($language, '系统设置已关闭终端功能。')}</p>{/if}
     <div class="pref-row">
-      <span>自定义 CSS</span>
+      <span>{t($language, '自定义 CSS')}</span>
       <div class="inline-actions">
-        <span class="path">{preferences.custom_css_path ?? '未选择'}</span>
+        <span class="path">{preferences.custom_css_path ?? t($language, '未选择')}</span>
         <button type="button" class="small" onclick={() => (cssOpen = true)}>
-          {preferences.custom_css_path ? '更换' : '选择文件'}
+          {preferences.custom_css_path ? t($language, '更换') : t($language, '选择文件')}
         </button>
         {#if preferences.custom_css_path}
           <button
             type="button"
             class="small ghost"
-            onclick={() => void persist({ clear_custom_css: true })}>清除</button
+            onclick={() => void persist({ clear_custom_css: true })}>{t($language, '清除')}</button
           >
         {/if}
       </div>
@@ -165,9 +169,9 @@
   </section>
 
   <section class="pref-card">
-    <h2>文件浏览</h2>
+    <h2>{t($language, '文件浏览')}</h2>
     <label class="pref-row">
-      <span>显示隐藏文件</span>
+      <span>{t($language, '显示隐藏文件')}</span>
       <input
         type="checkbox"
         checked={preferences.show_hidden}
@@ -175,7 +179,7 @@
       />
     </label>
     <div class="pref-row">
-      <span>显示缩略图</span>
+      <span>{t($language, '显示缩略图')}</span>
       <input
         type="checkbox"
         checked={preferences.show_thumbnails}
@@ -183,9 +187,11 @@
         onchange={(event) => void persist({ show_thumbnails: event.currentTarget.checked })}
       />
     </div>
-    {#if !system.thumbnails}<p class="system-off">系统设置已关闭缩略图功能。</p>{/if}
+    {#if !system.thumbnails}<p class="system-off">
+        {t($language, '系统设置已关闭缩略图功能。')}
+      </p>{/if}
     <label class="pref-row">
-      <span>上传同名文件</span>
+      <span>{t($language, '上传同名文件')}</span>
       <select
         value={preferences.upload_conflict}
         onchange={(event) =>
@@ -194,14 +200,14 @@
               'rename' | 'overwrite' | 'skip',
           })}
       >
-        <option value="rename">自动重命名</option>
-        <option value="overwrite">覆盖</option>
-        <option value="skip">跳过</option>
+        <option value="rename">{t($language, '自动重命名')}</option>
+        <option value="overwrite">{t($language, '覆盖')}</option>
+        <option value="skip">{t($language, '跳过')}</option>
       </select>
     </label>
   </section>
 
-  {#if saving}<p class="saving">保存中…</p>{/if}
+  {#if saving}<p class="saving">{t($language, '保存中…')}</p>{/if}
 </section>
 
 <PasswordDialog
@@ -281,6 +287,8 @@
     flex: 0 0 auto;
     place-items: center;
     overflow: hidden;
+    padding: 0;
+    box-sizing: border-box;
     border: 1px solid var(--border);
     border-radius: 50%;
     background: var(--accent-soft);
@@ -289,6 +297,7 @@
     font-weight: 600;
   }
   .avatar-button img {
+    display: block;
     width: 100%;
     height: 100%;
     object-fit: cover;

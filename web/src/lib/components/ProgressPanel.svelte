@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { language, t } from '../i18n';
   import { progress } from '../progress';
 
   let percentage = $derived(
@@ -14,15 +15,15 @@
       <strong>{$progress.title}</strong>
       <span
         >{$progress.status === 'done'
-          ? '完成'
+          ? t($language, '完成')
           : $progress.status === 'error'
-            ? '失败'
+            ? t($language, '失败')
             : percentage !== null
               ? `${percentage}%`
-              : '处理中'}</span
+              : t($language, '处理中')}</span
       >
     </div>
-    <p>{$progress.detail || '请稍候…'}</p>
+    <p>{$progress.detail || t($language, '请稍候…')}</p>
     <div class="progress-track">
       <div class="progress-fill" style={`width:${percentage ?? 100}%`}></div>
     </div>

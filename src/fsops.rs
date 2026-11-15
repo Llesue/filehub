@@ -1,5 +1,7 @@
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -249,10 +251,15 @@ pub fn finalize_upload(temp: &Path, target: &Path) -> Result<(), AppError> {
         return Err(AppError::conflict("target file already exists"));
     }
 
-    let file = File::open(temp).map_err(io_error)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp)
+        .map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
     std::fs::rename(temp, target).map_err(io_error)?;
 
+    #[cfg(unix)]
     if let Some(parent) = target.parent()
         && let Ok(directory) = File::open(parent)
     {
@@ -278,6 +285,7 @@ pub fn write_text_atomic(path: &Path, contents: &[u8]) -> Result<(), AppError> {
     file.sync_all().map_err(io_error)?;
     drop(file);
     std::fs::rename(&temp, path).map_err(io_error)?;
+    #[cfg(unix)]
     if let Ok(directory) = File::open(parent) {
         directory.sync_all().map_err(io_error)?;
     }

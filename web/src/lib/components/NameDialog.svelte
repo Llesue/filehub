@@ -1,11 +1,13 @@
 <script lang="ts">
+  import { language, t } from '../i18n';
+
   let {
     open,
     title,
     label,
     initialValue = '',
     inputType = 'text',
-    confirmLabel = '确定',
+    confirmLabel,
     onConfirm,
     onClose,
   }: {
@@ -52,8 +54,10 @@
         <input bind:value type={inputType} />
       </label>
       <div class="dialog-actions">
-        <button type="button" class="ghost" onclick={onClose}>取消</button>
-        <button type="submit" disabled={!value.trim()}>{confirmLabel}</button>
+        <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button>
+        <button type="submit" disabled={!value.trim()}
+          >{confirmLabel ?? t($language, '确定')}</button
+        >
       </div>
     </form>
   </div>

@@ -1003,7 +1003,7 @@ async fn create_home_root(
 
     state
         .db
-        .ensure_root(user_id, real_path, "我的文件", false)
+        .ensure_root(user_id, real_path, "My Files", false)
         .await
         .map_err(AppError::internal)?;
     Ok(())

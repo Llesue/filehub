@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type Entry, type Root } from '../api';
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
 
@@ -37,7 +38,7 @@
     try {
       entries = (await api.list(rootId, path, 'name', 'asc', false)).entries;
     } catch (err) {
-      error = err instanceof Error ? err.message : '目录加载失败';
+      error = err instanceof Error ? err.message : t($language, '目录加载失败');
     } finally {
       loading = false;
     }
@@ -58,12 +59,12 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <section
     class="css-picker"
-    aria-label="选择 CSS 文件"
+    aria-label={t($language, '选择 CSS 文件')}
     onclick={(event) => event.stopPropagation()}
   >
     <header>
-      <h2>选择自定义 CSS</h2>
-      <button type="button" class="icon-button" aria-label="关闭" onclick={onClose}
+      <h2>{t($language, '选择自定义 CSS')}</h2>
+      <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}
         ><Icon name="close" size={18} /></button
       >
     </header>
@@ -79,7 +80,9 @@
     </select>
     <div class="crumbs">/{path}</div>
     <div class="picker-list">
-      {#if loading}<p class="muted">加载中…</p>{:else if error}<p class="error">{error}</p>{:else}
+      {#if loading}<p class="muted">{t($language, '加载中…')}</p>{:else if error}<p class="error">
+          {error}
+        </p>{:else}
         {#each entries as entry (entry.name)}
           {#if entry.is_dir || entry.name.toLowerCase().endsWith('.css')}
             <button type="button" class="row" onclick={() => enter(entry)}>

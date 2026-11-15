@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: FileHub API
-  version: 0.1.0
+  version: 0.1.1
   description: FileHub 自托管文件管理器 API。所有业务接口前缀 /api/v1。
 servers:
   - url: /

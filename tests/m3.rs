@@ -367,7 +367,13 @@ async fn server_paths_require_existing_directory_and_support_crud() {
     .await;
     assert_eq!(created.status(), StatusCode::OK);
     let created = json_body(created).await;
-    assert_eq!(created["real_path"], storage.to_string_lossy().as_ref());
+    assert_eq!(
+        created["real_path"],
+        std::fs::canonicalize(&storage)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
 
     let listed = send(
         &app.router,

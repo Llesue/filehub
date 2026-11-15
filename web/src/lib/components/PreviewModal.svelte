@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api, type Entry } from '../api';
   import Icon from './Icon.svelte';
+  import { language, t } from '../i18n';
 
   let {
     root,
@@ -110,12 +111,17 @@
         <button type="button" onclick={() => (zoom = Math.max(0.2, zoom - 0.2))}>−</button>
         <span>{Math.round(zoom * 100)}%</span>
         <button type="button" onclick={() => (zoom = Math.min(8, zoom + 0.2))}>+</button>
-        <button type="button" onclick={() => resetView()}>复位</button>
+        <button type="button" onclick={() => resetView()}>{t($language, '复位')}</button>
         <button type="button" onclick={() => (showOriginal = !showOriginal)}>
-          {showOriginal ? '显示预览图' : '显示原图'}
+          {showOriginal ? t($language, '显示预览图') : t($language, '显示原图')}
         </button>
       {/if}
-      <button type="button" class="icon-button" aria-label="关闭预览" onclick={onClose}>
+      <button
+        type="button"
+        class="icon-button"
+        aria-label={t($language, '关闭预览')}
+        onclick={onClose}
+      >
         <Icon name="close" size={22} />
       </button>
     </div>
@@ -171,9 +177,11 @@
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <footer class="lightbox-footer" onclick={(event) => event.stopPropagation()}>
-    <button type="button" onclick={previous} disabled={index <= 0}>上一项</button>
+    <button type="button" onclick={previous} disabled={index <= 0}>{t($language, '上一项')}</button>
     <span>{index + 1} / {items.length}</span>
-    <button type="button" onclick={next} disabled={index >= items.length - 1}>下一项</button>
+    <button type="button" onclick={next} disabled={index >= items.length - 1}
+      >{t($language, '下一项')}</button
+    >
   </footer>
 </div>
 

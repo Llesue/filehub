@@ -22,7 +22,7 @@
   import AuthScreen from './lib/components/AuthScreen.svelte';
   import SharePage from './lib/components/SharePage.svelte';
   import Icon from './lib/components/Icon.svelte';
-  import { initLanguage, language, setLanguage, t } from './lib/i18n';
+  import { initLanguage, language, localeOf, rootAlias, setLanguage, t } from './lib/i18n';
   import { showNotice, showNoticeAction } from './lib/notices';
   import { failProgress, finishProgress, startProgress, updateProgress } from './lib/progress';
   import {
@@ -132,11 +132,13 @@
       : '—',
   );
   let pageTitle = $derived.by(() => {
-    if (appView === 'shares') return 'FileHub - 分享管理';
-    if (appView === 'settings') return 'FileHub - 设置';
-    if (appView === 'admin') return 'FileHub - 系统管理';
-    if (appView === 'audit') return 'FileHub - 审计日志';
-    const current = pathSegments[pathSegments.length - 1] || activeRoot?.alias;
+    if (appView === 'shares') return t($language, 'FileHub - 分享管理');
+    if (appView === 'settings') return t($language, 'FileHub - 设置');
+    if (appView === 'admin') return t($language, 'FileHub - 系统管理');
+    if (appView === 'audit') return t($language, 'FileHub - 审计日志');
+    const current =
+      pathSegments[pathSegments.length - 1] ||
+      (activeRoot ? rootLabel(activeRoot.alias) : undefined);
     return current ? `FileHub - ${current}` : 'FileHub';
   });
 
@@ -306,7 +308,7 @@
       systemFeatures = result.system;
       applyPreferences(result.preferences);
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '偏好保存失败');
+      showNotice(error instanceof Error ? error.message : t($language, '偏好保存失败'));
     }
   }
 
@@ -339,7 +341,7 @@
       if (!next) {
         activeRootId = null;
         entries = [];
-        filesError = '当前账号还没有可访问的目录';
+        filesError = t($language, '当前账号还没有可访问的目录');
         return;
       }
       await loadList(next.id, '');
@@ -434,9 +436,9 @@
 
   function entrySize(entry: Entry): string {
     if (!entry.is_dir) return formatSize(entry.size);
-    if (activeRootId === null) return '计算中…';
+    if (activeRootId === null) return t($language, '计算中…');
     const size = dirSizes[`${activeRootId}:${joinPath(currentPath, entry.name)}`];
-    return size === undefined ? '计算中…' : size < 0 ? '—' : formatSize(size);
+    return size === undefined ? t($language, '计算中…') : size < 0 ? '—' : formatSize(size);
   }
 
   function handleContentScroll(event: Event): void {
@@ -452,7 +454,7 @@
       csrf = '';
       return;
     }
-    showNotice(error instanceof Error ? error.message : '文件列表加载失败');
+    showNotice(error instanceof Error ? error.message : t($language, '文件列表加载失败'));
   }
 
   async function loadUsage(): Promise<void> {
@@ -556,6 +558,10 @@
     return base ? `${base}/${name}` : name;
   }
 
+  function rootLabel(alias: string): string {
+    return rootAlias($language, alias);
+  }
+
   function enterEntry(entry: Entry): void {
     if (entry.is_dir) {
       navigate(joinPath(currentPath, entry.name));
@@ -573,9 +579,9 @@
 
   function showUnsupported(entry: Entry): void {
     showNoticeAction(
-      `无法在浏览器中预览「${entry.name}」。`,
-      '无法预览',
-      '下载文件',
+      t($language, '无法在浏览器中预览「{name}」。', { name: entry.name }),
+      t($language, '无法预览'),
+      t($language, '下载文件'),
       () => downloadEntry(entry),
       'info',
     );
@@ -630,6 +636,9 @@
     } else if (event.metaKey || event.ctrlKey) {
       toggleSelection(entry.name);
       selectionAnchor = entry.name;
+    } else if (selected.length === 1 && selected[0] === entry.name) {
+      selected = [];
+      selectionAnchor = null;
     } else {
       selected = [entry.name];
       selectionAnchor = entry.name;
@@ -694,8 +703,8 @@
       nameDialog = {
         mode: 'rename',
         entry,
-        title: '重命名',
-        label: '新名称',
+        title: t($language, '重命名'),
+        label: t($language, '新名称'),
         initialValue: entry.name,
       };
     }
@@ -708,8 +717,8 @@
     nameDialog = {
       mode: 'mkdir',
       entry: null,
-      title: '新建目录',
-      label: '目录名称',
+      title: t($language, '新建目录'),
+      label: t($language, '目录名称'),
       initialValue: '',
     };
   }
@@ -757,17 +766,17 @@
     if (!payload) return;
     if (payload.rootId === destRoot && payload.path === destPath) return;
     if (payload.rootId === destRoot && destPath.startsWith(`${payload.path}/`)) {
-      showNotice('不能把目录移动到它自己里面。', 'warning', '移动失败');
+      showNotice(t($language, '不能把目录移动到它自己里面。'), 'warning', t($language, '移动失败'));
       return;
     }
-    startProgress('移动文件', 1, payload.name);
+    startProgress(t($language, '移动文件'), 1, payload.name);
     try {
       await api.transfer('move', payload.rootId, [payload.path], destRoot, destPath, csrf);
-      updateProgress(1, '完成');
+      updateProgress(1, t($language, '完成'));
       finishProgress();
       if (activeRootId !== null) await loadList(activeRootId, currentPath);
     } catch (error) {
-      failProgress(error instanceof Error ? error.message : '移动失败');
+      failProgress(error instanceof Error ? error.message : t($language, '移动失败'));
       handleFilesError(error);
     }
   }
@@ -777,7 +786,10 @@
     transfer = null;
     if (!pending || activeRootId === null) return;
     const rootId = activeRootId;
-    startProgress(pending.mode === 'copy' ? '复制文件' : '移动文件', pending.entries.length);
+    startProgress(
+      pending.mode === 'copy' ? t($language, '复制文件') : t($language, '移动文件'),
+      pending.entries.length,
+    );
     try {
       await api.transfer(
         pending.mode,
@@ -787,11 +799,11 @@
         destPath,
         csrf,
       );
-      updateProgress(pending.entries.length, '完成');
+      updateProgress(pending.entries.length, t($language, '完成'));
       await loadList(rootId, currentPath);
       finishProgress();
     } catch (error) {
-      failProgress(error instanceof Error ? error.message : '操作失败');
+      failProgress(error instanceof Error ? error.message : t($language, '操作失败'));
       handleFilesError(error);
     }
   }
@@ -1000,12 +1012,12 @@
 
     filesError = '';
     uploading = true;
-    startProgress('上传文件', files.length);
+    startProgress(t($language, '上传文件'), files.length);
     try {
       for (const [index, file] of files.entries()) {
         updateProgress(index, file.name);
         if (file.size === 0) {
-          throw new Error(`空文件暂不支持上传：${file.name}`);
+          throw new Error(t($language, '空文件暂不支持上传：{name}', { name: file.name }));
         }
         const relative = preservePaths ? file.webkitRelativePath || file.name : file.name;
         const parts = relative.split('/').filter(Boolean);
@@ -1024,11 +1036,11 @@
         }
         await api.completeUpload(created.upload_id, csrf);
       }
-      updateProgress(files.length, `${files.length} 个文件完成`);
+      updateProgress(files.length, t($language, '{count} 个文件完成', { count: files.length }));
       await loadList(activeRootId, currentPath);
       finishProgress();
     } catch (error) {
-      failProgress(error instanceof Error ? error.message : '上传失败');
+      failProgress(error instanceof Error ? error.message : t($language, '上传失败'));
       handleFilesError(error);
     } finally {
       uploading = false;
@@ -1056,22 +1068,25 @@
         .slice(0, 12)
         .map((entry) => `× ${entry.name}${entry.is_dir ? '/' : ''}`)
         .join('\n');
-      const more = items.length > 12 ? `\n…以及另外 ${items.length - 12} 项` : '';
+      const more =
+        items.length > 12
+          ? '\n' + t($language, '…以及另外 {count} 项', { count: items.length - 12 })
+          : '';
       confirmState = {
         title: t($language, '永久删除'),
-        message: `以下文件将被永久删除：\n${list}${more}`,
+        message: t($language, '以下文件将被永久删除：\n{list}{more}', { list, more }),
         requireText: needsCode ? result.confirm_code : null,
         action: (value) => {
           void (async () => {
-            startProgress('删除文件', items.length, '正在删除…');
+            startProgress(t($language, '删除文件'), items.length, t($language, '正在删除…'));
             try {
               await api.deletePaths(result.token, undefined, csrf, needsCode ? value : undefined);
-              updateProgress(items.length, '完成');
+              updateProgress(items.length, t($language, '完成'));
               finishProgress();
               confirmState = null;
               await loadList(rootId, path);
             } catch (error) {
-              failProgress(error instanceof Error ? error.message : '删除失败');
+              failProgress(error instanceof Error ? error.message : t($language, '删除失败'));
               handleFilesError(error);
               confirmState = null;
             }
@@ -1146,9 +1161,9 @@
       await loadList(activeRootId, currentPath);
     } catch (error) {
       if (error instanceof ApiError && error.status === 412) {
-        editorError = '文件已被其他操作修改，请关闭后重新打开。';
+        editorError = t($language, '文件已被其他操作修改，请关闭后重新打开。');
       } else {
-        editorError = error instanceof Error ? error.message : '保存失败';
+        editorError = error instanceof Error ? error.message : t($language, '保存失败');
       }
     } finally {
       editorSaving = false;
@@ -1196,7 +1211,7 @@
 
   function formatDate(seconds: number): string {
     if (!seconds) return '—';
-    return new Intl.DateTimeFormat('zh-CN', {
+    return new Intl.DateTimeFormat(localeOf($language), {
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
@@ -1207,10 +1222,10 @@
   function formatRelativeDate(seconds: number): string {
     if (!seconds) return '—';
     const diff = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
-    if (diff < 60) return '刚刚';
-    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-    if (diff < 7 * 86400) return `${Math.floor(diff / 86400)} 天前`;
+    if (diff < 60) return t($language, '刚刚');
+    if (diff < 3600) return t($language, '{count} 分钟前', { count: Math.floor(diff / 60) });
+    if (diff < 86400) return t($language, '{count} 小时前', { count: Math.floor(diff / 3600) });
+    if (diff < 7 * 86400) return t($language, '{count} 天前', { count: Math.floor(diff / 86400) });
     return formatDate(seconds);
   }
 </script>
@@ -1236,7 +1251,7 @@
 {#if shareToken}
   <SharePage token={shareToken} />
 {:else if loading}
-  <div class="boot-screen" aria-label="正在加载">
+  <div class="boot-screen" aria-label={t($language, '正在加载')}>
     <div class="boot-mark" aria-hidden="true">F</div>
   </div>
 {:else if !initialized}
@@ -1362,7 +1377,7 @@
 
     <div class="workspace">
       <aside class:open={sidebarOpen} class="sidebar" aria-label={t($language, '主导航')}>
-        <nav class="nav" aria-label="文件导航">
+        <nav class="nav" aria-label={t($language, '文件导航')}>
           {#each roots as root (root.id)}
             <button
               type="button"
@@ -1375,7 +1390,7 @@
               }}
             >
               <Icon name="folder" size={18} />
-              <span>{root.alias}</span>
+              <span>{rootLabel(root.alias)}</span>
             </button>
           {/each}
           {#if roots.length === 0}
@@ -1463,7 +1478,7 @@
           <div class="pathbar">
             <div class="path">
               <button type="button" class="path-link" onclick={() => navigate('')}>
-                {activeRoot?.alias ?? t($language, '文件')}
+                {activeRoot ? rootLabel(activeRoot.alias) : t($language, '文件')}
               </button>
               {#each pathSegments as segment, index (index)}
                 <span class="sep">/</span>
@@ -1474,7 +1489,9 @@
             </div>
             {#if selected.length > 0}
               <div class="pathbar-actions">
-                <span class="selection-count">已选 {selected.length} 项</span>
+                <span class="selection-count"
+                  >{t($language, '已选 {count} 项', { count: selected.length })}</span
+                >
                 <button
                   type="button"
                   class="icon-button"
@@ -1487,8 +1504,8 @@
                 <button
                   type="button"
                   class="icon-button"
-                  aria-label="复制到"
-                  title="复制到"
+                  aria-label={t($language, '复制到')}
+                  title={t($language, '复制到')}
                   onclick={() =>
                     (transfer = {
                       mode: 'copy',
@@ -1500,8 +1517,8 @@
                 <button
                   type="button"
                   class="icon-button"
-                  aria-label="移动到"
-                  title="移动到"
+                  aria-label={t($language, '移动到')}
+                  title={t($language, '移动到')}
                   onclick={() =>
                     (transfer = {
                       mode: 'move',
@@ -1522,8 +1539,8 @@
                 <button
                   type="button"
                   class="icon-button"
-                  aria-label="取消选择"
-                  title="取消选择"
+                  aria-label={t($language, '取消选择')}
+                  title={t($language, '取消选择')}
                   onclick={clearSelection}
                 >
                   <Icon name="close" size={16} />
@@ -1722,7 +1739,7 @@
                             <td class="check" onclick={(event) => event.stopPropagation()}>
                               <input
                                 type="checkbox"
-                                aria-label={`选择 ${entry.name}`}
+                                aria-label={t($language, '选择 {name}', { name: entry.name })}
                                 checked={isSelected(entry.name)}
                                 onchange={() => toggleSelection(entry.name)}
                               />
@@ -1746,7 +1763,7 @@
                               <button
                                 type="button"
                                 class="row-action"
-                                aria-label={`删除 ${entry.name}`}
+                                aria-label={t($language, '删除 {name}', { name: entry.name })}
                                 title={t($language, '删除')}
                                 disabled={!activeRoot || activeRoot.read_only}
                                 onclick={(event) => {
@@ -1802,7 +1819,7 @@
                           <input
                             class="card-check"
                             type="checkbox"
-                            aria-label={`选择 ${entry.name}`}
+                            aria-label={t($language, '选择 {name}', { name: entry.name })}
                             checked={isSelected(entry.name)}
                             onclick={(event) => event.stopPropagation()}
                             onchange={() => toggleSelection(entry.name)}
@@ -1876,7 +1893,7 @@
                           <input
                             class="card-check"
                             type="checkbox"
-                            aria-label={`选择 ${entry.name}`}
+                            aria-label={t($language, '选择 {name}', { name: entry.name })}
                             checked={isSelected(entry.name)}
                             onclick={(event) => event.stopPropagation()}
                             onchange={() => toggleSelection(entry.name)}
@@ -1914,7 +1931,9 @@
                   </div>
                 {/if}
                 {#if nextCursor || filesLoadingMore}
-                  <div class="load-more">{filesLoadingMore ? '加载中…' : '继续滚动加载更多'}</div>
+                  <div class="load-more">
+                    {filesLoadingMore ? t($language, '加载中…') : t($language, '继续滚动加载更多')}
+                  </div>
                 {/if}
               {/if}
             {/if}
@@ -1963,30 +1982,32 @@
     >
       {#if canPreviewEntry(contextMenu.entry)}
         <button type="button" role="menuitem" onclick={() => runContextAction('preview')}
-          >预览</button
+          >{t($language, '预览')}</button
         >
       {/if}
       <button type="button" role="menuitem" onclick={() => runContextAction('download')}
-        >下载</button
+        >{t($language, '下载')}</button
       >
-      <button type="button" role="menuitem" onclick={() => runContextAction('share')}>分享</button>
+      <button type="button" role="menuitem" onclick={() => runContextAction('share')}
+        >{t($language, '分享')}</button
+      >
       {#if !activeRoot?.read_only}
         <button type="button" role="menuitem" onclick={() => runContextAction('rename')}
-          >重命名</button
+          >{t($language, '重命名')}</button
         >
       {/if}
       <button type="button" role="menuitem" onclick={() => runContextAction('copy-to')}
-        >复制到…</button
+        >{t($language, '复制到…')}</button
       >
       <button type="button" role="menuitem" onclick={() => runContextAction('move-to')}
-        >移动到…</button
+        >{t($language, '移动到…')}</button
       >
       <div class="menu-sep"></div>
       <button
         type="button"
         role="menuitem"
         class="danger"
-        onclick={() => runContextAction('delete')}>删除</button
+        onclick={() => runContextAction('delete')}>{t($language, '删除')}</button
       >
     </div>
   {/if}
@@ -2010,7 +2031,7 @@
           onclick={() => {
             blankMenu = null;
             openMkdir();
-          }}>新建目录</button
+          }}>{t($language, '新建目录')}</button
         >
         <button
           type="button"
@@ -2020,11 +2041,11 @@
             nameDialog = {
               mode: 'touch',
               entry: null,
-              title: '新建文件',
-              label: '文件名称',
+              title: t($language, '新建文件'),
+              label: t($language, '文件名称'),
               initialValue: '',
             };
-          }}>新建文件</button
+          }}>{t($language, '新建文件')}</button
         >
         <button
           type="button"
@@ -2032,7 +2053,7 @@
           onclick={() => {
             blankMenu = null;
             folderUploadClick();
-          }}>上传目录</button
+          }}>{t($language, '上传目录')}</button
         >
       {/if}
       <button
@@ -2041,12 +2062,12 @@
         onclick={() => {
           blankMenu = null;
           terminalOpen = true;
-        }}>打开终端</button
+        }}>{t($language, '打开终端')}</button
       >
       <div class="menu-sep"></div>
       <div class="menu-item">
         <button type="button" role="menuitem">
-          排序方式 <span class="menu-arrow">›</span>
+          {t($language, '排序方式')} <span class="menu-arrow">›</span>
         </button>
         <div class="submenu" role="menu">
           <button
@@ -2056,7 +2077,8 @@
               setSort('name');
             }}
           >
-            名称 {sortField === 'name' ? (sortOrder === 'asc' ? '↑' : '↓') : ''}
+            {t($language, '名称')}
+            {sortField === 'name' ? (sortOrder === 'asc' ? '↑' : '↓') : ''}
           </button>
           <button
             type="button"
@@ -2065,7 +2087,8 @@
               setSort('size');
             }}
           >
-            大小 {sortField === 'size' ? (sortOrder === 'asc' ? '↑' : '↓') : ''}
+            {t($language, '大小')}
+            {sortField === 'size' ? (sortOrder === 'asc' ? '↑' : '↓') : ''}
           </button>
           <button
             type="button"
@@ -2074,13 +2097,14 @@
               setSort('modified');
             }}
           >
-            修改时间 {sortField === 'modified' ? (sortOrder === 'asc' ? '↑' : '↓') : ''}
+            {t($language, '修改时间')}
+            {sortField === 'modified' ? (sortOrder === 'asc' ? '↑' : '↓') : ''}
           </button>
         </div>
       </div>
       <div class="menu-item">
         <button type="button" role="menuitem">
-          视图切换 <span class="menu-arrow">›</span>
+          {t($language, '视图切换')} <span class="menu-arrow">›</span>
         </button>
         <div class="submenu" role="menu">
           <button
@@ -2088,21 +2112,21 @@
             onclick={() => {
               blankMenu = null;
               setView('list');
-            }}>列表</button
+            }}>{t($language, '列表')}</button
           >
           <button
             type="button"
             onclick={() => {
               blankMenu = null;
               setView('thumb');
-            }}>缩略图</button
+            }}>{t($language, '缩略图')}</button
           >
           <button
             type="button"
             onclick={() => {
               blankMenu = null;
               setView('tile');
-            }}>平铺</button
+            }}>{t($language, '平铺')}</button
           >
         </div>
       </div>
@@ -2114,7 +2138,7 @@
       open
       title={confirmState.title}
       message={confirmState.message}
-      confirmLabel="删除"
+      confirmLabel={t($language, '删除')}
       danger
       requireText={confirmState.requireText}
       onConfirm={(value) => {
@@ -2143,7 +2167,7 @@
       title={nameDialog.title}
       label={nameDialog.label}
       initialValue={nameDialog.initialValue}
-      confirmLabel={nameDialog.mode === 'mkdir' ? '创建' : '重命名'}
+      confirmLabel={nameDialog.mode === 'mkdir' ? t($language, '创建') : t($language, '重命名')}
       onConfirm={(value) => void submitName(value)}
       onClose={() => (nameDialog = null)}
     />
@@ -2250,7 +2274,8 @@
 
         <footer class="editor-footer">
           <span
-            >{editorDirty ? '有未保存修改' : '已保存'} · UTF-8 · {editorContent.length} chars</span
+            >{editorDirty ? t($language, '有未保存修改') : t($language, '已保存')} · UTF-8 ·
+            {editorContent.length} chars</span
           >
           <div>
             <button type="button" class="ghost" onclick={() => (editorOpen = false)}
@@ -2346,6 +2371,7 @@
   }
 
   .top-avatar-button img {
+    display: block;
     width: 100%;
     height: 100%;
     object-fit: cover;
@@ -2358,8 +2384,10 @@
     overflow: hidden;
     flex: 0 0 auto;
     place-items: center;
-    border: 0;
+    padding: 0;
+    border: 1px solid var(--border);
     border-radius: 50%;
+    box-sizing: border-box;
     background: var(--accent-soft);
     color: var(--accent-text);
     font-size: 13.5px;

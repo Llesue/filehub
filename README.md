@@ -83,6 +83,15 @@ sc.exe start FileHub
 
 The service runs as `LocalSystem`, starts automatically, and stores its database, users, cache, and logs under `C:\ProgramData\FileHub`. Service logs are written to `filehub.log.YYYY-MM-DD` in that directory.
 
+To read the service log and retrieve the first-run setup token:
+
+```powershell
+Get-ChildItem C:\ProgramData\FileHub\filehub.log.* |
+  Sort-Object LastWriteTime |
+  Select-Object -Last 1 |
+  Get-Content -Tail 50
+```
+
 Stop or uninstall:
 
 ```powershell

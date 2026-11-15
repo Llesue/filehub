@@ -160,7 +160,7 @@ async fn ensure_default_roots(db: &Db) -> anyhow::Result<()> {
         let real_path = canonical
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("user home is not valid UTF-8"))?;
-        db.ensure_root(user.id, real_path, "我的文件", false)
+        db.ensure_root(user.id, real_path, "My Files", false)
             .await?;
     }
     Ok(())

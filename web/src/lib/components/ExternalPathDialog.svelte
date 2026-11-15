@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
   let {
@@ -17,7 +18,7 @@
       await onSave(path.trim(), alias.trim());
       onClose();
     } catch (err) {
-      error = err instanceof Error ? err.message : '添加失败';
+      error = err instanceof Error ? err.message : t($language, '添加失败');
     } finally {
       busy = false;
     }
@@ -33,19 +34,32 @@
     onclick={(event) => event.stopPropagation()}
   >
     <header>
-      <h2>添加外部路径</h2>
-      <button type="button" class="icon-button" aria-label="关闭" onclick={onClose}
+      <h2>{t($language, '添加外部路径')}</h2>
+      <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}
         ><Icon name="close" size={18} /></button
       >
     </header>
-    <label><span>服务器目录</span><input bind:value={path} placeholder="/mnt/red" /></label>
-    <label><span>别名</span><input bind:value={alias} placeholder="红盘" /></label>
-    <p class="hint">目录必须已存在且可读；添加后到用户卡片的“分配外部路径”中授权。</p>
+    <label
+      ><span>{t($language, '服务器目录')}</span><input
+        bind:value={path}
+        placeholder="/mnt/red"
+      /></label
+    >
+    <label
+      ><span>{t($language, '别名')}</span><input
+        bind:value={alias}
+        placeholder={t($language, '红盘')}
+      /></label
+    >
+    <p class="hint">
+      {t($language, '目录必须已存在且可读；添加后到用户卡片的“分配外部路径”中授权。')}
+    </p>
     {#if error}<p class="error">{error}</p>{/if}
     <footer>
-      <button type="button" class="ghost" onclick={onClose}>取消</button><button
+      <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button><button
         type="submit"
-        disabled={busy || !path.trim() || !alias.trim()}>{busy ? '添加中…' : '添加'}</button
+        disabled={busy || !path.trim() || !alias.trim()}
+        >{busy ? t($language, '添加中…') : t($language, '添加')}</button
       >
     </footer>
   </form>

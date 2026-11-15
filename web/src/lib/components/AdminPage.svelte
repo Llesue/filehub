@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type AdminRoot, type ServerPath, type SettingsResponse, type User } from '../api';
+  import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
   import AssignPathDialog from './AssignPathDialog.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
@@ -26,6 +27,7 @@
   let deleteUser = $state<User | null>(null);
   let editingPathId = $state<number | null>(null);
   let editingPathAlias = $state('');
+  let editingPathOriginal = $state('');
 
   function password(): string {
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%';
@@ -55,7 +57,7 @@
       );
       roots = Object.fromEntries(rootEntries);
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '管理数据加载失败');
+      showNotice(error instanceof Error ? error.message : t($language, '管理数据加载失败'));
     } finally {
       loading = false;
     }
@@ -64,14 +66,16 @@
   onMount(() => void load());
 
   function formatBytes(value: number | null): string {
-    if (value === null) return '不限制';
+    if (value === null) return t($language, '不限制');
     if (value < 1024 ** 2) return `${(value / 1024).toFixed(0)} KB`;
     if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
     return `${(value / 1024 ** 3).toFixed(1)} GB`;
   }
 
   function formatDate(value: number | null): string {
-    return value ? new Date(value * 1000).toLocaleString('zh-CN') : '从未登录';
+    return value
+      ? new Date(value * 1000).toLocaleString(localeOf($language))
+      : t($language, '从未登录');
   }
 
   async function createUser(
@@ -99,7 +103,7 @@
   async function resetPassword(value: string): Promise<void> {
     if (!passwordUser) return;
     await api.updateUser(passwordUser.id, { password: value }, csrf);
-    showNotice('密码已重置', 'info', '操作成功');
+    showNotice(t($language, '密码已重置'), 'info', t($language, '操作成功'));
   }
 
   async function toggleRole(user: User): Promise<void> {
@@ -108,7 +112,7 @@
       await api.updateUser(user.id, { role }, csrf);
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '角色切换失败');
+      showNotice(error instanceof Error ? error.message : t($language, '角色切换失败'));
     }
   }
 
@@ -117,7 +121,7 @@
       await api.updateUser(user.id, { disabled: !user.disabled }, csrf);
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '状态切换失败');
+      showNotice(error instanceof Error ? error.message : t($language, '状态切换失败'));
     }
   }
 
@@ -128,7 +132,7 @@
       deleteUser = null;
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '删除用户失败');
+      showNotice(error instanceof Error ? error.message : t($language, '删除用户失败'));
     }
   }
 
@@ -150,16 +154,25 @@
   function beginPathAlias(path: ServerPath): void {
     editingPathId = path.id;
     editingPathAlias = path.alias;
+    editingPathOriginal = path.alias;
   }
 
-  async function savePathAlias(): Promise<void> {
+  async function finishPathAlias(): Promise<void> {
     if (editingPathId === null) return;
+    const value = editingPathAlias.trim();
+    if (!value || value === editingPathOriginal) {
+      editingPathId = null;
+      editingPathAlias = editingPathOriginal;
+      return;
+    }
     try {
-      await api.updateServerPath(editingPathId, editingPathAlias.trim(), csrf);
+      await api.updateServerPath(editingPathId, value, csrf);
       editingPathId = null;
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '修改别名失败');
+      showNotice(error instanceof Error ? error.message : t($language, '修改别名失败'));
+      editingPathId = null;
+      editingPathAlias = editingPathOriginal;
     }
   }
 
@@ -168,7 +181,7 @@
       await api.deleteServerPath(path.id, csrf);
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '删除外部路径失败');
+      showNotice(error instanceof Error ? error.message : t($language, '删除外部路径失败'));
     }
   }
 
@@ -182,7 +195,7 @@
       );
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '权限修改失败');
+      showNotice(error instanceof Error ? error.message : t($language, '权限修改失败'));
     }
   }
 
@@ -191,7 +204,7 @@
       await api.deleteRoot(user.id, root.id, csrf);
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '移除授权失败');
+      showNotice(error instanceof Error ? error.message : t($language, '移除授权失败'));
     }
   }
 
@@ -208,7 +221,7 @@
     try {
       settings = await api.updateSetting(key, value, csrf);
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '系统设置保存失败');
+      showNotice(error instanceof Error ? error.message : t($language, '系统设置保存失败'));
     }
   }
 
@@ -229,20 +242,20 @@
 <section class="admin-page">
   <header class="admin-header">
     <div>
-      <h1>系统管理</h1>
-      <p>用户、外部路径与系统设置</p>
+      <h1>{t($language, '系统管理')}</h1>
+      <p>{t($language, '用户、外部路径与系统设置')}</p>
     </div>
     <button type="button" class="audit-button" onclick={onAudit}
-      ><Icon name="terminal" size={17} />审计日志</button
+      ><Icon name="terminal" size={17} />{t($language, '审计日志')}</button
     >
   </header>
 
-  {#if loading}<p class="muted">加载中…</p>{:else}
+  {#if loading}<p class="muted">{t($language, '加载中…')}</p>{:else}
     <section class="admin-section">
       <div class="section-heading">
-        <h2>用户</h2>
+        <h2>{t($language, '用户')}</h2>
         <button type="button" class="add-button" onclick={() => (createOpen = true)}
-          >+ 新建用户</button
+          >{t($language, '+ 新建用户')}</button
         >
       </div>
       {#each users as user (user.id)}
@@ -250,26 +263,26 @@
           <div class="user-line">
             <strong>{user.username}</strong>
             <button type="button" class="pill-button" onclick={() => void toggleRole(user)}
-              >{user.role === 'admin' ? '管理员' : '成员'}</button
+              >{user.role === 'admin' ? t($language, '管理员') : t($language, '成员')}</button
             >
             <button type="button" class="quota-button" onclick={() => (quotaUser = user)}
-              >配额 {formatBytes(user.quota_bytes)}</button
+              >{t($language, '配额')} {formatBytes(user.quota_bytes)}</button
             >
-            <span class="meta">已用 {formatBytes(usage[user.id] ?? 0)}</span>
+            <span class="meta">{t($language, '已用')} {formatBytes(usage[user.id] ?? 0)}</span>
             <button type="button" class="text-button" onclick={() => (passwordUser = user)}
-              >重置密码</button
+              >{t($language, '重置密码')}</button
             >
             <button type="button" class="text-button" onclick={() => void toggleDisabled(user)}
-              >{user.disabled ? '启用' : '禁用'}</button
+              >{user.disabled ? t($language, '启用') : t($language, '禁用')}</button
             >
             <button type="button" class="text-button danger" onclick={() => (deleteUser = user)}
-              >删除</button
+              >{t($language, '删除')}</button
             >
           </div>
           <div class="user-meta">
-            <span>创建 {formatDate(user.created_at)}</span>
-            <span>最后登录 {formatDate(user.last_login_at)}</span>
-            {#if user.disabled}<span class="danger-text">已禁用</span>{/if}
+            <span>{t($language, '创建')} {formatDate(user.created_at)}</span>
+            <span>{t($language, '最后登录')} {formatDate(user.last_login_at)}</span>
+            {#if user.disabled}<span class="danger-text">{t($language, '已禁用')}</span>{/if}
           </div>
           <div class="roots">
             {#each roots[user.id] ?? [] as root (root.id)}
@@ -277,17 +290,17 @@
                 <span class="root-alias">{root.alias}</span>
                 <span class="root-path">{root.real_path}</span>
                 <button type="button" class="permission" onclick={() => void toggleRoot(user, root)}
-                  >{root.read_only ? '只读' : '读写'}</button
+                  >{root.read_only ? t($language, '只读') : t($language, '读写')}</button
                 >
                 <button
                   type="button"
                   class="text-button danger"
-                  onclick={() => void removeRoot(user, root)}>删除</button
+                  onclick={() => void removeRoot(user, root)}>{t($language, '删除')}</button
                 >
               </div>
             {/each}
             <button type="button" class="assign-button" onclick={() => (assignUser = user)}
-              >+ 分配外部路径</button
+              >{t($language, '+ 分配外部路径')}</button
             >
           </div>
         </article>
@@ -296,30 +309,31 @@
 
     <section class="admin-section">
       <div class="section-heading">
-        <h2>外部路径</h2>
+        <h2>{t($language, '外部路径')}</h2>
         <button type="button" class="add-button" onclick={() => (pathOpen = true)}
-          >+ 添加外部路径</button
+          >{t($language, '+ 添加外部路径')}</button
         >
       </div>
       {#each paths as path (path.id)}
         <div class="path-card">
           {#if editingPathId === path.id}
-            <form
-              class="path-alias-form"
-              onsubmit={(event) => {
-                event.preventDefault();
-                void savePathAlias();
-              }}
-            >
+            <div class="path-alias-form">
               <input
                 bind:value={editingPathAlias}
-                aria-label="外部路径别名"
+                aria-label={t($language, '外部路径别名')}
+                onblur={() => void finishPathAlias()}
                 onkeydown={(event) => {
-                  if (event.key === 'Escape') editingPathId = null;
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  } else if (event.key === 'Escape') {
+                    editingPathId = null;
+                    editingPathAlias = editingPathOriginal;
+                    event.currentTarget.blur();
+                  }
                 }}
               />
-              <button type="submit">保存</button>
-            </form>
+            </div>
           {:else}
             <button type="button" class="path-alias" onclick={() => beginPathAlias(path)}
               >{path.alias}</button
@@ -327,40 +341,40 @@
           {/if}
           <span class="root-path">{path.real_path}</span>
           <button type="button" class="text-button danger" onclick={() => void deletePath(path)}
-            >删除</button
+            >{t($language, '删除')}</button
           >
         </div>
       {:else}
-        <p class="muted">还没有外部路径。</p>
+        <p class="muted">{t($language, '还没有外部路径。')}</p>
       {/each}
     </section>
 
     <section class="admin-section">
-      <h2>系统设置</h2>
+      <h2>{t($language, '系统设置')}</h2>
       <div class="setting-grid">
         <label class="setting-row"
-          ><span>缩略图</span><input
+          ><span>{t($language, '缩略图')}</span><input
             type="checkbox"
             checked={Boolean(setting('thumbnails.enabled'))}
             onchange={(event) => void setSetting('thumbnails.enabled', event.currentTarget.checked)}
           /></label
         >
         <label class="setting-row"
-          ><span>文本编辑器</span><input
+          ><span>{t($language, '文本编辑器')}</span><input
             type="checkbox"
             checked={Boolean(setting('editor.enabled'))}
             onchange={(event) => void setSetting('editor.enabled', event.currentTarget.checked)}
           /></label
         >
         <label class="setting-row"
-          ><span>终端</span><input
+          ><span>{t($language, '终端')}</span><input
             type="checkbox"
             checked={Boolean(setting('terminal_enabled'))}
             onchange={(event) => void setSetting('terminal_enabled', event.currentTarget.checked)}
           /></label
         >
         <label class="setting-row"
-          ><span>默认显示隐藏文件</span><input
+          ><span>{t($language, '默认显示隐藏文件')}</span><input
             type="checkbox"
             checked={Boolean(setting('show_hidden_default'))}
             onchange={(event) =>
@@ -368,36 +382,38 @@
           /></label
         >
         <label class="setting-row"
-          ><span>默认主题</span><select
+          ><span>{t($language, '默认主题')}</span><select
             value={String(setting('ui.default_theme') ?? 'system')}
             onchange={(event) => void setSetting('ui.default_theme', event.currentTarget.value)}
-            ><option value="system">跟随系统</option><option value="light">浅色</option><option
-              value="dark">深色</option
+            ><option value="system">{t($language, '跟随系统')}</option><option value="light"
+              >{t($language, '浅色')}</option
+            ><option value="dark">{t($language, '深色')}</option></select
+          ></label
+        >
+        <label class="setting-row"
+          ><span>{t($language, '默认语言')}</span><select
+            value={String(setting('ui.default_locale') ?? 'zh-CN')}
+            onchange={(event) => void setSetting('ui.default_locale', event.currentTarget.value)}
+            ><option value="zh-CN">{t($language, '中文')}</option><option value="en">English</option
             ></select
           ></label
         >
         <label class="setting-row"
-          ><span>默认语言</span><select
-            value={String(setting('ui.default_locale') ?? 'zh-CN')}
-            onchange={(event) => void setSetting('ui.default_locale', event.currentTarget.value)}
-            ><option value="zh-CN">中文</option><option value="en">English</option></select
-          ></label
-        >
-        <label class="setting-row"
-          ><span>上传同名文件</span><select
+          ><span>{t($language, '上传同名文件')}</span><select
             value={String(setting('upload_conflict_default') ?? 'rename')}
             onchange={(event) =>
               void setSetting('upload_conflict_default', event.currentTarget.value)}
-            ><option value="rename">自动重命名</option><option value="overwrite">覆盖</option
-            ><option value="skip">跳过</option></select
+            ><option value="rename">{t($language, '自动重命名')}</option><option value="overwrite"
+              >{t($language, '覆盖')}</option
+            ><option value="skip">{t($language, '跳过')}</option></select
           ></label
         >
         <label class="setting-row"
-          ><span>默认配额</span>
+          ><span>{t($language, '默认配额')}</span>
           <div class="quota-setting">
             <input bind:value={defaultQuotaGb} type="number" min="0" step="1" /><span>GB</span
             ><button type="button" class="small" onclick={() => void saveDefaultQuota()}
-              >保存</button
+              >{t($language, '保存')}</button
             >
           </div></label
         >
@@ -421,8 +437,8 @@
   />{/if}
 {#if passwordUser}<NameDialog
     open
-    title="重置密码"
-    label={`${passwordUser.username} 的新密码`}
+    title={t($language, '重置密码')}
+    label={t($language, '{username} 的新密码', { username: passwordUser.username })}
     initialValue={password()}
     onConfirm={(value) => void resetPassword(value)}
     onClose={() => (passwordUser = null)}
@@ -435,9 +451,11 @@
   />{/if}
 {#if deleteUser}<ConfirmDialog
     open
-    title="删除用户"
-    message={`删除用户「${deleteUser.username}」？默认保留其 home 文件。`}
-    confirmLabel="删除"
+    title={t($language, '删除用户')}
+    message={t($language, '删除用户「{username}」？默认保留其 home 文件。', {
+      username: deleteUser.username,
+    })}
+    confirmLabel={t($language, '删除')}
     danger
     onConfirm={() => void confirmDelete()}
     onCancel={() => (deleteUser = null)}
@@ -626,15 +644,6 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface-2);
-    color: var(--text);
-  }
-
-  .path-alias-form button {
-    height: 30px;
-    padding: 0 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface);
     color: var(--text);
   }
 

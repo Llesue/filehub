@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { language, t } from '../i18n';
+
   let {
     open,
     onClose,
@@ -20,7 +22,7 @@
     event.preventDefault();
     error = '';
     if (next !== confirm) {
-      error = '两次输入的新密码不一致';
+      error = t($language, '两次输入的新密码不一致');
       return;
     }
     busy = true;
@@ -31,7 +33,7 @@
       confirm = '';
       onClose();
     } catch (err) {
-      error = err instanceof Error ? err.message : '修改密码失败';
+      error = err instanceof Error ? err.message : t($language, '修改密码失败');
     } finally {
       busy = false;
     }
@@ -55,23 +57,23 @@
       onsubmit={(event) => void submit(event)}
       onclick={(event) => event.stopPropagation()}
     >
-      <h2>修改密码</h2>
+      <h2>{t($language, '修改密码')}</h2>
       <label
-        ><span>当前密码</span><input
+        ><span>{t($language, '当前密码')}</span><input
           bind:value={current}
           type="password"
           autocomplete="current-password"
         /></label
       >
       <label
-        ><span>新密码</span><input
+        ><span>{t($language, '新密码')}</span><input
           bind:value={next}
           type="password"
           autocomplete="new-password"
         /></label
       >
       <label
-        ><span>确认新密码</span><input
+        ><span>{t($language, '确认新密码')}</span><input
           bind:value={confirm}
           type="password"
           autocomplete="new-password"
@@ -79,9 +81,9 @@
       >
       {#if error}<p class="error">{error}</p>{/if}
       <div class="actions">
-        <button type="button" class="ghost" onclick={onClose}>取消</button>
+        <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button>
         <button type="submit" disabled={busy || !current || !next}
-          >{busy ? '更新中…' : '更新密码'}</button
+          >{busy ? t($language, '更新中…') : t($language, '更新密码')}</button
         >
       </div>
     </form>

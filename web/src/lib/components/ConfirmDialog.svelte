@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { language, t } from '../i18n';
+
   let {
     open,
     title,
     message,
-    confirmLabel = '确认',
+    confirmLabel,
     danger = false,
     requireText = null,
     busy = false,
@@ -62,16 +64,19 @@
           {/each}
         </p>
         {#if requireText}
-          <input bind:value={input} placeholder={`输入 ${requireText} 确认`} />
+          <input
+            bind:value={input}
+            placeholder={t($language, '输入 {code} 确认', { code: requireText })}
+          />
         {/if}
         <div class="confirm-actions">
-          <button type="button" onclick={onCancel} disabled={busy}>取消</button>
+          <button type="button" onclick={onCancel} disabled={busy}>{t($language, '取消')}</button>
           <button
             type="submit"
             class:danger
             disabled={busy || (requireText !== null && input !== requireText)}
           >
-            {busy ? '处理中…' : confirmLabel}
+            {busy ? t($language, '处理中…') : (confirmLabel ?? t($language, '确认'))}
           </button>
         </div>
       </form>

@@ -78,11 +78,20 @@ pub fn metadata_mtime(metadata: &Metadata) -> i64 {
     }
 }
 
+#[cfg(windows)]
+fn normalized_windows_path(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    value
+        .strip_prefix("//?/unc/")
+        .map(|value| format!("//{value}"))
+        .or_else(|| value.strip_prefix("//?/").map(str::to_owned))
+        .unwrap_or(value)
+}
+
 pub fn paths_equal(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
-        left.to_string_lossy().replace('\\', "/").to_lowercase()
-            == right.to_string_lossy().replace('\\', "/").to_lowercase()
+        normalized_windows_path(left) == normalized_windows_path(right)
     }
     #[cfg(not(windows))]
     {
@@ -93,12 +102,9 @@ pub fn paths_equal(left: &Path, right: &Path) -> bool {
 pub fn path_within(path: &Path, base: &Path) -> bool {
     #[cfg(windows)]
     {
-        let path = path.to_string_lossy().replace('\\', "/").to_lowercase();
-        let base = base
-            .to_string_lossy()
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_lowercase();
+        let path = normalized_windows_path(path);
+        let base = normalized_windows_path(base);
+        let base = base.trim_end_matches('/');
         path == base || path.starts_with(&format!("{base}/"))
     }
     #[cfg(not(windows))]

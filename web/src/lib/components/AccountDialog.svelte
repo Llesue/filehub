@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { User } from '../api';
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
 
@@ -25,11 +26,16 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <section
     class="account-dialog"
-    aria-label="账号菜单"
+    aria-label={t($language, '账号菜单')}
     onclick={(event) => event.stopPropagation()}
   >
     <header>
-      <button type="button" class="icon-button close-button" aria-label="关闭" onclick={onClose}>
+      <button
+        type="button"
+        class="icon-button close-button"
+        aria-label={t($language, '关闭')}
+        onclick={onClose}
+      >
         <Icon name="close" size={18} />
       </button>
       {#if avatarUrl}
@@ -42,15 +48,15 @@
 
     <div class="menu-section">
       <button type="button" onclick={onSettings}>
-        <Icon name="settings" size={18} />偏好设置
+        <Icon name="settings" size={18} />{t($language, '偏好设置')}
       </button>
       {#if user.role === 'admin'}
         <button type="button" onclick={onAdmin}>
-          <Icon name="shield" size={18} />系统管理
+          <Icon name="shield" size={18} />{t($language, '系统管理')}
         </button>
       {/if}
       <button type="button" class="danger" onclick={onLogout}>
-        <Icon name="logout" size={18} />退出登录
+        <Icon name="logout" size={18} />{t($language, '退出登录')}
       </button>
     </div>
   </section>
@@ -98,6 +104,7 @@
   }
 
   .avatar-image img {
+    display: block;
     width: 100%;
     height: 100%;
     object-fit: cover;
@@ -109,6 +116,8 @@
     height: 56px;
     flex: 0 0 auto;
     place-items: center;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
     border-radius: 50%;
     background: var(--accent-soft);
     color: var(--accent-text);

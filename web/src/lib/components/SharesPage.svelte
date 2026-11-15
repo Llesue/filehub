@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api, type ShareInfo } from '../api';
   import { copyText } from '../clipboard';
+  import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import FileTypeIcon from './FileTypeIcon.svelte';
@@ -29,7 +30,7 @@
       shares = cursor ? [...shares, ...result.shares] : result.shares;
       nextCursor = result.next_cursor;
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '分享列表加载失败');
+      showNotice(error instanceof Error ? error.message : t($language, '分享列表加载失败'));
     } finally {
       loading = false;
       loadingMore = false;
@@ -54,7 +55,7 @@
       await api.updateShare(share.id, patch, csrf);
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '修改分享失败');
+      showNotice(error instanceof Error ? error.message : t($language, '修改分享失败'));
     }
   }
 
@@ -70,7 +71,7 @@
       await copyText(`${window.location.origin}${result.url}`);
       await load();
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '生成分享地址失败');
+      showNotice(error instanceof Error ? error.message : t($language, '生成分享地址失败'));
     }
   }
 
@@ -87,19 +88,21 @@
   }
 
   function date(value: number | null): string {
-    return value ? new Date(value * 1000).toLocaleString('zh-CN') : '永久';
+    return value
+      ? new Date(value * 1000).toLocaleString(localeOf($language))
+      : t($language, '永久');
   }
 </script>
 
 <section class="shares-page">
   <header>
     <div>
-      <h1>分享管理</h1>
-      <p>这里只显示你创建的分享。</p>
+      <h1>{t($language, '分享管理')}</h1>
+      <p>{t($language, '这里只显示你创建的分享。')}</p>
     </div>
     <Icon name="share" size={24} />
   </header>
-  {#if loading}<p class="muted">加载中…</p>{:else}
+  {#if loading}<p class="muted">{t($language, '加载中…')}</p>{:else}
     <div class="share-list">
       {#each shares as share (share.id)}
         <article class="share-card" class:revoked={share.revoked}>
@@ -115,10 +118,13 @@
                     void savePassword(share);
                   }}
                 >
-                  <input bind:value={passwordDraft} placeholder="新密码，留空清除" />
-                  <button type="submit" class="small">保存</button>
+                  <input
+                    bind:value={passwordDraft}
+                    placeholder={t($language, '新密码，留空清除')}
+                  />
+                  <button type="submit" class="small">{t($language, '保存')}</button>
                   <button type="button" class="small" onclick={() => (passwordEditId = null)}
-                    >取消</button
+                    >{t($language, '取消')}</button
                   >
                 </form>
               {:else}
@@ -128,56 +134,56 @@
                   onclick={() => {
                     passwordEditId = share.id;
                     passwordDraft = '';
-                  }}>{share.has_password ? '有密码' : '无密码'}</button
+                  }}>{share.has_password ? t($language, '有密码') : t($language, '无密码')}</button
                 >
               {/if}
               <select
                 value={share.read_only ? 'read' : 'write'}
-                aria-label="权限"
+                aria-label={t($language, '权限')}
                 onchange={(event) =>
                   void update(share, { read_only: event.currentTarget.value === 'read' })}
               >
-                <option value="write">读写</option>
-                <option value="read">只读</option>
+                <option value="write">{t($language, '读写')}</option>
+                <option value="read">{t($language, '只读')}</option>
               </select>
               <select
                 value={expiryDays(share)}
-                aria-label="过期时间"
+                aria-label={t($language, '过期时间')}
                 onchange={(event) => void setExpiry(share, event.currentTarget.value)}
               >
-                <option value="0">永久</option>
-                <option value="1">1 天</option>
-                <option value="7">7 天</option>
-                <option value="30">30 天</option>
-                <option value="90">90 天</option>
+                <option value="0">{t($language, '永久')}</option>
+                <option value="1">{t($language, '1 天')}</option>
+                <option value="7">{t($language, '7 天')}</option>
+                <option value="30">{t($language, '30 天')}</option>
+                <option value="90">{t($language, '90 天')}</option>
               </select>
               <button
                 type="button"
                 class="small"
                 onclick={() => void update(share, { revoked: !share.revoked })}
               >
-                {share.revoked ? '启用共享' : '停止共享'}
+                {share.revoked ? t($language, '启用共享') : t($language, '停止共享')}
               </button>
               <button type="button" class="small danger" onclick={() => (deleteTarget = share)}
-                >删除</button
+                >{t($language, '删除')}</button
               >
               <button type="button" class="small" onclick={() => void copyAddress(share)}
-                >复制地址</button
+                >{t($language, '复制地址')}</button
               >
             </div>
           </div>
           <div class="share-meta">
-            <span>分享日期 {date(share.created_at)}</span>
-            <span>访问次数 {share.visit_count}</span>
-            <span>{share.is_dir ? '目录' : '文件'}</span>
-            <span>过期 {date(share.expires_at)}</span>
-            {#if share.revoked}<span class="danger-text">已停止</span>{/if}
+            <span>{t($language, '分享日期 {date}', { date: date(share.created_at) })}</span>
+            <span>{t($language, '访问次数 {count}', { count: share.visit_count })}</span>
+            <span>{share.is_dir ? t($language, '目录') : t($language, '文件')}</span>
+            <span>{t($language, '过期 {date}', { date: date(share.expires_at) })}</span>
+            {#if share.revoked}<span class="danger-text">{t($language, '已停止')}</span>{/if}
           </div>
         </article>
-      {:else}<p class="muted">还没有分享。</p>{/each}
+      {:else}<p class="muted">{t($language, '还没有分享。')}</p>{/each}
     </div>
     <div bind:this={sentinel} class="sentinel">
-      {loadingMore ? '加载中…' : nextCursor ? '继续滚动加载' : ''}
+      {loadingMore ? t($language, '加载中…') : nextCursor ? t($language, '继续滚动加载') : ''}
     </div>
   {/if}
 </section>
@@ -185,9 +191,11 @@
 {#if deleteTarget}
   <ConfirmDialog
     open
-    title="删除分享记录"
-    message={`永久删除「${fileName(deleteTarget.real_path)}」的分享记录？`}
-    confirmLabel="删除"
+    title={t($language, '删除分享记录')}
+    message={t($language, '永久删除「{name}」的分享记录？', {
+      name: fileName(deleteTarget.real_path),
+    })}
+    confirmLabel={t($language, '删除')}
     danger
     onConfirm={() => {
       const target = deleteTarget;
@@ -198,7 +206,7 @@
             await api.purgeShare(target.id, csrf);
             await load();
           } catch (error) {
-            showNotice(error instanceof Error ? error.message : '删除分享失败');
+            showNotice(error instanceof Error ? error.message : t($language, '删除分享失败'));
           }
         })();
       }

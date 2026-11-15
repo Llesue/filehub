@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
 
@@ -87,8 +88,13 @@
 <div class="crop-overlay" role="presentation" use:overlayGuard={onClose}>
   <section class="crop-dialog" role="presentation" onclick={(event) => event.stopPropagation()}>
     <header>
-      <h2>调整头像</h2>
-      <button type="button" class="close-button" aria-label="关闭" onclick={onClose}>
+      <h2>{t($language, '调整头像')}</h2>
+      <button
+        type="button"
+        class="close-button"
+        aria-label={t($language, '关闭')}
+        onclick={onClose}
+      >
         <Icon name="close" size={18} />
       </button>
     </header>
@@ -105,7 +111,7 @@
       ></canvas>
     </div>
     <div class="zoom-row">
-      <span>缩放</span>
+      <span>{t($language, '缩放')}</span>
       <input
         type="range"
         min="0.5"
@@ -119,8 +125,10 @@
       />
     </div>
     <footer>
-      <button type="button" class="ghost" onclick={onClose}>取消</button>
-      <button type="button" disabled={!ready} onclick={confirm}>使用这张头像</button>
+      <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button>
+      <button type="button" disabled={!ready} onclick={confirm}
+        >{t($language, '使用这张头像')}</button
+      >
     </footer>
   </section>
 </div>

@@ -42,7 +42,7 @@
   },
   "ui": {
     "default_theme": "system",
-    "default_locale": "zh-CN",
+    "default_locale": "en",
     "locales": ["zh-CN", "en"]
   },
   "security": {

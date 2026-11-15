@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ServerPath } from '../api';
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
 
@@ -24,7 +25,7 @@
     event.preventDefault();
     const path = paths.find((item) => String(item.id) === selected);
     if (!path) {
-      error = '请选择外部路径';
+      error = t($language, '请选择外部路径');
       return;
     }
     busy = true;
@@ -33,7 +34,7 @@
       await onAssign(path, readOnly);
       onClose();
     } catch (err) {
-      error = err instanceof Error ? err.message : '分配失败';
+      error = err instanceof Error ? err.message : t($language, '分配失败');
     } finally {
       busy = false;
     }
@@ -49,8 +50,8 @@
     onclick={(event) => event.stopPropagation()}
   >
     <header>
-      <h2>分配外部路径</h2>
-      <button type="button" class="icon-button" aria-label="关闭" onclick={onClose}
+      <h2>{t($language, '分配外部路径')}</h2>
+      <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}
         ><Icon name="close" size={18} /></button
       >
     </header>
@@ -66,22 +67,26 @@
         >
           <span class="path-name">{path.alias}</span>
           <span class="path-real">{path.real_path}</span>
-          {#if disabled}<span class="tag">已选择</span>{/if}
+          {#if disabled}<span class="tag">{t($language, '已选择')}</span>{/if}
         </button>
       {/each}
-      {#if paths.length === 0}<p class="muted">还没有外部路径，请先在外部路径区添加。</p>{/if}
+      {#if paths.length === 0}<p class="muted">
+          {t($language, '还没有外部路径，请先在外部路径区添加。')}
+        </p>{/if}
     </div>
     <label class="permission"
-      >权限
+      >{t($language, '权限')}
       <select bind:value={readOnly}
-        ><option value={false}>读写</option><option value={true}>只读</option></select
+        ><option value={false}>{t($language, '读写')}</option><option value={true}
+          >{t($language, '只读')}</option
+        ></select
       >
     </label>
     {#if error}<p class="error">{error}</p>{/if}
     <footer>
-      <button type="button" class="ghost" onclick={onClose}>取消</button><button
+      <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button><button
         type="submit"
-        disabled={busy || !selected}>{busy ? '分配中…' : '分配'}</button
+        disabled={busy || !selected}>{busy ? t($language, '分配中…') : t($language, '分配')}</button
       >
     </footer>
   </form>

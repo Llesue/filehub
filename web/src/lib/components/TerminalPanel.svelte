@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '../api';
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
 
@@ -34,7 +35,7 @@
   let dragStart = { x: 0, y: 0 };
 
   function formatBytes(value: number | null | undefined): string {
-    if (value === null || value === undefined) return '不限';
+    if (value === null || value === undefined) return t($language, '不限');
     if (value < 1024) return `${value} B`;
     if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
     if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
@@ -52,17 +53,35 @@
       const diskTotal = usage.disks.reduce((sum, disk) => sum + disk.total, 0);
       const diskUsed = usage.disks.reduce((sum, disk) => sum + disk.used, 0);
       lines = [
-        { kind: 'system', text: `当前目录：/${workdir}` },
+        { kind: 'system', text: t($language, '当前目录：/{path}', { path: workdir }) },
         {
           kind: 'system',
-          text: `用户配额：${formatBytes(usage.used_bytes)} / ${formatBytes(usage.quota_bytes)}`,
+          text: t($language, '用户配额：{used} / {quota}', {
+            used: formatBytes(usage.used_bytes),
+            quota: formatBytes(usage.quota_bytes),
+          }),
         },
-        { kind: 'system', text: `物理磁盘：${formatBytes(diskUsed)} / ${formatBytes(diskTotal)}` },
-        { kind: 'system', text: `本目录：${directories} 个目录，${files} 个文件` },
+        {
+          kind: 'system',
+          text: t($language, '物理磁盘：{used} / {total}', {
+            used: formatBytes(diskUsed),
+            total: formatBytes(diskTotal),
+          }),
+        },
+        {
+          kind: 'system',
+          text: t($language, '本目录：{dirs} 个目录，{files} 个文件', {
+            dirs: directories,
+            files,
+          }),
+        },
       ];
     } catch (error) {
       lines = [
-        { kind: 'error', text: error instanceof Error ? error.message : '无法读取终端信息' },
+        {
+          kind: 'error',
+          text: error instanceof Error ? error.message : t($language, '无法读取终端信息'),
+        },
       ];
     }
   }
@@ -78,7 +97,7 @@
 
   function send(message: unknown): boolean {
     if (socket?.readyState !== WebSocket.OPEN) {
-      append('error', '终端连接尚未建立。');
+      append('error', t($language, '终端连接尚未建立。'));
       return false;
     }
     socket.send(JSON.stringify(message));
@@ -97,13 +116,13 @@
       try {
         message = JSON.parse(String(event.data)) as ServerMessage;
       } catch {
-        append('error', '终端返回了无法解析的数据。');
+        append('error', t($language, '终端返回了无法解析的数据。'));
         return;
       }
       if (message.type === 'ready') {
         connected = true;
         workdir = message.cwd;
-        append('system', '已建立 WebSocket 终端连接。');
+        append('system', t($language, '已建立 WebSocket 终端连接。'));
         focusInput();
       } else if (message.type === 'result') {
         if (message.output) append('output', message.output);
@@ -120,7 +139,7 @@
     socket.addEventListener('close', () => {
       connected = false;
       busy = false;
-      append('system', '终端连接已断开。');
+      append('system', t($language, '终端连接已断开。'));
     });
     socket.addEventListener('error', () => {
       connected = false;
@@ -173,7 +192,7 @@
       if (line.toLowerCase() === 'y') {
         execute(command, true);
       } else {
-        lines = [...lines, { kind: 'system', text: '已取消删除。' }];
+        lines = [...lines, { kind: 'system', text: t($language, '已取消删除。') }];
         focusInput();
       }
       return;
@@ -181,7 +200,10 @@
 
     if (/^rm(?:\s|$)/.test(line) && !/\s-y(?:\s|$)/.test(line)) {
       pendingDelete = line;
-      lines = [...lines, { kind: 'prompt', text: '确认删除？输入 y 确认，其他内容取消。' }];
+      lines = [
+        ...lines,
+        { kind: 'prompt', text: t($language, '确认删除？输入 y 确认，其他内容取消。') },
+      ];
       focusInput();
       return;
     }
@@ -204,7 +226,7 @@
   <section
     class="terminal-window"
     style={`transform:translate(${offsetX}px, ${offsetY}px)`}
-    aria-label="终端"
+    aria-label={t($language, '终端')}
     onclick={(event) => {
       event.stopPropagation();
       inputElement?.focus();
@@ -215,7 +237,7 @@
         <span class="tab-dot"></span>
         <span>FileHub Terminal</span>
       </div>
-      <button type="button" class="close" aria-label="关闭终端" onclick={onClose}>
+      <button type="button" class="close" aria-label={t($language, '关闭终端')} onclick={onClose}>
         <Icon name="close" size={16} />
       </button>
     </header>
@@ -240,7 +262,7 @@
           spellcheck="false"
         />
         {#if !connected}
-          <button type="button" class="reconnect" onclick={connect}>重连</button>
+          <button type="button" class="reconnect" onclick={connect}>{t($language, '重连')}</button>
         {/if}
       </form>
     </div>

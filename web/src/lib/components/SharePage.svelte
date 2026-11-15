@@ -148,7 +148,7 @@
       {#if data.is_dir}
         <div class="share-toolbar">
           <nav class="path" aria-label={t($language, '分享路径')}>
-            <button type="button" onclick={() => navigate('')}>根目录</button>
+            <button type="button" onclick={() => navigate('')}>{t($language, '根目录')}</button>
             {#each path.split('/').filter(Boolean) as segment, index (index)}
               <span>/</span>
               <button

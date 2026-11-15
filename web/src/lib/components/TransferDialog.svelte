@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type Entry, type Root } from '../api';
+  import { language, rootAlias, t } from '../i18n';
   import Icon from './Icon.svelte';
 
   let {
@@ -44,7 +45,7 @@
       const result = await api.list(rootId, path, 'name', 'asc', false);
       directories = result.entries.filter((entry) => entry.is_dir);
     } catch (err) {
-      error = err instanceof Error ? err.message : '目录加载失败';
+      error = err instanceof Error ? err.message : t($language, '目录加载失败');
       directories = [];
     } finally {
       loading = false;
@@ -86,13 +87,13 @@
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <form class="transfer-dialog" onsubmit={submit} onclick={(event) => event.stopPropagation()}>
-      <h2>{mode === 'copy' ? '复制到' : '移动到'}</h2>
-      <p class="hint">共 {count} 项，点击选择目标目录。</p>
+      <h2>{mode === 'copy' ? t($language, '复制到') : t($language, '移动到')}</h2>
+      <p class="hint">{t($language, '共 {count} 项，点击选择目标目录。', { count })}</p>
       <label>
-        <span>存储目录</span>
+        <span>{t($language, '存储目录')}</span>
         <select value={rootId} onchange={changeRoot}>
           {#each roots as root (root.id)}
-            <option value={root.id}>{root.alias}</option>
+            <option value={root.id}>{rootAlias($language, root.alias)}</option>
           {/each}
         </select>
       </label>
@@ -121,15 +122,17 @@
             }}>{segment}</button
           >
         {/each}
-        {#if path}<button type="button" class="ghost small" onclick={up}>上一级</button>{/if}
+        {#if path}<button type="button" class="ghost small" onclick={up}
+            >{t($language, '上一级')}</button
+          >{/if}
       </div>
       <div class="picker-list">
         {#if loading}
-          <p class="hint">加载中…</p>
+          <p class="hint">{t($language, '加载中…')}</p>
         {:else if error}
           <p class="error">{error}</p>
         {:else if directories.length === 0}
-          <p class="hint">当前目录没有子目录，可直接选择这里。</p>
+          <p class="hint">{t($language, '当前目录没有子目录，可直接选择这里。')}</p>
         {:else}
           {#each directories as directory (directory.name)}
             <button
@@ -144,10 +147,12 @@
           {/each}
         {/if}
       </div>
-      <p class="hint">目标目录：<strong>/{path}</strong></p>
+      <p class="hint">{t($language, '目标目录：')}<strong>/{path}</strong></p>
       <div class="dialog-actions">
-        <button type="button" class="ghost" onclick={onClose}>取消</button>
-        <button type="submit">{mode === 'copy' ? '复制到这里' : '移动到这里'}</button>
+        <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button>
+        <button type="submit"
+          >{mode === 'copy' ? t($language, '复制到这里') : t($language, '移动到这里')}</button
+        >
       </div>
     </form>
   </div>

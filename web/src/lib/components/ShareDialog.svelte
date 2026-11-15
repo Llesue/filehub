@@ -2,6 +2,7 @@
   import { api, ApiError } from '../api';
   import Icon from './Icon.svelte';
   import { copyText } from '../clipboard';
+  import { language, t } from '../i18n';
   import { overlayGuard } from '../overlayGuard';
 
   let {
@@ -46,7 +47,7 @@
       );
       created = { url: result.url, token: result.token };
     } catch (err) {
-      error = err instanceof ApiError ? err.message : '创建分享失败';
+      error = err instanceof ApiError ? err.message : t($language, '创建分享失败');
     } finally {
       busy = false;
     }
@@ -67,21 +68,21 @@
   >
     <header>
       <div>
-        <h2 id="share-title">分享</h2>
+        <h2 id="share-title">{t($language, '分享')}</h2>
         <span>{name}</span>
       </div>
-      <button type="button" class="icon-button" aria-label="关闭" onclick={onClose}>
+      <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}>
         <Icon name="close" size={20} />
       </button>
     </header>
 
     {#if created}
       <div class="created">
-        <p>分享已创建，链接只显示一次：</p>
+        <p>{t($language, '分享已创建，链接只显示一次：')}</p>
         <code>{window.location.origin}{created.url}</code>
         <div class="actions">
-          <button type="button" onclick={() => void copyLink()}>复制链接</button>
-          <button type="button" class="primary" onclick={onClose}>完成</button>
+          <button type="button" onclick={() => void copyLink()}>{t($language, '复制链接')}</button>
+          <button type="button" class="primary" onclick={onClose}>{t($language, '完成')}</button>
         </div>
       </div>
     {:else}
@@ -92,16 +93,20 @@
         }}
       >
         <label>
-          <span>密码（可选）</span>
-          <input bind:value={password} type="password" placeholder="留空表示无密码" />
+          <span>{t($language, '密码（可选）')}</span>
+          <input
+            bind:value={password}
+            type="password"
+            placeholder={t($language, '留空表示无密码')}
+          />
         </label>
         <label>
-          <span>有效期</span>
+          <span>{t($language, '有效期')}</span>
           <select bind:value={expiresDays}>
-            <option value="0">永久</option>
-            <option value="1">1 天</option>
-            <option value="7">7 天</option>
-            <option value="30">30 天</option>
+            <option value="0">{t($language, '永久')}</option>
+            <option value="1">{t($language, '1 天')}</option>
+            <option value="7">{t($language, '7 天')}</option>
+            <option value="30">{t($language, '30 天')}</option>
           </select>
         </label>
         {#if isDir}
@@ -111,14 +116,14 @@
               checked={readOnly}
               onchange={(event) => (readOnlyOverride = event.currentTarget.checked)}
             />
-            只读分享
+            {t($language, '只读分享')}
           </label>
         {/if}
         {#if error}<p class="error" role="alert">{error}</p>{/if}
         <div class="actions">
-          <button type="button" onclick={onClose}>取消</button>
+          <button type="button" onclick={onClose}>{t($language, '取消')}</button>
           <button type="submit" class="primary" disabled={busy}
-            >{busy ? '创建中…' : '创建分享'}</button
+            >{busy ? t($language, '创建中…') : t($language, '创建分享')}</button
           >
         </div>
       </form>

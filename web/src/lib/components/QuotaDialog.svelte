@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
   let {
@@ -22,7 +23,7 @@
     const raw = String(amount).trim();
     if (!raw) return null;
     const value = Number(raw);
-    if (!Number.isFinite(value)) throw new Error('请输入有效的配额数字');
+    if (!Number.isFinite(value)) throw new Error(t($language, '请输入有效的配额数字'));
     return (
       Math.max(0, value) *
       (unit === 'KB' ? 1024 : unit === 'MB' ? 1024 ** 2 : unit === 'GB' ? 1024 ** 3 : 1024 ** 4)
@@ -36,7 +37,7 @@
       await onSave(bytes());
       onClose();
     } catch (err) {
-      error = err instanceof Error ? err.message : '保存失败';
+      error = err instanceof Error ? err.message : t($language, '保存失败');
     } finally {
       busy = false;
     }
@@ -52,23 +53,27 @@
     onclick={(event) => event.stopPropagation()}
   >
     <header>
-      <h2>配置配额</h2>
-      <button type="button" class="icon-button" aria-label="关闭" onclick={onClose}
+      <h2>{t($language, '配置配额')}</h2>
+      <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}
         ><Icon name="close" size={18} /></button
       >
     </header>
-    <p class="hint">留空表示不限制；只统计用户 home 目录。</p>
+    <p class="hint">{t($language, '留空表示不限制；只统计用户 home 目录。')}</p>
     <div class="quota-row">
-      <input bind:value={amount} type="number" min="0" placeholder="不限制" /><select
-        bind:value={unit}
+      <input
+        bind:value={amount}
+        type="number"
+        min="0"
+        placeholder={t($language, '不限制')}
+      /><select bind:value={unit}
         ><option>KB</option><option>MB</option><option>GB</option><option>TB</option></select
       >
     </div>
     {#if error}<p class="error">{error}</p>{/if}
     <footer>
-      <button type="button" class="ghost" onclick={onClose}>取消</button><button
+      <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button><button
         type="submit"
-        disabled={busy}>{busy ? '保存中…' : '保存'}</button
+        disabled={busy}>{busy ? t($language, '保存中…') : t($language, '保存')}</button
       >
     </footer>
   </form>

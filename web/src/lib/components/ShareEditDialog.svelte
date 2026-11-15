@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { ShareInfo } from '../api';
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   let {
     share,
@@ -22,7 +23,7 @@
       await onSave(readOnly);
       onClose();
     } catch (err) {
-      error = err instanceof Error ? err.message : '保存失败';
+      error = err instanceof Error ? err.message : t($language, '保存失败');
     } finally {
       busy = false;
     }
@@ -38,21 +39,23 @@
     onclick={(event) => event.stopPropagation()}
   >
     <header>
-      <h2>编辑共享</h2>
-      <button type="button" class="icon-button" aria-label="关闭" onclick={onClose}
-        ><Icon name="close" size={18} /></button
-      >
+      <h2>{t($language, '编辑共享')}</h2>
+      <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}>
+        <Icon name="close" size={18} />
+      </button>
     </header>
     <label class="row"
-      ><span>权限</span><select bind:value={readOnly}
-        ><option value={false}>读写</option><option value={true}>只读</option></select
+      ><span>{t($language, '权限')}</span><select bind:value={readOnly}
+        ><option value={false}>{t($language, '读写')}</option><option value={true}
+          >{t($language, '只读')}</option
+        ></select
       ></label
     >
     {#if error}<p class="error">{error}</p>{/if}
     <footer>
-      <button type="button" class="ghost" onclick={onClose}>取消</button><button
+      <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button><button
         type="submit"
-        disabled={busy}>{busy ? '保存中…' : '保存'}</button
+        disabled={busy}>{busy ? t($language, '保存中…') : t($language, '保存')}</button
       >
     </footer>
   </form>

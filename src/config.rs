@@ -186,7 +186,7 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             default_theme: "system".into(),
-            default_locale: "zh-CN".into(),
+            default_locale: "en".into(),
             locales: vec!["zh-CN".into(), "en".into()],
         }
     }

@@ -83,6 +83,15 @@ sc.exe start FileHub
 
 服务以 `LocalSystem` 运行，开机自启；数据库、用户目录、缓存和日志默认在 `C:\ProgramData\FileHub`。日志文件名是 `filehub.log.YYYY-MM-DD`。
 
+读取服务日志和首次初始化 token：
+
+```powershell
+Get-ChildItem C:\ProgramData\FileHub\filehub.log.* |
+  Sort-Object LastWriteTime |
+  Select-Object -Last 1 |
+  Get-Content -Tail 50
+```
+
 停止和卸载：
 
 ```powershell

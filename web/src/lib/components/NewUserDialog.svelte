@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
   import { overlayGuard } from '../overlayGuard';
 
@@ -39,7 +40,7 @@
     event.preventDefault();
     error = '';
     if (!username.trim() || !password) {
-      error = '用户名和密码不能为空';
+      error = t($language, '用户名和密码不能为空');
       return;
     }
     busy = true;
@@ -47,7 +48,7 @@
       await onSave(username.trim(), password, bytes());
       onClose();
     } catch (err) {
-      error = err instanceof Error ? err.message : '创建用户失败';
+      error = err instanceof Error ? err.message : t($language, '创建用户失败');
     } finally {
       busy = false;
     }
@@ -63,20 +64,25 @@
     onclick={(event) => event.stopPropagation()}
   >
     <header>
-      <h2>新建用户</h2>
-      <button type="button" class="icon-button" aria-label="关闭" onclick={onClose}
+      <h2>{t($language, '新建用户')}</h2>
+      <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}
         ><Icon name="close" size={18} /></button
       >
     </header>
-    <label><span>用户名</span><input bind:value={username} autocomplete="off" /></label>
     <label
-      ><span>初始密码（可修改）</span><input
+      ><span>{t($language, '用户名')}</span><input
+        bind:value={username}
+        autocomplete="off"
+      /></label
+    >
+    <label
+      ><span>{t($language, '初始密码（可修改）')}</span><input
         bind:value={password}
         autocomplete="new-password"
       /></label
     >
     <label
-      ><span>配额</span>
+      ><span>{t($language, '配额')}</span>
       <div class="quota-row">
         <input bind:value={quota} type="number" min="0" /><select bind:value={unit}
           ><option>KB</option><option>MB</option><option>GB</option><option>TB</option></select
@@ -85,9 +91,9 @@
     >
     {#if error}<p class="error">{error}</p>{/if}
     <footer>
-      <button type="button" class="ghost" onclick={onClose}>取消</button><button
+      <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button><button
         type="submit"
-        disabled={busy}>{busy ? '创建中…' : '创建用户'}</button
+        disabled={busy}>{busy ? t($language, '创建中…') : t($language, '创建用户')}</button
       >
     </footer>
   </form>
