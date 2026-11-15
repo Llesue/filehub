@@ -425,6 +425,7 @@ const en: Record<string, string> = {
   '{count} 小时前': '{count} hours ago',
   '{count} 天前': '{count} days ago',
   正在加载: 'Loading',
+  '索引中…': 'Indexing…',
   '已选 {count} 项': '{count} selected',
   取消选择: 'Clear selection',
   继续滚动加载更多: 'Scroll to load more',

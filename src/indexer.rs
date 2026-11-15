@@ -50,17 +50,18 @@ pub async fn index_path(
 ) -> Result<IndexStats, AppError> {
     let resolved = authz::resolve(state, user_id, root.id, relative, false).await?;
     let base = resolved.absolute.clone();
-
-    let scans = tokio::task::spawn_blocking(move || collect_dirs(&base, recursive))
-        .await
-        .map_err(|err| AppError::internal(anyhow::anyhow!("index task failed: {err}")))??;
+    let ignore = state.settings().settings.index.ignore.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    let task = tokio::task::spawn_blocking(move || {
+        collect_dirs_channel(&base, recursive, &ignore, sender)
+    });
 
     let mut stats = IndexStats {
         directories: 0,
         entries: 0,
     };
 
-    for scan in scans {
+    while let Some(scan) = receiver.recv().await {
         let path = scan.path.to_string_lossy().to_string();
         let dir_id = state
             .db
@@ -90,46 +91,51 @@ pub async fn index_path(
         stats.entries += count;
     }
 
+    task.await
+        .map_err(|err| AppError::internal(anyhow::anyhow!("index task failed: {err}")))??;
+
     Ok(stats)
 }
 
-#[cfg(not(windows))]
-fn collect_dirs(base: &Path, recursive: bool) -> Result<Vec<DirScan>, AppError> {
-    collect_dirs_std(base, recursive)
-}
-
-#[cfg(windows)]
-fn collect_dirs(base: &Path, recursive: bool) -> Result<Vec<DirScan>, AppError> {
+fn collect_dirs_channel(
+    base: &Path,
+    recursive: bool,
+    ignore: &[String],
+    sender: tokio::sync::mpsc::Sender<DirScan>,
+) -> Result<(), AppError> {
+    #[cfg(windows)]
     if recursive {
         match crate::winindex::scan(base, true) {
             Ok(scans) => {
-                return Ok(scans
-                    .into_iter()
-                    .map(|scan| {
-                        let mtime_ns = crate::fsops::dir_mtime_ns(&scan.path).unwrap_or_default();
-                        DirScan {
+                for scan in scans {
+                    let mtime_ns = crate::fsops::dir_mtime_ns(&scan.path).unwrap_or_default();
+                    if sender
+                        .blocking_send(DirScan {
                             path: scan.path,
                             mtime_ns,
                             entries: scan.entries,
-                        }
-                    })
-                    .collect());
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                return Ok(());
             }
             Err(error) => {
                 tracing::warn!(%error, path = %base.display(), "MFT index failed; falling back to directory scan");
             }
         }
     }
-    collect_dirs_std(base, recursive)
+    scan_walk(base, recursive, ignore, &sender)
 }
 
-fn collect_dirs_std(base: &Path, recursive: bool) -> Result<Vec<DirScan>, AppError> {
-    let mut scans = Vec::new();
-    collect_one(base, recursive, &mut scans)?;
-    Ok(scans)
-}
-
-fn collect_one(path: &Path, recursive: bool, scans: &mut Vec<DirScan>) -> Result<(), AppError> {
+fn scan_walk(
+    path: &Path,
+    recursive: bool,
+    ignore: &[String],
+    sender: &tokio::sync::mpsc::Sender<DirScan>,
+) -> Result<(), AppError> {
     let metadata = std::fs::metadata(path).map_err(io_error)?;
     if !metadata.is_dir() {
         return Err(AppError::bad_request("index path is not a directory"));
@@ -148,7 +154,7 @@ fn collect_one(path: &Path, recursive: bool, scans: &mut Vec<DirScan>) -> Result
     for entry in std::fs::read_dir(path).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(".filehub-upload-") {
+        if name.starts_with(".filehub-upload-") || ignore.iter().any(|ignored| ignored == &name) {
             continue;
         }
 
@@ -182,14 +188,19 @@ fn collect_one(path: &Path, recursive: bool, scans: &mut Vec<DirScan>) -> Result
         }
     }
 
-    scans.push(DirScan {
-        path: path.to_path_buf(),
-        mtime_ns,
-        entries,
-    });
+    if sender
+        .blocking_send(DirScan {
+            path: path.to_path_buf(),
+            mtime_ns,
+            entries,
+        })
+        .is_err()
+    {
+        return Ok(());
+    }
 
     for child in child_dirs {
-        collect_one(&child, true, scans)?;
+        scan_walk(&child, true, ignore, sender)?;
     }
 
     Ok(())

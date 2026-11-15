@@ -59,7 +59,6 @@
   let selected = $state<string[]>([]);
   let selectionAnchor = $state<string | null>(null);
   let filesLoading = $state(false);
-  let dirSizes = $state<Record<string, number>>({});
   let filesLoadingMore = $state(false);
   let nextCursor = $state<string | null>(null);
   let filesError = $state('');
@@ -74,6 +73,7 @@
   let searchQuery = $state('');
   let searchResults = $state<SearchEntry[]>([]);
   let searchActive = $state(false);
+  let searchIndexing = $state(false);
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   let searchInput = $state<HTMLInputElement | null>(null);
   const indexedRoots = new SvelteSet<number>();
@@ -368,7 +368,6 @@
       currentPath = result.path;
       entries = result.entries;
       nextCursor = result.next_cursor;
-      void loadDirectorySizes(entries, result.root.id, result.path);
       selected = [];
       selectionAnchor = null;
       const remembered = localStorage.getItem(`view:${result.root.id}:${result.path}`);
@@ -406,7 +405,6 @@
       if (rootId !== activeRootId || path !== currentPath) return;
       entries = [...entries, ...result.entries];
       nextCursor = result.next_cursor;
-      void loadDirectorySizes(result.entries, result.root.id, result.path);
     } catch (error) {
       handleFilesError(error);
     } finally {
@@ -414,31 +412,8 @@
     }
   }
 
-  async function loadDirectorySizes(items: Entry[], rootId: number, path: string): Promise<void> {
-    const directories = items.filter((entry) => entry.is_dir);
-    let cursor = 0;
-    const worker = async (): Promise<void> => {
-      while (cursor < directories.length) {
-        const entry = directories[cursor++];
-        if (!entry) continue;
-        const key = `${rootId}:${joinPath(path, entry.name)}`;
-        if (dirSizes[key] !== undefined) continue;
-        try {
-          const result = await api.dirSize(rootId, joinPath(path, entry.name));
-          dirSizes = { ...dirSizes, [key]: result.size };
-        } catch {
-          dirSizes = { ...dirSizes, [key]: -1 };
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(4, directories.length) }, worker));
-  }
-
   function entrySize(entry: Entry): string {
-    if (!entry.is_dir) return formatSize(entry.size);
-    if (activeRootId === null) return t($language, '计算中…');
-    const size = dirSizes[`${activeRootId}:${joinPath(currentPath, entry.name)}`];
-    return size === undefined ? t($language, '计算中…') : size < 0 ? '—' : formatSize(size);
+    return entry.is_dir ? '—' : formatSize(entry.size);
   }
 
   function handleContentScroll(event: Event): void {
@@ -498,16 +473,28 @@
     const token = ++searchToken;
 
     const collect = async (forceIndex: boolean): Promise<SearchEntry[]> => {
+      const indexing: Promise<unknown>[] = [];
       const settled = await Promise.allSettled(
         roots.map(async (root) => {
           if (forceIndex || !indexedRoots.has(root.id)) {
-            await api.index(root.id, '', true);
             indexedRoots.add(root.id);
+            indexing.push(
+              api.index(root.id, '', true).catch((error) => {
+                console.warn('background index failed', error);
+              }),
+            );
           }
           const result = await api.search(root.id, query, 100);
           return result.entries.map((entry) => ({ ...entry, rootId: root.id }));
         }),
       );
+      if (indexing.length > 0) {
+        searchIndexing = true;
+        void Promise.allSettled(indexing).then(() => {
+          searchIndexing = false;
+          if (token === searchToken && searchQuery === query) void runSearch(query);
+        });
+      }
       return settled.flatMap((result) => (result.status === 'fulfilled' ? result.value : []));
     };
 
@@ -548,6 +535,7 @@
     searchActive = false;
     searchQuery = '';
     searchResults = [];
+    searchIndexing = false;
   }
 
   function navigateToSegment(index: number): void {
@@ -1585,6 +1573,9 @@
               {#if searchActive}
                 <div class="search-header">
                   <span>{t($language, '搜索')} “{searchQuery}”</span>
+                  {#if searchIndexing}
+                    <span class="muted">{t($language, '索引中…')}</span>
+                  {/if}
                   <button type="button" class="ghost" onclick={exitSearch}
                     >{t($language, '清除')}</button
                   >
