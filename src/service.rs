@@ -56,7 +56,7 @@ pub fn install(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     service
         .set_description("FileHub self-hosted file manager")
         .map_err(|err| anyhow::anyhow!("failed to set service description: {err}"))?;
-    println!("FileHub service installed. Start it with: sc start FileHub");
+    println!("FileHub service installed. Start it with: sc.exe start FileHub");
     Ok(())
 }
 

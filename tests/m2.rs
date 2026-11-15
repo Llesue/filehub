@@ -209,17 +209,20 @@ async fn list_download_range_and_etag() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(response).await["error"]["code"], "INVALID_PATH");
 
-    std::os::unix::fs::symlink("/etc", app.home.join("escape")).unwrap();
-    let symlink_uri = format!("/api/v1/download?root={}&path=escape/passwd", app.root_id);
-    let response = send(
-        &app.router,
-        Method::GET,
-        &symlink_uri,
-        Some(&app.cookie),
-        None,
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/etc", app.home.join("escape")).unwrap();
+        let symlink_uri = format!("/api/v1/download?root={}&path=escape/passwd", app.root_id);
+        let response = send(
+            &app.router,
+            Method::GET,
+            &symlink_uri,
+            Some(&app.cookie),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]

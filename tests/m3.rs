@@ -263,6 +263,7 @@ async fn root_crud_overlap_permissions_and_quota() {
     assert_eq!(quota.status(), StatusCode::INSUFFICIENT_STORAGE);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn trusted_link_allows_registered_external_target() {
     let app = setup_app().await;

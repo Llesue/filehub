@@ -179,7 +179,10 @@ async fn safe_command_runner_handles_wildcards_and_confirmation() {
     let inject = cmd(&app, "", "ls; cat /etc/passwd", false).await;
     assert_eq!(inject.status(), StatusCode::BAD_REQUEST);
 
-    let ln = cmd(&app, "", "ln -s a.txt link.txt", false).await;
-    assert_eq!(ln.status(), StatusCode::OK);
-    assert!(app.home.join("link.txt").is_symlink());
+    #[cfg(unix)]
+    {
+        let ln = cmd(&app, "", "ln -s a.txt link.txt", false).await;
+        assert_eq!(ln.status(), StatusCode::OK);
+        assert!(app.home.join("link.txt").is_symlink());
+    }
 }
