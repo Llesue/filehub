@@ -1,0 +1,61 @@
+# Build output
+/target/
+**/*.rs.bk
+node_modules/
+web/dist/
+web/.vite/
+web/.svelte-kit/
+*.tsbuildinfo
+/filehub
+/filehub.exe
+*.exe
+
+# Runtime data
+/data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.filehub-upload-*
+*.part
+
+# Local configuration and secrets
+/config.json
+/config.*.json
+!/config.example.json
+.env
+.env.*
+!.env.example
+*.secret
+*.token
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.log
+
+# Internal development / agent notes
+/AGENTS.md
+/PLAN.md
+/CONTRIBUTING.md
+.omo/
+.codegraph
+.claude/
+.opencode/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test / coverage
+/coverage/
+/playwright-report/
+/test-results/
+*.profraw

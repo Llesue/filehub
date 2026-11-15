@@ -1,0 +1,89 @@
+:root {
+  color-scheme: light;
+
+  --font-ui: 'Noto Sans', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  --font-mono: 'Noto Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --surface-2: #f1f3f4;
+  --text: #202124;
+  --text-2: #5f6368;
+  --border: #e3e5e8;
+  --accent: #1a73e8;
+  --accent-text: #1967d2;
+  --accent-soft: #e8f0fe;
+  --hover: #f1f3f4;
+  --danger: #d93025;
+  --on-accent: #ffffff;
+  --scrim: rgba(32, 33, 36, 0.4);
+  --scrim-strong: rgba(0, 0, 0, 0.72);
+  --lightbox-fg: #ffffff;
+  --terminal-bg: #111418;
+  --terminal-titlebar: #1b1f24;
+  --terminal-fg: #e8eaed;
+  --terminal-muted: #9aa0a6;
+  --terminal-border: #30363d;
+  --terminal-hover: #2b3138;
+
+  --file-folder: #f4b400;
+  --file-doc: #4285f4;
+  --file-sheet: #0f9d58;
+  --file-slide: #f4b400;
+  --file-pdf: #db4437;
+  --file-image: #a142f4;
+  --file-video: #e8710a;
+  --file-archive: #8d6e63;
+  --file-code: #00897b;
+
+  --radius-sm: 4px;
+  --radius: 8px;
+  --radius-pill: 20px;
+  --shadow-1: 0 1px 3px rgba(60, 64, 67, 0.18);
+  --shadow-2: 0 8px 24px rgba(60, 64, 67, 0.2);
+
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  --sidebar-width: 256px;
+  --sidebar-collapsed: 56px;
+  --topbar-height: 64px;
+  --pathbar-height: 44px;
+  --row-height: 48px;
+  --row-compact: 36px;
+  --details-width: 360px;
+  --content-pad: 28px;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #202124;
+  --surface: #292a2d;
+  --surface-2: #35363a;
+  --text: #e8eaed;
+  --text-2: #9aa0a6;
+  --border: #3c4043;
+  --accent: #8ab4f8;
+  --accent-text: #8ab4f8;
+  --accent-soft: #1e3a5f;
+  --hover: #35363a;
+  --danger: #f28b82;
+  --on-accent: #202124;
+  --scrim: rgba(0, 0, 0, 0.55);
+  --scrim-strong: rgba(0, 0, 0, 0.82);
+
+  --file-folder: #fdd663;
+  --file-doc: #8ab4f8;
+  --file-sheet: #81c995;
+  --file-slide: #fdd663;
+  --file-pdf: #f28b82;
+  --file-image: #c58af9;
+  --file-video: #fcad70;
+  --file-archive: #c7a99a;
+  --file-code: #78d9cb;
+
+  --shadow-1: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.5);
+}

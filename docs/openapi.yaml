@@ -1,0 +1,714 @@
+openapi: 3.1.0
+info:
+  title: FileHub API
+  version: 0.1.0
+  description: FileHub 自托管文件管理器 API。所有业务接口前缀 /api/v1。
+servers:
+  - url: /
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+tags:
+  - name: setup
+  - name: auth
+  - name: files
+  - name: transfer
+  - name: index
+  - name: shares
+  - name: admin
+  - name: terminal
+
+paths:
+  /api/v1/setup/status:
+    get:
+      tags: [setup]
+      security: []
+      summary: 是否完成初始化
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  initialized: { type: boolean }
+  /api/v1/setup:
+    post:
+      tags: [setup]
+      security: []
+      summary: 首次初始化管理员
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, username, password]
+              properties:
+                token: { type: string }
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/AuthResponse' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/login:
+    post:
+      tags: [auth]
+      security: []
+      summary: 登录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/AuthResponse' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/v1/logout:
+    post:
+      tags: [auth]
+      summary: 退出当前会话
+      responses:
+        '204': { description: Logged out }
+  /api/v1/me:
+    get:
+      tags: [auth]
+      summary: 当前用户与 CSRF token
+      responses:
+        '200': { $ref: '#/components/responses/AuthResponse' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/me/password:
+    post:
+      tags: [auth]
+      summary: 修改当前用户密码
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string }
+      responses:
+        '204': { description: Password changed }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/auth/tokens:
+    get:
+      tags: [auth]
+      summary: 列出 API Token
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [auth]
+      summary: 创建 API Token（明文只返回一次）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scope]
+              properties:
+                name: { type: string, maxLength: 64 }
+                scope: { type: string, enum: [read, write] }
+                expires_at: { type: integer, format: int64, nullable: true }
+      responses:
+        '200': { description: OK }
+  /api/v1/auth/tokens/{id}:
+    delete:
+      tags: [auth]
+      summary: 撤销 API Token
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '204': { description: Deleted }
+
+  /api/v1/roots:
+    get:
+      tags: [files]
+      summary: 当前用户授权根
+      responses:
+        '200': { description: OK }
+  /api/v1/list:
+    get:
+      tags: [files]
+      summary: 目录列表
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, schema: { type: string, default: '' } }
+        - { name: sort, in: query, schema: { type: string, enum: [name, size, modified], default: name } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: asc } }
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/download:
+    get:
+      tags: [files]
+      summary: 单文件下载（Range/ETag）
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: inline, in: query, schema: { type: boolean, default: false }, description: 图片/视频以 inline 展示；SVG 仍强制下载 }
+      responses:
+        '200': { description: File }
+        '206': { description: Partial content }
+        '304': { description: Not modified }
+        '416': { description: Range not satisfiable }
+  /api/v1/download/zip:
+    post:
+      tags: [transfer]
+      summary: 流式 ZIP 下载
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, paths]
+              properties:
+                root: { type: integer, format: int64 }
+                paths:
+                  type: array
+                  maxItems: 1000
+                  items: { type: string }
+      responses:
+        '200': { description: application/zip }
+        '413': { $ref: '#/components/responses/Error' }
+  /api/v1/uploads:
+    post:
+      tags: [transfer]
+      summary: 创建分段上传会话
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, filename, total_size]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string, default: '' }
+                filename: { type: string }
+                total_size: { type: integer, format: int64 }
+                chunk_size: { type: integer, format: int64, nullable: true }
+      responses:
+        '200': { description: OK }
+        '507': { $ref: '#/components/responses/Error' }
+  /api/v1/uploads/{id}:
+    get:
+      tags: [transfer]
+      summary: 查询上传进度
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+  /api/v1/uploads/{id}/chunks/{index}:
+    put:
+      tags: [transfer]
+      summary: 上传分片
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: index, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200': { description: OK }
+  /api/v1/uploads/{id}/complete:
+    post:
+      tags: [transfer]
+      summary: 完成上传并原子落盘
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+  /api/v1/fs/delete/preview:
+    post:
+      tags: [files]
+      summary: 生成删除确认令牌
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, paths]
+              properties:
+                root: { type: integer, format: int64 }
+                paths: { type: array, items: { type: string } }
+      responses:
+        '200': { description: OK }
+  /api/v1/fs/delete:
+    post:
+      tags: [files]
+      summary: 二次确认后永久删除
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                confirm_name: { type: string, nullable: true }
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/thumb:
+    get:
+      tags: [files]
+      summary: 缩略图
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: w, in: query, schema: { type: integer, minimum: 16, maximum: 2048, default: 256 } }
+      responses:
+        '200': { description: image/jpeg }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/file/probe:
+    get:
+      tags: [files]
+      summary: 检查文件是否可作为 UTF-8 文本编辑
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_text: { type: boolean }
+                  reason: { type: string }
+                  size: { type: integer, format: int64 }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/file:
+    get:
+      tags: [files]
+      summary: 读取文本文件
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+        '415': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [files]
+      summary: 保存文本文件（If-Match）
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: If-Match, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+      responses:
+        '200': { description: OK }
+        '412': { $ref: '#/components/responses/Error' }
+
+  /api/v1/terminal/ws:
+    get:
+      tags: [terminal]
+      summary: WebSocket 受限命令终端的升级端点
+      description: 使用 WebSocket，首条消息必须是带 CSRF token 的 init 消息。
+      responses:
+        '101': { description: Switching Protocols }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /api/v1/index:
+    post:
+      tags: [index]
+      summary: 触发目录索引
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string, default: '' }
+                recursive: { type: boolean, default: false }
+      responses:
+        '200': { description: OK }
+  /api/v1/index/status:
+    get:
+      tags: [index]
+      summary: 索引状态
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+  /api/v1/search:
+    get:
+      tags: [index]
+      summary: 文件名搜索
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        '200': { description: OK }
+  /api/v1/cmd:
+    post:
+      tags: [files]
+      summary: 受限命令执行
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, line]
+              properties:
+                root: { type: integer, format: int64 }
+                cwd: { type: string, default: '' }
+                line: { type: string }
+                confirm: { type: boolean, default: false }
+      responses:
+        '200': { description: OK }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/v1/shares:
+    get:
+      tags: [shares]
+      summary: 当前用户的分享
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [shares]
+      summary: 创建分享
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, path]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string }
+                password: { type: string, nullable: true }
+                expires_at: { type: integer, format: int64, nullable: true }
+                read_only: { type: boolean, default: true }
+      responses:
+        '200': { description: Token returned once }
+  /api/v1/shares/{id}:
+    delete:
+      tags: [shares]
+      summary: 撤销分享
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '204': { description: Revoked }
+  /api/v1/public/shares/{token}:
+    get:
+      tags: [shares]
+      security: []
+      summary: 公开分享元数据/目录列表
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, schema: { type: string } }
+        - { name: X-Share-Ticket, in: header, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/public/shares/{token}/unlock:
+    post:
+      tags: [shares]
+      security: []
+      summary: 密码分享解锁
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        '200': { description: Ticket }
+  /api/v1/public/shares/{token}/download:
+    get:
+      tags: [shares]
+      security: []
+      summary: 公开分享下载
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, schema: { type: string } }
+        - { name: X-Share-Ticket, in: header, schema: { type: string } }
+      responses:
+        '200': { description: File }
+
+  /api/v1/admin/users:
+    get:
+      tags: [admin]
+      summary: 用户列表
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [admin]
+      summary: 创建用户
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+                role: { type: string, enum: [admin, user], default: user }
+                quota_bytes: { type: integer, format: int64, nullable: true }
+      responses:
+        '200': { description: OK }
+  /api/v1/admin/users/{id}:
+    put:
+      tags: [admin]
+      summary: 更新用户
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password: { type: string, nullable: true }
+                role: { type: string, enum: [admin, user], nullable: true }
+                quota_bytes: { type: integer, format: int64, nullable: true }
+                clear_quota: { type: boolean, nullable: true }
+                disabled: { type: boolean, nullable: true }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [admin]
+      summary: 软删除用户
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '204': { description: Disabled }
+  /api/v1/admin/users/{id}/roots:
+    get:
+      tags: [admin]
+      summary: 用户存储目录
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [admin]
+      summary: 分配存储目录
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, alias]
+              properties:
+                path: { type: string }
+                alias: { type: string }
+                read_only: { type: boolean, default: false }
+                sort_order: { type: integer, default: 0 }
+      responses:
+        '200': { description: OK }
+  /api/v1/admin/users/{id}/roots/{rootId}:
+    put:
+      tags: [admin]
+      summary: 更新存储目录
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - { name: rootId, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alias]
+              properties:
+                alias: { type: string }
+                read_only: { type: boolean, default: false }
+                sort_order: { type: integer, default: 0 }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [admin]
+      summary: 移除存储目录
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+        - { name: rootId, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '204': { description: Deleted }
+  /api/v1/admin/server-paths:
+    get:
+      tags: [admin]
+      summary: 存储目录列表
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [admin]
+      summary: 登记服务器存储目录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, alias]
+              properties:
+                path: { type: string, description: 服务器绝对目录，例如 /mnt/red }
+                alias: { type: string, description: 显示别名，例如 红盘 }
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/admin/server-paths/{id}:
+    delete:
+      tags: [admin]
+      summary: 删除存储目录
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/admin/trusted-links:
+    get:
+      tags: [admin]
+      summary: 可信软链接列表
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [admin]
+      summary: 登记可信软链接
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [link_path, target_path]
+              properties:
+                link_path: { type: string }
+                target_path: { type: string }
+                access: { type: string, enum: [inherit, read_only, read_write], default: inherit }
+      responses:
+        '200': { description: OK }
+  /api/v1/admin/trusted-links/{id}:
+    delete:
+      tags: [admin]
+      summary: 撤销可信软链接
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '204': { description: Deleted }
+  /api/v1/admin/settings:
+    get:
+      tags: [admin]
+      summary: 生效配置与来源
+      responses:
+        '200': { description: OK }
+    put:
+      tags: [admin]
+      summary: 写入 DB 覆盖
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, value]
+              properties:
+                key: { type: string }
+                value: {}
+      responses:
+        '200': { description: OK }
+  /api/v1/admin/settings/{key}:
+    delete:
+      tags: [admin]
+      summary: 清除 DB 覆盖
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: filehub_session
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    Error:
+      description: Error envelope
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    AuthResponse:
+      description: Authenticated user
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              user: { $ref: '#/components/schemas/User' }
+              csrf_token: { type: string }
+              auth: { type: string, enum: [session, token] }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
+    User:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        username: { type: string }
+        role: { type: string, enum: [admin, user] }
+        quota_bytes: { type: integer, format: int64, nullable: true }
+        disabled: { type: boolean }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }

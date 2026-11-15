@@ -1,0 +1,290 @@
+<script lang="ts">
+  import { api, type Entry } from '../api';
+  import Icon from './Icon.svelte';
+
+  let {
+    root,
+    currentPath,
+    items,
+    index,
+    onClose,
+    onIndexChange,
+  }: {
+    root: number;
+    currentPath: string;
+    items: Entry[];
+    index: number;
+    onClose: () => void;
+    onIndexChange: (index: number) => void;
+  } = $props();
+
+  let current = $derived(items[index]);
+  let zoom = $state(1);
+  let offsetX = $state(0);
+  let offsetY = $state(0);
+  let showOriginal = $state(false);
+  let imageFallback = $state(false);
+  let dragging = false;
+  let dragged = false;
+  let dragStart = { x: 0, y: 0, offsetX: 0, offsetY: 0 };
+  let url = $derived(
+    current
+      ? api.previewUrl(root, currentPath ? `${currentPath}/${current.name}` : current.name)
+      : '',
+  );
+
+  function resetView(): void {
+    zoom = 1;
+    offsetX = 0;
+    offsetY = 0;
+    showOriginal = false;
+    imageFallback = false;
+  }
+
+  function previous(): void {
+    if (index > 0) {
+      resetView();
+      onIndexChange(index - 1);
+    }
+  }
+
+  function next(): void {
+    if (index < items.length - 1) {
+      resetView();
+      onIndexChange(index + 1);
+    }
+  }
+
+  function startDrag(event: PointerEvent): void {
+    event.preventDefault();
+    dragging = true;
+    dragged = true;
+    dragStart = { x: event.clientX, y: event.clientY, offsetX, offsetY };
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  }
+
+  function drag(event: PointerEvent): void {
+    if (!dragging) return;
+    offsetX = dragStart.offsetX + event.clientX - dragStart.x;
+    offsetY = dragStart.offsetY + event.clientY - dragStart.y;
+  }
+
+  function endDrag(): void {
+    dragging = false;
+  }
+
+  function onKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape') onClose();
+    if (event.key === 'ArrowLeft') previous();
+    if (event.key === 'ArrowRight') next();
+    if (event.key === '0') resetView();
+  }
+
+  function zoomBy(event: WheelEvent): void {
+    if (!current || isVideo(current.name) || isAudio(current.name) || isPdf(current.name)) return;
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? 1.15 : 0.87;
+    zoom = Math.min(8, Math.max(0.2, zoom * factor));
+  }
+
+  function isVideo(name: string): boolean {
+    return /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(name);
+  }
+
+  function isAudio(name: string): boolean {
+    return /\.(mp3|wav|ogg|m4a|flac|aac)$/i.test(name);
+  }
+
+  function isPdf(name: string): boolean {
+    return /\.pdf$/i.test(name);
+  }
+</script>
+
+<svelte:window onkeydown={onKeydown} onpointermove={drag} onpointerup={endDrag} />
+
+<div class="lightbox" role="presentation" onclick={onClose}>
+  <header class="lightbox-bar" role="presentation" onclick={(event) => event.stopPropagation()}>
+    <strong>{current?.name ?? ''}</strong>
+    <div class="lightbox-actions">
+      {#if current && !isVideo(current.name) && !isAudio(current.name) && !isPdf(current.name)}
+        <button type="button" onclick={() => (zoom = Math.max(0.2, zoom - 0.2))}>−</button>
+        <span>{Math.round(zoom * 100)}%</span>
+        <button type="button" onclick={() => (zoom = Math.min(8, zoom + 0.2))}>+</button>
+        <button type="button" onclick={() => resetView()}>复位</button>
+        <button type="button" onclick={() => (showOriginal = !showOriginal)}>
+          {showOriginal ? '显示预览图' : '显示原图'}
+        </button>
+      {/if}
+      <button type="button" class="icon-button" aria-label="关闭预览" onclick={onClose}>
+        <Icon name="close" size={22} />
+      </button>
+    </div>
+  </header>
+
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="lightbox-stage"
+    role="presentation"
+    onclick={() => {
+      if (dragged) {
+        dragged = false;
+        return;
+      }
+      onClose();
+    }}
+    onwheel={zoomBy}
+  >
+    {#if current}
+      {#if isVideo(current.name)}
+        <video src={url} controls autoplay playsinline onclick={(event) => event.stopPropagation()}
+          ><track kind="captions" /></video
+        >
+      {:else if isAudio(current.name)}
+        <audio src={url} controls autoplay onclick={(event) => event.stopPropagation()}></audio>
+      {:else if isPdf(current.name)}
+        <iframe class="lightbox-document" src={url} title={current.name}></iframe>
+      {:else}
+        <img
+          src={showOriginal || imageFallback
+            ? url
+            : api.previewThumbUrl(
+                root,
+                currentPath ? `${currentPath}/${current.name}` : current.name,
+                2048,
+              )}
+          alt={current.name}
+          style={`transform:translate(${offsetX}px, ${offsetY}px) scale(${zoom})`}
+          onclick={(event) => {
+            if (dragged) dragged = false;
+            event.stopPropagation();
+          }}
+          onpointerdown={startDrag}
+          onpointerup={endDrag}
+          onpointercancel={endDrag}
+          onerror={() => (imageFallback = true)}
+        />
+      {/if}
+    {/if}
+  </div>
+
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <footer class="lightbox-footer" onclick={(event) => event.stopPropagation()}>
+    <button type="button" onclick={previous} disabled={index <= 0}>上一项</button>
+    <span>{index + 1} / {items.length}</span>
+    <button type="button" onclick={next} disabled={index >= items.length - 1}>下一项</button>
+  </footer>
+</div>
+
+<style>
+  .lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    display: flex;
+    flex-direction: column;
+    background: var(--scrim-strong);
+    color: var(--lightbox-fg);
+  }
+
+  .lightbox-bar,
+  .lightbox-footer {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    background: rgb(0 0 0 / 38%);
+    color: var(--lightbox-fg);
+  }
+
+  .lightbox-bar strong {
+    overflow: hidden;
+    max-width: 60vw;
+    font-size: 15px;
+    font-weight: 500;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .lightbox-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  .lightbox-actions button,
+  .lightbox-footer button {
+    height: 30px;
+    padding: 0 10px;
+    border: 1px solid rgb(255 255 255 / 24%);
+    border-radius: 4px;
+    background: rgb(255 255 255 / 8%);
+    color: var(--lightbox-fg);
+    font-size: 13px;
+  }
+
+  .lightbox-actions button:hover,
+  .lightbox-footer button:hover {
+    background: rgb(255 255 255 / 18%);
+  }
+
+  .lightbox-actions button:disabled,
+  .lightbox-footer button:disabled {
+    opacity: 0.4;
+  }
+
+  .lightbox-actions .icon-button {
+    display: grid;
+    width: 36px;
+    padding: 0;
+    place-items: center;
+  }
+
+  .lightbox-stage {
+    display: grid;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    place-items: center;
+    padding: 18px;
+  }
+
+  .lightbox-stage img {
+    max-width: 92vw;
+    max-height: 78vh;
+    cursor: grab;
+    object-fit: contain;
+    touch-action: none;
+    user-select: none;
+  }
+
+  .lightbox-stage img:active {
+    cursor: grabbing;
+  }
+
+  .lightbox-stage video {
+    max-width: 92vw;
+    max-height: 78vh;
+    object-fit: contain;
+  }
+
+  .lightbox-stage audio {
+    width: min(640px, 90vw);
+  }
+
+  .lightbox-document {
+    width: 92vw;
+    height: 78vh;
+    border: 0;
+    background: var(--surface);
+  }
+
+  .lightbox-footer {
+    justify-content: center;
+    gap: 16px;
+    font-size: 13px;
+  }
+</style>

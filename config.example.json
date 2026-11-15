@@ -1,0 +1,54 @@
+{
+  "listen": "0.0.0.0:8080",
+  "db_path": "/var/lib/filehub/filehub.db",
+  "users_root": "/srv/filehub/users",
+  "cache_dir": "/var/cache/filehub",
+  "thumbnails": {
+    "enabled": true,
+    "workers": 2,
+    "max_source_bytes": 52428800,
+    "max_pixels": 50000000,
+    "video": true,
+    "video_seek_seconds": 1,
+    "video_timeout_secs": 15,
+    "cache_max_bytes": 2147483648
+  },
+  "symlinks": {
+    "allow_create": true,
+    "follow_in_index": false,
+    "follow_admin_links": true,
+    "max_depth": 32,
+    "max_hops": 40
+  },
+  "index": {
+    "ignore": [".git", "node_modules", "@eaDir"],
+    "max_entries_per_dir": 200000,
+    "auto_index_on_browse": true
+  },
+  "uploads": {
+    "max_file_bytes": 10737418240,
+    "chunk_size": 8388608,
+    "session_ttl_hours": 24,
+    "concurrency_per_user": 2
+  },
+  "downloads": {
+    "zip_max_bytes": 2147483648,
+    "zip_max_files": 1000,
+    "zip_concurrency": 1
+  },
+  "editor": {
+    "enabled": true,
+    "max_file_bytes": 2097152
+  },
+  "ui": {
+    "default_theme": "system",
+    "default_locale": "zh-CN",
+    "locales": ["zh-CN", "en"]
+  },
+  "security": {
+    "session_ttl_hours": 168,
+    "cookie_secure": false,
+    "trusted_proxies": []
+  },
+  "log": { "level": "info", "format": "text" }
+}
