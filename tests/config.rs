@@ -52,6 +52,6 @@ fn bootstrap_only_keys_cannot_be_overridden_by_db() {
     assert_eq!(snapshot.sources.get("db_path"), Some(&Source::Default));
     assert_eq!(
         snapshot.settings.db_path,
-        std::path::PathBuf::from("./data/filehub.db")
+        filehub::platform::default_data_dir().join("filehub.db")
     );
 }
