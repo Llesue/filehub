@@ -6,6 +6,8 @@ FileHub 是一个单可执行文件的自托管文件管理器。它在浏览器
 
 前端是嵌入 Rust 二进制的 Svelte 5 SPA，元数据存放在 SQLite，文件仍然在文件系统里。Linux 发布物是单个静态 musl 二进制；Windows 使用同一套代码，单独产出 `filehub.exe`。
 
+![FileHub 主界面](docs/assets/filehub-main.png)
+
 ## 功能
 
 - 浏览、上传、下载、重命名、复制、移动和删除文件/目录
