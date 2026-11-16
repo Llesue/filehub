@@ -2,6 +2,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
+use std::time::Duration;
 use tower::ServiceExt;
 
 struct TestApp {
@@ -145,7 +146,33 @@ async fn index_and_search_finds_english_and_chinese() {
     )
     .await;
     assert_eq!(index.status(), StatusCode::OK);
-    assert!(json_body(index).await["entries"].as_u64().unwrap() >= 3);
+    let job_id = json_body(index).await["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut completed = false;
+    for _ in 0..200 {
+        let job = send(
+            &app.router,
+            Method::GET,
+            &format!("/api/v1/jobs/{job_id}"),
+            Some(&app.cookie),
+            None,
+        )
+        .await;
+        let job = json_body(job).await;
+        match job["status"].as_str() {
+            Some("completed") => {
+                assert!(job["result"]["entries"].as_u64().unwrap() >= 3);
+                completed = true;
+                break;
+            }
+            Some("failed") => panic!("index job failed: {}", job["error"]),
+            Some("cancelled") => panic!("index job was cancelled"),
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert!(completed, "index job did not finish");
 
     let status = send(
         &app.router,

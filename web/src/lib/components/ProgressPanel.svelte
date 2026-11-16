@@ -24,6 +24,11 @@
       >
     </div>
     <p>{$progress.detail || t($language, '请稍候…')}</p>
+    {#if $progress.onCancel && $progress.status === 'running'}
+      <button type="button" class="cancel-button" onclick={() => $progress.onCancel?.()}
+        >{t($language, '取消')}</button
+      >
+    {/if}
     <div class="progress-track">
       <div class="progress-fill" style={`width:${percentage ?? 100}%`}></div>
     </div>
@@ -64,6 +69,16 @@
     font-size: 12.5px;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .cancel-button {
+    margin: 0 0 9px;
+    padding: 3px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 12px;
   }
 
   .progress-track {

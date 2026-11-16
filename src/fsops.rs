@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use crate::db::{Root, TrustedLink};
 use crate::error::AppError;
@@ -19,6 +20,9 @@ pub struct Entry {
     pub is_symlink: bool,
     pub size: i64,
     pub modified: i64,
+    pub created_at: i64,
+    pub mime_type: String,
+    pub has_preview: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +61,15 @@ pub fn list_dir(resolved: &ResolvedPath, sort: &str, order: &str) -> Result<Vec<
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or_default();
+        let created_at = metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+        let mime_type = mime_guess::from_path(&name)
+            .first_or_octet_stream()
+            .to_string();
 
         entries.push(Entry {
             name,
@@ -68,6 +81,9 @@ pub fn list_dir(resolved: &ResolvedPath, sort: &str, order: &str) -> Result<Vec<
                 0
             },
             modified,
+            created_at,
+            mime_type,
+            has_preview: false,
         });
     }
 
@@ -571,38 +587,154 @@ pub fn rename_path(source: &Path, target: &Path) -> Result<(), AppError> {
 }
 
 pub fn copy_path(source: &Path, target: &Path) -> Result<(), AppError> {
+    let cancel = CancellationToken::new();
+    copy_path_with_progress(source, target, &cancel, 0, &mut |_, _, _| {})
+}
+
+pub fn copy_path_with_progress(
+    source: &Path,
+    target: &Path,
+    cancel: &CancellationToken,
+    total_bytes: u64,
+    progress: &mut dyn FnMut(u64, u64, u64),
+) -> Result<(), AppError> {
     let metadata = std::fs::symlink_metadata(source).map_err(io_error)?;
     if metadata.file_type().is_symlink() {
         return Err(AppError::invalid_path(
             "copying symbolic links is not supported",
         ));
     }
-    if metadata.is_dir() {
-        std::fs::create_dir(target).map_err(io_error)?;
-        for entry in std::fs::read_dir(source).map_err(io_error)? {
-            let entry = entry.map_err(io_error)?;
-            let name = entry.file_name();
-            copy_path(&entry.path(), &target.join(name))?;
+    if target.exists() {
+        return Err(AppError::conflict("copy target already exists"));
+    }
+    let result = copy_tree(source, target, cancel, total_bytes, progress);
+    if result.is_err() {
+        remove_path_quiet(target);
+    }
+    result
+}
+
+fn copy_tree(
+    source: &Path,
+    target: &Path,
+    cancel: &CancellationToken,
+    total_bytes: u64,
+    progress: &mut dyn FnMut(u64, u64, u64),
+) -> Result<(), AppError> {
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    let mut bytes_done = 0_u64;
+    let mut files_done = 0_u64;
+    let mut stack = vec![(source.to_path_buf(), target.to_path_buf())];
+
+    while let Some((source_path, target_path)) = stack.pop() {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
         }
-    } else if metadata.is_file() {
-        std::fs::copy(source, target).map_err(io_error)?;
-    } else {
-        return Err(AppError::invalid_path("unsupported file type"));
+        let metadata = std::fs::symlink_metadata(&source_path).map_err(io_error)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            std::fs::create_dir(&target_path).map_err(io_error)?;
+            for entry in std::fs::read_dir(&source_path).map_err(io_error)? {
+                let entry = entry.map_err(io_error)?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".filehub-upload-")
+                {
+                    continue;
+                }
+                stack.push((entry.path(), target_path.join(entry.file_name())));
+            }
+        } else if metadata.is_file() {
+            copy_file_cancellable(
+                &source_path,
+                &target_path,
+                &metadata,
+                cancel,
+                &mut buffer,
+                &mut bytes_done,
+                total_bytes,
+                progress,
+            )?;
+            files_done += 1;
+            progress(bytes_done, total_bytes, files_done);
+        } else {
+            return Err(AppError::invalid_path("unsupported file type"));
+        }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn copy_file_cancellable(
+    source: &Path,
+    target: &Path,
+    metadata: &std::fs::Metadata,
+    cancel: &CancellationToken,
+    buffer: &mut [u8],
+    bytes_done: &mut u64,
+    total_bytes: u64,
+    progress: &mut dyn FnMut(u64, u64, u64),
+) -> Result<(), AppError> {
+    let mut input = std::fs::File::open(source).map_err(io_error)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut output = options.open(target).map_err(io_error)?;
+    let mut copied = 0_u64;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let read = std::io::Read::read(&mut input, buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read]).map_err(io_error)?;
+        copied = copied.saturating_add(read as u64);
+        *bytes_done = bytes_done.saturating_add(read as u64);
+        if copied % (64 * 1024 * 1024) < read as u64 {
+            progress(*bytes_done, total_bytes, 0);
+        }
+    }
+    output.sync_all().map_err(io_error)?;
+    std::fs::set_permissions(target, metadata.permissions()).map_err(io_error)?;
+    Ok(())
+}
+
 pub fn move_path(source: &Path, target: &Path) -> Result<(), AppError> {
+    let cancel = CancellationToken::new();
+    move_path_with_progress(source, target, &cancel, 0, &mut |_, _, _| {})
+}
+
+pub fn move_path_with_progress(
+    source: &Path,
+    target: &Path,
+    cancel: &CancellationToken,
+    total_bytes: u64,
+    progress: &mut dyn FnMut(u64, u64, u64),
+) -> Result<(), AppError> {
     let metadata = std::fs::symlink_metadata(source).map_err(io_error)?;
+    if cancel.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
     match std::fs::rename(source, target) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            progress(total_bytes, total_bytes, 1);
+            Ok(())
+        }
         Err(error) if crate::platform::is_cross_device_error(&error) => {
             if metadata.file_type().is_symlink() {
                 return Err(AppError::invalid_path(
                     "moving symbolic links across filesystems is not supported",
                 ));
             }
-            copy_path(source, target)?;
+            copy_path_with_progress(source, target, cancel, total_bytes, progress)?;
+            if cancel.is_cancelled() {
+                remove_path_quiet(target);
+                return Err(AppError::Cancelled);
+            }
             if metadata.is_dir() {
                 std::fs::remove_dir_all(source).map_err(io_error)
             } else {
@@ -610,6 +742,17 @@ pub fn move_path(source: &Path, target: &Path) -> Result<(), AppError> {
             }
         }
         Err(error) => Err(io_error(error)),
+    }
+}
+
+fn remove_path_quiet(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -676,4 +819,249 @@ pub fn path_size_limited(path: &Path, max_entries: usize) -> u64 {
         total
     }
     walk(path, &mut max_entries.max(1))
+}
+
+#[cfg(unix)]
+fn disk_size_for_file(
+    metadata: &std::fs::Metadata,
+    use_logical: bool,
+    seen: &mut HashSet<(u64, u64)>,
+) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    if use_logical {
+        return metadata.len();
+    }
+    let identity = (metadata.dev(), metadata.ino());
+    if metadata.nlink() > 1 && !seen.insert(identity) {
+        return 0;
+    }
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn disk_size_for_file(
+    metadata: &std::fs::Metadata,
+    use_logical: bool,
+    _seen: &mut HashSet<(u64, u64)>,
+) -> u64 {
+    if use_logical {
+        return metadata.len();
+    }
+    let size = metadata.len();
+    if size == 0 {
+        0
+    } else {
+        size.saturating_add(4095) / 4096 * 4096
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DirSizeResult {
+    pub total: u64,
+    pub partial: bool,
+    pub error: Option<String>,
+    pub directories: u64,
+}
+
+struct SizeFrame {
+    path: PathBuf,
+    mtime_ns: i64,
+    total: u64,
+    partial: bool,
+    error: Option<String>,
+    children: Vec<PathBuf>,
+}
+
+fn build_size_frame(
+    path: PathBuf,
+    ignore: &[String],
+    cancel: &CancellationToken,
+    use_logical: bool,
+    seen: &mut HashSet<(u64, u64)>,
+) -> Result<SizeFrame, AppError> {
+    if cancel.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
+    let metadata = std::fs::metadata(&path).map_err(io_error)?;
+    if !metadata.is_dir() {
+        return Err(AppError::bad_request("path is not a directory"));
+    }
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or_default();
+    let mut frame = SizeFrame {
+        path,
+        mtime_ns,
+        total: 0,
+        partial: false,
+        error: None,
+        children: Vec::new(),
+    };
+    let entries = match std::fs::read_dir(&frame.path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if frame.children.is_empty() && frame.total == 0 {
+                return Err(io_error(error));
+            }
+            frame.partial = true;
+            frame.error = Some(error.to_string());
+            return Ok(frame);
+        }
+    };
+    for entry in entries {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                frame.partial = true;
+                frame.error.get_or_insert_with(|| error.to_string());
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".filehub-upload-") || ignore.iter().any(|ignored| ignored == &name) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                frame.partial = true;
+                frame.error.get_or_insert_with(|| error.to_string());
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            frame.children.push(entry.path());
+        } else if file_type.is_file() {
+            match entry.metadata() {
+                Ok(metadata) => {
+                    frame.total = frame.total.saturating_add(disk_size_for_file(
+                        &metadata,
+                        use_logical,
+                        seen,
+                    ));
+                }
+                Err(error) => {
+                    frame.partial = true;
+                    frame.error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+    }
+    Ok(frame)
+}
+
+/// Compute the logical size of a directory tree with an iterative walk.
+///
+/// The callback is invoked for every directory after its subtree has been
+/// fully measured, so callers can persist nested results and answer later
+/// navigation without rescanning.
+pub fn dir_size_scan(
+    root: &Path,
+    ignore: &[String],
+    cancel: &CancellationToken,
+    use_logical: bool,
+    on_dir: &mut dyn FnMut(&Path, u64, i64, bool),
+) -> Result<DirSizeResult, AppError> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![build_size_frame(
+        root.to_path_buf(),
+        ignore,
+        cancel,
+        use_logical,
+        &mut seen,
+    )?];
+    let mut directories = 1_u64;
+    let mut first_error: Option<String> = None;
+    let mut partial = false;
+
+    while !stack.is_empty() {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let Some(frame) = stack.last_mut() else {
+            break;
+        };
+        if let Some(child) = frame.children.pop() {
+            let child_path = child.clone();
+            match build_size_frame(child, ignore, cancel, use_logical, &mut seen) {
+                Ok(child_frame) => {
+                    directories += 1;
+                    stack.push(child_frame);
+                }
+                Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+                Err(error) => {
+                    let message = format!("{}: {error}", child_path.display());
+                    frame.partial = true;
+                    frame.error.get_or_insert_with(|| message.clone());
+                    partial = true;
+                    first_error.get_or_insert(message);
+                }
+            }
+            continue;
+        }
+
+        let Some(mut done) = stack.pop() else {
+            break;
+        };
+        if !use_logical {
+            done.total = done.total.max(4096);
+        }
+        on_dir(&done.path, done.total, done.mtime_ns, done.partial);
+        if let Some(parent) = stack.last_mut() {
+            parent.total = parent.total.saturating_add(done.total);
+            parent.partial |= done.partial;
+            if let Some(error) = done.error {
+                parent.error.get_or_insert(error);
+            }
+        } else {
+            partial |= done.partial;
+            if let Some(error) = done.error {
+                first_error.get_or_insert(error);
+            }
+            return Ok(DirSizeResult {
+                total: done.total,
+                partial,
+                error: first_error,
+                directories,
+            });
+        }
+    }
+
+    Ok(DirSizeResult {
+        total: 0,
+        partial,
+        error: first_error,
+        directories,
+    })
+}
+
+pub fn path_size_cancellable(
+    path: &Path,
+    cancel: &CancellationToken,
+    on_bytes: &mut dyn FnMut(u64),
+) -> Result<u64, AppError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        let size = metadata.len();
+        on_bytes(size);
+        return Ok(size);
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    let result = dir_size_scan(path, &[], cancel, true, &mut |_, _, _, _| {})?;
+    on_bytes(result.total);
+    Ok(result.total)
 }

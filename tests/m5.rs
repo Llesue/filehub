@@ -37,6 +37,7 @@ async fn setup_app() -> TestApp {
     .save(home.join("photo.png"))
     .unwrap();
     std::fs::write(home.join("fake.heic"), b"not a real heic").unwrap();
+    std::fs::write(home.join("broken.png"), b"not a real png").unwrap();
     TestApp {
         _dir: dir,
         home,
@@ -90,6 +91,25 @@ fn session_cookie(response: &Response<Body>) -> String {
         .to_owned()
 }
 
+fn count_fail_markers(directory: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                count_fail_markers(&path)
+            } else if path.extension().and_then(|value| value.to_str()) == Some("fail") {
+                1
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
 async fn json_body(response: Response<Body>) -> Value {
     let body = to_bytes(response.into_body(), 10 * 1024 * 1024)
         .await
@@ -107,14 +127,43 @@ async fn thumbnails_are_generated_cached_and_safe() {
         response.headers().get(header::CONTENT_TYPE).unwrap(),
         "image/jpeg"
     );
+    let etag = response
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert!(body.starts_with(&[0xff, 0xd8]));
+
+    let builder = Request::builder()
+        .method(Method::GET)
+        .uri(&uri)
+        .header(header::COOKIE, &app.cookie)
+        .header(header::IF_NONE_MATCH, &etag);
+    let response = app
+        .router
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let heic = format!("/api/v1/thumb?root={}&path=fake.heic&w=64", app.root_id);
     let response = send(&app.router, Method::GET, &heic, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let broken = format!("/api/v1/thumb?root={}&path=broken.png&w=64", app.root_id);
+    let response = send(&app.router, Method::GET, &broken, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let cache_root = app._dir.path().join("cache/thumbs");
+    let failures = count_fail_markers(&cache_root);
+    assert!(failures >= 1, "expected a negative thumbnail marker");
+    let response = send(&app.router, Method::GET, &broken, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let traversal = format!("/api/v1/thumb?root={}&path=../photo.png&w=64", app.root_id);

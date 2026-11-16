@@ -148,14 +148,14 @@ pub async fn save(
 
     let bytes = request.content.into_bytes();
     let path = resolved.absolute.clone();
-    let parent = path.parent().map(|path| path.to_string_lossy().to_string());
-    tokio::task::spawn_blocking(move || fsops::write_text_atomic(&path, &bytes))
+    let write_path = path.clone();
+    tokio::task::spawn_blocking(move || fsops::write_text_atomic(&write_path, &bytes))
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("editor save task failed: {err}")))??;
 
-    if let Some(parent) = parent {
-        let _ = state.db.mark_index_stale(&parent).await;
-    }
+    state
+        .invalidate_path_caches(&path, Some(current.user.id), false)
+        .await;
     let new_info = tokio::task::spawn_blocking({
         let path = resolved.absolute.clone();
         move || fsops::file_info(&path)
@@ -200,14 +200,15 @@ fn classify_text(bytes: &[u8]) -> (bool, &'static str) {
 }
 
 async fn audit(state: &Arc<AppState>, user_id: i64, path: &str, headers: &HeaderMap) {
-    let ip = auth::client_ip(headers);
-    if let Err(error) = state
-        .db
-        .audit(Some(user_id), "edit", Some(path), None, ip.as_deref())
-        .await
-    {
-        tracing::warn!(error = %error, "failed to write editor audit log");
-    }
+    state
+        .enqueue_audit(crate::db::AuditRecord {
+            user_id: Some(user_id),
+            action: "edit".to_owned(),
+            path: Some(path.to_owned()),
+            detail: None,
+            ip: auth::client_ip(headers),
+        })
+        .await;
 }
 
 #[cfg(test)]

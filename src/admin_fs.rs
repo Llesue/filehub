@@ -16,6 +16,7 @@ use crate::state::AppState;
 pub struct AuditQuery {
     limit: Option<i64>,
     cursor: Option<String>,
+    before_id: Option<i64>,
 }
 
 pub async fn list_audit(
@@ -26,20 +27,22 @@ pub async fn list_audit(
     let current = auth::current_user(&state, &headers).await?;
     auth::require_admin(&current)?;
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
-    let offset = query
-        .cursor
-        .as_deref()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0);
+    let before_id = query.before_id.or_else(|| {
+        query
+            .cursor
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+    });
     let mut entries = state
         .db
-        .list_audit(limit + 1, offset)
+        .list_audit(limit + 1, before_id)
         .await
         .map_err(AppError::internal)?;
     let has_more = entries.len() as i64 > limit;
     entries.truncate(limit as usize);
+    let next_cursor = has_more.then(|| entries.last().map(|entry| entry.id.to_string()));
     Ok(Json(json!({
-        "next_cursor": has_more.then(|| (offset + limit).to_string()),
+        "next_cursor": next_cursor.flatten(),
         "entries": entries.iter().map(|entry| json!({
             "id": entry.id,
             "username": entry.username,
@@ -76,13 +79,89 @@ pub async fn list_roots(
         .await
         .map_err(AppError::internal)?;
     Ok(Json(json!({
-        "roots": roots.iter().map(|root| json!({
-            "id": root.id,
-            "alias": root.alias,
-            "real_path": root.real_path,
-            "read_only": root.read_only,
-            "sort_order": root.sort_order,
-        })).collect::<Vec<_>>()
+        "roots": roots.iter().map(|root| {
+            let covered = covering_root(&roots, root);
+            json!({
+                "id": root.id,
+                "alias": root.alias,
+                "real_path": root.real_path,
+                "read_only": root.read_only,
+                "sort_order": root.sort_order,
+                "covered_by": covered.map(|other| other.alias.clone()),
+                "covered_by_id": covered.map(|other| other.id),
+            })
+        }).collect::<Vec<_>>()
+    })))
+}
+
+fn covering_root<'a>(
+    roots: &'a [crate::db::Root],
+    root: &crate::db::Root,
+) -> Option<&'a crate::db::Root> {
+    let path = std::path::Path::new(&root.real_path);
+    roots
+        .iter()
+        .filter(|other| {
+            other.id != root.id
+                && other.real_path.len() < root.real_path.len()
+                && crate::platform::path_within(path, std::path::Path::new(&other.real_path))
+        })
+        .min_by_key(|other| other.real_path.len())
+}
+
+pub async fn status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    let jobs = state.jobs.summary();
+    let job_counts = state.db.job_counts().await.map_err(AppError::internal)?;
+    let directory_sizes = state
+        .db
+        .directory_size_counts()
+        .await
+        .map_err(AppError::internal)?;
+    let stats = state.db.stats().await.map_err(AppError::internal)?;
+    let slow_requests = state.recent_slow_requests();
+    let settings = state.settings();
+    let last_quick_scan = state
+        .db
+        .runtime_state_get("index.last_quick_scan")
+        .await
+        .ok()
+        .flatten();
+    let last_full_scan = state
+        .db
+        .runtime_state_get("index.last_full_scan")
+        .await
+        .ok()
+        .flatten();
+    Ok(Json(json!({
+        "jobs": jobs,
+        "job_counts": job_counts.iter().map(|(kind, status, count)| json!({
+            "kind": kind,
+            "status": status,
+            "count": count,
+        })).collect::<Vec<_>>(),
+        "directory_sizes": directory_sizes.iter().map(|(status, count)| json!({
+            "status": status,
+            "count": count,
+        })).collect::<Vec<_>>(),
+        "database": {
+            "page_count": stats.page_count,
+            "page_size": stats.page_size,
+            "freelist_count": stats.freelist_count,
+            "wal_bytes": stats.wal_bytes,
+        },
+        "slow_requests": slow_requests,
+        "index": {
+            "scheduled": settings.settings.index.scheduled_scans,
+            "quick_scan_minutes": settings.settings.index.quick_scan_minutes,
+            "full_scan_hours": settings.settings.index.full_scan_hours,
+            "last_quick_scan": last_quick_scan,
+            "last_full_scan": last_full_scan,
+        },
     })))
 }
 
@@ -465,12 +544,13 @@ fn map_db_error(err: anyhow::Error) -> AppError {
 }
 
 async fn audit(state: &Arc<AppState>, user_id: i64, action: &str, path: &str, headers: &HeaderMap) {
-    let ip = auth::client_ip(headers);
-    if let Err(err) = state
-        .db
-        .audit(Some(user_id), action, Some(path), None, ip.as_deref())
-        .await
-    {
-        tracing::warn!(error = %err, action, "failed to write audit log");
-    }
+    state
+        .enqueue_audit(crate::db::AuditRecord {
+            user_id: Some(user_id),
+            action: action.to_owned(),
+            path: Some(path.to_owned()),
+            detail: None,
+            ip: auth::client_ip(headers),
+        })
+        .await;
 }

@@ -1,67 +1,129 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use crate::authz;
 use crate::db::{IndexEntry, Root};
 use crate::error::AppError;
+use crate::jobs::{JobKind, JobOutcome};
 use crate::state::AppState;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexStats {
     pub directories: usize,
     pub entries: usize,
+    pub partial: bool,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexTarget {
+    pub root: Root,
+    pub relative: String,
+    pub covered_by: Option<String>,
+}
+
+struct ScanOutcome {
+    removed: Vec<PathBuf>,
+    usn: Option<crate::db::UsnState>,
 }
 
 struct DirScan {
     path: PathBuf,
     mtime_ns: i64,
     entries: Vec<IndexEntry>,
+    partial: bool,
+    error: Option<String>,
 }
 
-pub fn schedule_index(
-    state: Arc<AppState>,
+pub async fn resolve_index_target(
+    state: &Arc<AppState>,
     user_id: i64,
     root: Root,
-    relative: String,
-    recursive: bool,
-    key: String,
-) {
-    if !state.index_jobs.lock().insert(key.clone()) {
-        return;
-    }
-    tokio::spawn(async move {
-        let result = index_path(&state, user_id, root, &relative, recursive).await;
-        if let Err(error) = &result {
-            tracing::warn!(error = %error, path = %relative, "background index failed");
+    relative: &str,
+) -> Result<IndexTarget, AppError> {
+    let resolved = authz::resolve(state, user_id, root.id, relative, false).await?;
+    let roots = state
+        .db
+        .list_roots(user_id)
+        .await
+        .map_err(AppError::internal)?;
+    let mut covering: Option<&Root> = None;
+    for other in &roots {
+        if other.id == root.id {
+            continue;
         }
-        state.index_jobs.lock().remove(&key);
-    });
+        if crate::platform::path_within(&resolved.absolute, Path::new(&other.real_path))
+            && covering.is_none_or(|current| other.real_path.len() < current.real_path.len())
+        {
+            covering = Some(other);
+        }
+    }
+    if let Some(covering) = covering {
+        return Ok(IndexTarget {
+            root: covering.clone(),
+            relative: String::new(),
+            covered_by: Some(covering.alias.clone()),
+        });
+    }
+    Ok(IndexTarget {
+        root,
+        relative: resolved.relative,
+        covered_by: None,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn index_path(
     state: &Arc<AppState>,
     user_id: i64,
     root: Root,
     relative: &str,
     recursive: bool,
+    cancel: &CancellationToken,
+    progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> Result<IndexStats, AppError> {
     let resolved = authz::resolve(state, user_id, root.id, relative, false).await?;
     let base = resolved.absolute.clone();
-    let ignore = state.settings().settings.index.ignore.clone();
+    let settings = state.settings();
+    let ignore = settings.settings.index.ignore.clone();
+    let video_enabled = settings.settings.thumbnails.enabled
+        && settings.settings.thumbnails.video
+        && state.ffmpeg.is_some();
+    let usn_states = state.db.usn_states().await.unwrap_or_default();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    let scan_cancel = cancel.clone();
+    let scan_base = base.clone();
     let task = tokio::task::spawn_blocking(move || {
-        collect_dirs_channel(&base, recursive, &ignore, sender)
+        collect_dirs_channel(
+            &scan_base,
+            recursive,
+            &ignore,
+            &scan_cancel,
+            sender,
+            &usn_states,
+        )
     });
 
     let mut stats = IndexStats {
         directories: 0,
         entries: 0,
+        partial: !recursive,
+        errors: Vec::new(),
     };
+    let mut totals: HashMap<String, u64> = HashMap::new();
 
-    while let Some(scan) = receiver.recv().await {
+    let mut cancelled = false;
+    while let Some(mut scan) = receiver.recv().await {
+        enrich_entries(&mut scan.entries, video_enabled);
+        if cancel.is_cancelled() {
+            cancelled = true;
+            break;
+        }
         let path = scan.path.to_string_lossy().to_string();
         let dir_id = state
             .db
@@ -69,78 +131,650 @@ pub async fn index_path(
             .await
             .map_err(AppError::internal)?;
 
-        let count = match state.db.replace_index_entries(dir_id, scan.entries).await {
-            Ok(count) => {
-                state
-                    .db
-                    .finish_index_dir(dir_id, "ready", count as i64, None)
-                    .await
-                    .map_err(AppError::internal)?;
-                count
+        let mut total_size = 0_u64;
+        let mut partial = scan.partial || !recursive;
+        let mut child_dirs = Vec::new();
+        for entry in &scan.entries {
+            if entry.is_dir {
+                child_dirs.push(entry.real_path.clone());
+            } else {
+                total_size = total_size.saturating_add(entry.size.max(0) as u64);
             }
-            Err(err) => {
+        }
+        let count = match state.db.replace_index_entries(dir_id, scan.entries).await {
+            Ok(count) => count,
+            Err(error) => {
+                stats.partial = true;
+                if stats.errors.len() < 20 {
+                    stats.errors.push(format!("{path}: {error}"));
+                }
                 let _ = state
                     .db
-                    .finish_index_dir(dir_id, "error", 0, Some(&err.to_string()))
+                    .finish_index_dir(dir_id, "error", 0, 0, true, Some(&error.to_string()))
                     .await;
-                return Err(AppError::internal(err));
+                continue;
             }
         };
-
+        for child in child_dirs {
+            match totals.remove(&child) {
+                Some(child_size) => total_size = total_size.saturating_add(child_size),
+                None => partial = true,
+            }
+        }
+        let _ = state
+            .db
+            .finish_index_dir(
+                dir_id,
+                "ready",
+                count as i64,
+                total_size.min(i64::MAX as u64) as i64,
+                partial,
+                scan.error.as_deref(),
+            )
+            .await;
+        totals.insert(path, total_size);
         stats.directories += 1;
         stats.entries += count;
+        if partial {
+            stats.partial = true;
+        }
+        if let Some(error) = scan.error
+            && stats.errors.len() < 20
+        {
+            stats.errors.push(error);
+        }
+        progress(stats.directories, stats.entries);
     }
 
-    task.await
-        .map_err(|err| AppError::internal(anyhow::anyhow!("index task failed: {err}")))??;
+    drop(receiver);
+    let scan_result = task
+        .await
+        .map_err(|err| AppError::internal(anyhow::anyhow!("index task failed: {err}")))?;
+    if cancelled {
+        return Err(AppError::Cancelled);
+    }
+    let outcome = scan_result?;
+    for removed in outcome.removed {
+        let value = removed.to_string_lossy().to_string();
+        let _ = state.db.invalidate_index_subtree(&value).await;
+        let _ = state.db.invalidate_directory_sizes(&value).await;
+    }
+    if let Some(usn) = outcome.usn {
+        let _ = state.db.upsert_usn_state(&usn).await;
+    }
+
+    let mut current = base.parent().map(Path::to_path_buf);
+    while let Some(path) = current {
+        let value = path.to_string_lossy().to_string();
+        let _ = state.db.mark_index_partial(&value).await;
+        let _ = state.db.delete_directory_size_exact(&value).await;
+        current = path.parent().map(Path::to_path_buf);
+    }
+    let _ = state
+        .db
+        .invalidate_directory_sizes(&base.to_string_lossy())
+        .await;
 
     Ok(stats)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuickScanStats {
+    pub checked: usize,
+    pub changed: usize,
+    pub missing: usize,
+    pub entries: usize,
+    pub new_directories: usize,
+    pub errors: Vec<String>,
+}
+
+struct QuickScanChange {
+    path: String,
+    mtime_ns: i64,
+    entries: Vec<IndexEntry>,
+    child_dirs: Vec<PathBuf>,
+    partial: bool,
+    error: Option<String>,
+}
+
+struct QuickScanBatch {
+    checked: usize,
+    changes: Vec<QuickScanChange>,
+    missing: Vec<String>,
+    errors: Vec<String>,
+}
+
+fn quick_scan_batch(
+    paths: Vec<(String, i64, String)>,
+    roots: &[String],
+    ignore: &[String],
+    cancel: &CancellationToken,
+    video_enabled: bool,
+) -> Result<QuickScanBatch, AppError> {
+    let mut batch = QuickScanBatch {
+        checked: 0,
+        changes: Vec::new(),
+        missing: Vec::new(),
+        errors: Vec::new(),
+    };
+    for (path, database_mtime, status) in paths {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        batch.checked += 1;
+        if !roots
+            .iter()
+            .any(|root| crate::platform::path_within(Path::new(&path), Path::new(root)))
+        {
+            batch.missing.push(path);
+            continue;
+        }
+        let real_path = Path::new(&path);
+        let metadata = match std::fs::symlink_metadata(real_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                batch.missing.push(path);
+                continue;
+            }
+            Err(error) => {
+                if batch.errors.len() < 20 {
+                    batch.errors.push(format!("{path}: {error}"));
+                }
+                continue;
+            }
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            batch.missing.push(path);
+            continue;
+        }
+        let mtime_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as i64)
+            .unwrap_or_default();
+        if mtime_ns == database_mtime && status == "ready" {
+            continue;
+        }
+        match read_directory_contents(real_path, ignore, cancel) {
+            Ok(mut contents) => {
+                enrich_entries(&mut contents.entries, video_enabled);
+                batch.changes.push(QuickScanChange {
+                    path,
+                    mtime_ns: contents.mtime_ns,
+                    entries: contents.entries,
+                    child_dirs: contents.child_dirs,
+                    partial: contents.partial,
+                    error: (!contents.errors.is_empty()).then(|| contents.errors.join("; ")),
+                });
+            }
+            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+            Err(error) => {
+                if batch.errors.len() < 20 {
+                    batch.errors.push(format!("{path}: {error}"));
+                }
+            }
+        }
+    }
+    Ok(batch)
+}
+
+pub async fn quick_scan(
+    state: &Arc<AppState>,
+    cancel: &CancellationToken,
+    progress: &mut (dyn FnMut(usize, usize) + Send),
+) -> Result<QuickScanStats, AppError> {
+    let settings = state.settings();
+    let ignore = settings.settings.index.ignore.clone();
+    let video_enabled = settings.settings.thumbnails.enabled
+        && settings.settings.thumbnails.video
+        && state.ffmpeg.is_some();
+    let users = state.db.list_users().await.map_err(AppError::internal)?;
+    let mut root_entries: Vec<(i64, Root)> = Vec::new();
+    for user in users {
+        for root in state
+            .db
+            .list_roots(user.id)
+            .await
+            .map_err(AppError::internal)?
+        {
+            root_entries.push((user.id, root));
+        }
+    }
+    let roots: Vec<String> = root_entries
+        .iter()
+        .map(|(_, root)| root.real_path.clone())
+        .collect();
+    let total = state
+        .db
+        .count_indexed_dirs()
+        .await
+        .map_err(AppError::internal)? as usize;
+    let mut stats = QuickScanStats {
+        checked: 0,
+        changed: 0,
+        missing: 0,
+        entries: 0,
+        new_directories: 0,
+        errors: Vec::new(),
+    };
+    let mut after: Option<String> = None;
+    let mut parents: HashSet<PathBuf> = HashSet::new();
+    let mut new_dir_candidates: HashSet<String> = HashSet::new();
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let rows = state
+            .db
+            .indexed_dirs_page(after.clone(), 2000)
+            .await
+            .map_err(AppError::internal)?;
+        if rows.is_empty() {
+            break;
+        }
+        after = rows.last().map(|row| row.0.clone());
+        let paths: Vec<(String, i64, String)> = rows
+            .into_iter()
+            .map(|(path, _id, mtime, status)| (path, mtime, status))
+            .collect();
+        let batch_cancel = cancel.clone();
+        let batch_ignore = ignore.clone();
+        let batch_roots = roots.clone();
+        let batch = tokio::task::spawn_blocking(move || {
+            quick_scan_batch(
+                paths,
+                &batch_roots,
+                &batch_ignore,
+                &batch_cancel,
+                video_enabled,
+            )
+        })
+        .await
+        .map_err(|error| {
+            AppError::internal(anyhow::anyhow!("quick index scan task failed: {error}"))
+        })??;
+        stats.checked += batch.checked;
+        for error in batch.errors {
+            if stats.errors.len() < 20 {
+                stats.errors.push(error);
+            }
+        }
+
+        for change in batch.changes {
+            if cancel.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+            let dir_id = state
+                .db
+                .upsert_index_dir(&change.path, change.mtime_ns)
+                .await
+                .map_err(AppError::internal)?;
+            let direct_size: u64 = change
+                .entries
+                .iter()
+                .filter(|entry| !entry.is_dir)
+                .map(|entry| entry.size.max(0) as u64)
+                .sum();
+            let count = state
+                .db
+                .replace_index_entries(dir_id, change.entries)
+                .await
+                .map_err(AppError::internal)?;
+            let _ = state
+                .db
+                .finish_index_dir(
+                    dir_id,
+                    "ready",
+                    count as i64,
+                    direct_size.min(i64::MAX as u64) as i64,
+                    true,
+                    change.error.as_deref(),
+                )
+                .await;
+            let _ = state.db.mark_index_partial(&change.path).await;
+            let _ = state.db.delete_directory_size_exact(&change.path).await;
+            for child in change.child_dirs {
+                new_dir_candidates.insert(child.to_string_lossy().to_string());
+            }
+            if let Some(parent) = Path::new(&change.path).parent() {
+                parents.insert(parent.to_path_buf());
+            }
+            stats.changed += 1;
+            stats.entries += count;
+            let _ = change.partial;
+        }
+        for missing in batch.missing {
+            let _ = state.db.invalidate_index_subtree(&missing).await;
+            let _ = state.db.invalidate_directory_sizes(&missing).await;
+            if let Some(parent) = Path::new(&missing).parent() {
+                parents.insert(parent.to_path_buf());
+            }
+            stats.missing += 1;
+        }
+        progress(stats.checked, total);
+    }
+
+    for parent in parents {
+        state.invalidate_index_totals(&parent).await;
+    }
+
+    if !new_dir_candidates.is_empty() {
+        let candidates: Vec<String> = new_dir_candidates.into_iter().collect();
+        let existing = state
+            .db
+            .existing_index_dirs(candidates.clone())
+            .await
+            .map_err(AppError::internal)?;
+        let mut new_dirs: Vec<String> = candidates
+            .into_iter()
+            .filter(|path| !existing.contains(path))
+            .collect();
+        new_dirs.sort();
+        for path in new_dirs.into_iter().take(100) {
+            if cancel.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+            let Some((user_id, root, relative)) = best_root_for_path(&root_entries, &path) else {
+                continue;
+            };
+            let key = format!("dir:{path}");
+            if state.jobs.active_job_exact(JobKind::Index, &key).is_some()
+                || state
+                    .jobs
+                    .active_job_for_path(JobKind::Index, &path)
+                    .is_some()
+            {
+                continue;
+            }
+            let job_state = Arc::clone(state);
+            let job_root = root.clone();
+            let job_relative = relative.clone();
+            let result = state
+                .jobs
+                .submit(
+                    JobKind::Index,
+                    key,
+                    user_id,
+                    serde_json::json!({
+                        "root_id": root.id,
+                        "path": relative,
+                        "recursive": true,
+                        "auto": "quick-scan",
+                    }),
+                    1,
+                    move |ctx| async move {
+                        let cancel = ctx.token();
+                        let mut progress = |directories: usize, _entries: usize| {
+                            ctx.report(directories, 1, 0, 0);
+                        };
+                        let stats = index_path(
+                            &job_state,
+                            user_id,
+                            job_root,
+                            &job_relative,
+                            true,
+                            &cancel,
+                            &mut progress,
+                        )
+                        .await?;
+                        let directories = stats.directories;
+                        Ok(JobOutcome::done(
+                            serde_json::json!(stats),
+                            directories,
+                            directories.max(1),
+                        ))
+                    },
+                )
+                .await;
+            match result {
+                Ok(outcome) if outcome.created => stats.new_directories += 1,
+                Ok(_) => {}
+                Err(AppError::QueueFull) => break,
+                Err(error) => {
+                    tracing::debug!(%error, path, "failed to queue quick-scan child index");
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+fn best_root_for_path(roots: &[(i64, Root)], path: &str) -> Option<(i64, Root, String)> {
+    let path = Path::new(path);
+    roots
+        .iter()
+        .filter(|(_, root)| crate::platform::path_within(path, Path::new(&root.real_path)))
+        .max_by_key(|(_, root)| root.real_path.len())
+        .and_then(|(user_id, root)| {
+            let relative = path.strip_prefix(Path::new(&root.real_path)).ok()?;
+            let relative = relative
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            Some((*user_id, root.clone(), relative))
+        })
+}
+
+pub async fn scheduled_full_scan(
+    state: &Arc<AppState>,
+    cancel: &CancellationToken,
+    progress: &mut (dyn FnMut(usize, usize) + Send),
+) -> Result<IndexStats, AppError> {
+    let users = state.db.list_users().await.map_err(AppError::internal)?;
+    let mut candidates: Vec<(i64, Root)> = Vec::new();
+    for user in users {
+        for root in state
+            .db
+            .list_roots(user.id)
+            .await
+            .map_err(AppError::internal)?
+        {
+            candidates.push((user.id, root));
+        }
+    }
+    candidates.sort_by_key(|(_, root)| root.real_path.len());
+    let mut selected: Vec<(i64, Root)> = Vec::new();
+    for (user_id, root) in candidates {
+        let root_path = Path::new(&root.real_path);
+        if selected.iter().any(|(_, existing)| {
+            crate::platform::paths_equal(root_path, Path::new(&existing.real_path))
+                || crate::platform::path_within(root_path, Path::new(&existing.real_path))
+        }) {
+            continue;
+        }
+        selected.push((user_id, root));
+    }
+
+    let total = selected.len();
+    let mut stats = IndexStats {
+        directories: 0,
+        entries: 0,
+        partial: false,
+        errors: Vec::new(),
+    };
+    for (index, (user_id, root)) in selected.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        #[cfg(windows)]
+        if let Ok(volume) = crate::winindex::volume_name(Path::new(&root.real_path)) {
+            let _ = state.db.delete_usn_state(&volume).await;
+        }
+        progress(index, total);
+        let mut root_progress = |_directories: usize, _entries: usize| {
+            progress(index, total);
+        };
+        match index_path(
+            state,
+            user_id,
+            root.clone(),
+            "",
+            true,
+            cancel,
+            &mut root_progress,
+        )
+        .await
+        {
+            Ok(result) => {
+                stats.directories += result.directories;
+                stats.entries += result.entries;
+                stats.partial |= result.partial;
+                for error in result.errors {
+                    if stats.errors.len() < 20 {
+                        stats.errors.push(error);
+                    }
+                }
+            }
+            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+            Err(error) => {
+                stats.partial = true;
+                if stats.errors.len() < 20 {
+                    stats.errors.push(format!("{}: {error}", root.real_path));
+                }
+            }
+        }
+    }
+    progress(total, total);
+    Ok(stats)
+}
+
+fn enrich_entries(entries: &mut [IndexEntry], video_enabled: bool) {
+    for entry in entries {
+        entry.mime_type = mime_guess::from_path(&entry.name)
+            .first_or_octet_stream()
+            .to_string();
+        entry.is_hidden = entry.name.starts_with('.');
+        entry.has_preview = !entry.is_dir && crate::thumbs::can_preview(&entry.name, video_enabled);
+    }
 }
 
 fn collect_dirs_channel(
     base: &Path,
     recursive: bool,
     ignore: &[String],
+    cancel: &CancellationToken,
     sender: tokio::sync::mpsc::Sender<DirScan>,
-) -> Result<(), AppError> {
+    usn_states: &[crate::db::UsnState],
+) -> Result<ScanOutcome, AppError> {
     #[cfg(windows)]
     if recursive {
-        match crate::winindex::scan(base, true) {
-            Ok(scans) => {
-                for scan in scans {
+        let volume = crate::winindex::volume_name(base).ok();
+        let previous = volume
+            .as_deref()
+            .and_then(|volume| usn_states.iter().find(|state| state.volume == volume));
+        match crate::winindex::incremental(base, previous, ignore) {
+            Ok(Some(changes)) => {
+                let mut complete = changes.complete;
+                for scan in changes.scans {
+                    if cancel.is_cancelled() {
+                        return Err(AppError::Cancelled);
+                    }
                     let mtime_ns = crate::fsops::dir_mtime_ns(&scan.path).unwrap_or_default();
                     if sender
                         .blocking_send(DirScan {
                             path: scan.path,
                             mtime_ns,
                             entries: scan.entries,
+                            partial: false,
+                            error: None,
                         })
                         .is_err()
                     {
-                        return Ok(());
+                        return Ok(ScanOutcome {
+                            removed: changes.removed,
+                            usn: None,
+                        });
                     }
                 }
-                return Ok(());
+                for new_dir in &changes.new_dirs {
+                    match scan_walk(new_dir, true, ignore, cancel, &sender) {
+                        Ok(_) => {}
+                        Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+                        Err(error) => {
+                            complete = false;
+                            tracing::warn!(%error, path = %new_dir.display(), "failed to index new USN directory");
+                        }
+                    }
+                }
+                return Ok(ScanOutcome {
+                    removed: changes.removed,
+                    usn: complete.then_some(changes.state),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %base.display(), "USN incremental index failed; falling back to MFT");
+            }
+        }
+
+        let journal_before = crate::winindex::journal_state(base).ok();
+        match crate::winindex::scan(base, true) {
+            Ok(mut scans) => {
+                scans.sort_by_key(|scan| std::cmp::Reverse(scan.path.components().count()));
+                for scan in scans {
+                    if cancel.is_cancelled() {
+                        return Err(AppError::Cancelled);
+                    }
+                    let mtime_ns = crate::fsops::dir_mtime_ns(&scan.path).unwrap_or_default();
+                    if sender
+                        .blocking_send(DirScan {
+                            path: scan.path,
+                            mtime_ns,
+                            entries: scan.entries,
+                            partial: false,
+                            error: None,
+                        })
+                        .is_err()
+                    {
+                        return Ok(ScanOutcome {
+                            removed: Vec::new(),
+                            usn: None,
+                        });
+                    }
+                }
+                return Ok(ScanOutcome {
+                    removed: Vec::new(),
+                    usn: journal_before,
+                });
             }
             Err(error) => {
                 tracing::warn!(%error, path = %base.display(), "MFT index failed; falling back to directory scan");
             }
         }
     }
-    scan_walk(base, recursive, ignore, &sender)
+    let _ = usn_states;
+    scan_walk(base, recursive, ignore, cancel, &sender)?;
+    Ok(ScanOutcome {
+        removed: Vec::new(),
+        usn: None,
+    })
 }
 
-fn scan_walk(
+struct DirectoryContents {
+    mtime_ns: i64,
+    entries: Vec<IndexEntry>,
+    child_dirs: Vec<PathBuf>,
+    partial: bool,
+    errors: Vec<String>,
+}
+
+fn read_directory_contents(
     path: &Path,
-    recursive: bool,
     ignore: &[String],
-    sender: &tokio::sync::mpsc::Sender<DirScan>,
-) -> Result<(), AppError> {
+    cancel: &CancellationToken,
+) -> Result<DirectoryContents, AppError> {
+    if cancel.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
     let metadata = std::fs::metadata(path).map_err(io_error)?;
     if !metadata.is_dir() {
         return Err(AppError::bad_request("index path is not a directory"));
     }
-
     let mtime_ns = metadata
         .modified()
         .ok()
@@ -150,41 +784,139 @@ fn scan_walk(
 
     let mut entries = Vec::new();
     let mut child_dirs = Vec::new();
+    let mut errors = Vec::new();
+    let mut partial = false;
 
-    for entry in std::fs::read_dir(path).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(".filehub-upload-") || ignore.iter().any(|ignored| ignored == &name) {
+    let read_dir = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => return Err(io_error(error)),
+    };
+    for entry in read_dir {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                partial = true;
+                if errors.len() < 10 {
+                    errors.push(format!("{}: {error}", path.display()));
+                }
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with(".filehub-upload-")
+            || matches!(
+                name.as_str(),
+                "$RECYCLE.BIN" | "System Volume Information" | "@eaDir"
+            )
+            || ignore.iter().any(|ignored| ignored == &name)
+        {
             continue;
         }
-
-        let file_type = entry.file_type().map_err(io_error)?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                partial = true;
+                if errors.len() < 10 {
+                    errors.push(format!("{}: {error}", entry.path().display()));
+                }
+                continue;
+            }
+        };
         if file_type.is_symlink() {
             continue;
         }
-
-        let metadata = entry.metadata().map_err(io_error)?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                partial = true;
+                if errors.len() < 10 {
+                    errors.push(format!("{}: {error}", entry.path().display()));
+                }
+                continue;
+            }
+        };
         let mtime = metadata
             .modified()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or_default();
+        let created_at = metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
 
         entries.push(IndexEntry {
-            name,
+            name: name.clone(),
             real_path: entry.path().to_string_lossy().to_string(),
             is_dir: file_type.is_dir(),
             size: if file_type.is_file() {
-                metadata.len() as i64
+                metadata.len().min(i64::MAX as u64) as i64
             } else {
                 0
             },
             mtime,
+            created_at,
+            mime_type: String::new(),
+            has_preview: false,
+            is_hidden: false,
         });
 
-        if recursive && file_type.is_dir() {
+        if file_type.is_dir() {
             child_dirs.push(entry.path());
+        }
+    }
+
+    Ok(DirectoryContents {
+        mtime_ns,
+        entries,
+        child_dirs,
+        partial,
+        errors,
+    })
+}
+
+fn scan_walk(
+    path: &Path,
+    recursive: bool,
+    ignore: &[String],
+    cancel: &CancellationToken,
+    sender: &tokio::sync::mpsc::Sender<DirScan>,
+) -> Result<(bool, Vec<String>), AppError> {
+    let DirectoryContents {
+        mtime_ns,
+        entries,
+        child_dirs,
+        mut partial,
+        mut errors,
+    } = read_directory_contents(path, ignore, cancel)?;
+
+    if recursive {
+        for child in child_dirs {
+            match scan_walk(&child, true, ignore, cancel, sender) {
+                Ok((child_partial, child_errors)) => {
+                    partial |= child_partial;
+                    for error in child_errors {
+                        if errors.len() < 10 {
+                            errors.push(error);
+                        }
+                    }
+                }
+                Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+                Err(error) => {
+                    partial = true;
+                    if errors.len() < 10 {
+                        errors.push(format!("{}: {error}", child.display()));
+                    }
+                }
+            }
         }
     }
 
@@ -193,17 +925,15 @@ fn scan_walk(
             path: path.to_path_buf(),
             mtime_ns,
             entries,
+            partial,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
         })
         .is_err()
     {
-        return Ok(());
+        return Ok((partial, errors));
     }
 
-    for child in child_dirs {
-        scan_walk(&child, true, ignore, sender)?;
-    }
-
-    Ok(())
+    Ok((partial, errors))
 }
 
 fn io_error(error: std::io::Error) -> AppError {

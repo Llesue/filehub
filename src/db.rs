@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +22,17 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (9, include_str!("../migrations/0009_admin_defaults.sql")),
     (10, include_str!("../migrations/0010_share_visit_count.sql")),
+    (11, include_str!("../migrations/0011_directory_sizes.sql")),
+    (12, include_str!("../migrations/0012_jobs.sql")),
+    (
+        13,
+        include_str!("../migrations/0013_index_totals_audit.sql"),
+    ),
+    (
+        14,
+        include_str!("../migrations/0014_index_metadata_runtime.sql"),
+    ),
+    (15, include_str!("../migrations/0015_usn_state.sql")),
 ];
 
 pub fn unix_now() -> i64 {
@@ -114,6 +126,16 @@ pub struct UploadSession {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct IndexSearchFilters {
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    pub modified_after: Option<i64>,
+    pub modified_before: Option<i64>,
+    pub is_dir: Option<bool>,
+    pub mime_prefix: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
     pub name: String,
@@ -121,6 +143,10 @@ pub struct IndexEntry {
     pub is_dir: bool,
     pub size: i64,
     pub mtime: i64,
+    pub created_at: i64,
+    pub mime_type: String,
+    pub has_preview: bool,
+    pub is_hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +163,22 @@ pub struct UserPreferences {
     pub custom_css_version: i64,
     pub avatar_path: Option<String>,
     pub avatar_version: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsnState {
+    pub volume: String,
+    pub journal_id: u64,
+    pub next_usn: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    pub user_id: Option<i64>,
+    pub action: String,
+    pub path: Option<String>,
+    pub detail: Option<String>,
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +230,42 @@ pub struct TrustedLink {
 pub struct Db {
     connections: Vec<Arc<Mutex<Connection>>>,
     next: AtomicUsize,
+}
+
+impl Clone for Db {
+    fn clone(&self) -> Self {
+        Self {
+            connections: self.connections.clone(),
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JobRecord {
+    pub id: String,
+    pub user_id: i64,
+    pub kind: String,
+    pub job_key: String,
+    pub status: String,
+    pub progress: i64,
+    pub total: i64,
+    pub bytes_done: i64,
+    pub bytes_total: i64,
+    pub payload: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DbStats {
+    pub page_count: i64,
+    pub page_size: i64,
+    pub freelist_count: i64,
+    pub wal_bytes: u64,
 }
 
 impl Db {
@@ -588,29 +666,58 @@ impl Db {
         detail: Option<&str>,
         ip: Option<&str>,
     ) -> anyhow::Result<()> {
-        let action = action.to_owned();
-        let path = path.map(str::to_owned);
-        let detail = detail.map(str::to_owned);
-        let ip = ip.map(str::to_owned);
+        self.audit_batch(vec![AuditRecord {
+            user_id,
+            action: action.to_owned(),
+            path: path.map(str::to_owned),
+            detail: detail.map(str::to_owned),
+            ip: ip.map(str::to_owned),
+        }])
+        .await
+    }
+
+    pub async fn audit_batch(&self, records: Vec<AuditRecord>) -> anyhow::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now();
         self.call(move |connection| {
-            connection.execute(
-                "INSERT INTO audit_logs (user_id, action, path, detail, ip, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![user_id, action, path, detail, ip, unix_now()],
-            )?;
+            let transaction = connection.transaction()?;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO audit_logs (user_id, action, path, detail, ip, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for record in &records {
+                    statement.execute(params![
+                        record.user_id,
+                        record.action,
+                        record.path,
+                        record.detail,
+                        record.ip,
+                        now
+                    ])?;
+                }
+            }
+            transaction.commit()?;
             Ok(())
         })
         .await
     }
 
-    pub async fn list_audit(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<AuditEntry>> {
+    pub async fn list_audit(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> anyhow::Result<Vec<AuditEntry>> {
         self.call(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT a.id, u.username, a.action, a.path, a.detail, a.ip, a.created_at \
                  FROM audit_logs a LEFT JOIN users u ON u.id = a.user_id \
-                 ORDER BY a.id DESC LIMIT ?1 OFFSET ?2",
+                 WHERE (?1 IS NULL OR a.id < ?1) \
+                 ORDER BY a.id DESC LIMIT ?2",
             )?;
-            let rows = statement.query_map(params![limit, offset], |row| {
+            let rows = statement.query_map(params![before_id, limit], |row| {
                 Ok(AuditEntry {
                     id: row.get(0)?,
                     username: row.get(1)?,
@@ -622,6 +729,28 @@ impl Db {
                 })
             })?;
             rows.collect()
+        })
+        .await
+    }
+
+    pub async fn prune_audit(&self, retention_days: u64, max_rows: u64) -> anyhow::Result<usize> {
+        self.call(move |connection| {
+            let mut removed = 0;
+            if retention_days > 0 {
+                let cutoff = unix_now() - (retention_days.min(36_500) as i64) * 86_400;
+                removed += connection.execute(
+                    "DELETE FROM audit_logs WHERE created_at < ?1",
+                    params![cutoff],
+                )?;
+            }
+            if max_rows > 0 {
+                removed += connection.execute(
+                    "DELETE FROM audit_logs WHERE id NOT IN \
+                       (SELECT id FROM audit_logs ORDER BY id DESC LIMIT ?1)",
+                    params![max_rows.min(i64::MAX as u64) as i64],
+                )?;
+            }
+            Ok(removed)
         })
         .await
     }
@@ -1033,15 +1162,20 @@ impl Db {
             for entry in &entries {
                 transaction.execute(
                     "INSERT INTO index_entries \
-                     (dir_id, name, real_path, is_dir, size, mtime) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (dir_id, name, real_path, is_dir, size, mtime, created_at, mime_type, \
+                      has_preview, is_hidden) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         dir_id,
                         entry.name,
                         entry.real_path,
                         entry.is_dir as i64,
                         entry.size,
-                        entry.mtime
+                        entry.mtime,
+                        entry.created_at,
+                        entry.mime_type,
+                        entry.has_preview as i64,
+                        entry.is_hidden as i64
                     ],
                 )?;
             }
@@ -1051,11 +1185,14 @@ impl Db {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn finish_index_dir(
         &self,
         dir_id: i64,
         status: &str,
         entry_count: i64,
+        total_size_bytes: i64,
+        partial: bool,
         error: Option<&str>,
     ) -> anyhow::Result<()> {
         let status = status.to_owned();
@@ -1063,9 +1200,18 @@ impl Db {
         self.call(move |connection| {
             connection.execute(
                 "UPDATE indexed_dirs \
-                 SET status = ?1, entry_count = ?2, error = ?3, indexed_at = ?4 \
-                 WHERE id = ?5",
-                params![status, entry_count, error, unix_now(), dir_id],
+                 SET status = ?1, entry_count = ?2, total_size_bytes = ?3, partial = ?4, \
+                     error = ?5, indexed_at = ?6 \
+                 WHERE id = ?7",
+                params![
+                    status,
+                    entry_count,
+                    total_size_bytes,
+                    partial as i64,
+                    error,
+                    unix_now(),
+                    dir_id
+                ],
             )?;
             Ok(())
         })
@@ -1084,17 +1230,548 @@ impl Db {
         .await
     }
 
-    pub async fn index_status(
+    pub async fn indexed_directory_state(
         &self,
         real_path: &str,
-    ) -> anyhow::Result<Option<(String, i64, Option<i64>)>> {
+    ) -> anyhow::Result<Option<(i64, u64, bool, String)>> {
         let real_path = real_path.to_owned();
         self.call(move |connection| {
             connection
                 .query_row(
-                    "SELECT status, entry_count, indexed_at FROM indexed_dirs WHERE real_path = ?1",
+                    "SELECT mtime_ns, total_size_bytes, partial, status FROM indexed_dirs \
+                     WHERE real_path = ?1",
                     params![real_path],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get::<_, i64>(1)?.max(0) as u64,
+                            row.get::<_, i64>(2)? != 0,
+                            row.get(3)?,
+                        ))
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn directory_size_state(
+        &self,
+        real_path: &str,
+    ) -> anyhow::Result<Option<(String, i64, i64, Option<String>, i64)>> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT status, size_bytes, mtime_ns, error, updated_at \
+                     FROM directory_sizes WHERE real_path = ?1",
+                    params![real_path],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn set_directory_size(
+        &self,
+        real_path: &str,
+        status: &str,
+        size_bytes: i64,
+        mtime_ns: i64,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let real_path = real_path.to_owned();
+        let status = status.to_owned();
+        let error = error.map(str::to_owned);
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO directory_sizes \
+                 (real_path, size_bytes, mtime_ns, status, error, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(real_path) DO UPDATE SET \
+                   size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns, \
+                   status = excluded.status, error = excluded.error, updated_at = excluded.updated_at",
+                params![
+                    real_path,
+                    size_bytes,
+                    mtime_ns,
+                    status,
+                    error,
+                    unix_now()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_directory_size_exact(&self, real_path: &str) -> anyhow::Result<()> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "DELETE FROM directory_sizes WHERE real_path = ?1",
+                params![real_path],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_directory_sizes_batch(
+        &self,
+        rows: Vec<(String, i64, i64, Option<String>)>,
+    ) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO directory_sizes \
+                     (real_path, size_bytes, mtime_ns, status, error, updated_at) \
+                     VALUES (?1, ?2, ?3, 'ready', ?4, ?5) \
+                     ON CONFLICT(real_path) DO UPDATE SET \
+                       size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns, \
+                       status = 'ready', error = excluded.error, updated_at = excluded.updated_at",
+                )?;
+                for (real_path, size_bytes, mtime_ns, error) in &rows {
+                    statement.execute(params![real_path, size_bytes, mtime_ns, error, now])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn invalidate_index_subtree(&self, prefix: &str) -> anyhow::Result<()> {
+        let prefix = prefix.to_owned();
+        self.call(move |connection| {
+            let escaped = prefix
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_");
+            let unix_pattern = format!("{escaped}/%");
+            let windows_pattern = format!("{escaped}\\%");
+            connection.execute(
+                "DELETE FROM indexed_dirs WHERE real_path = ?1 \
+                 OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
+                params![prefix, unix_pattern, windows_pattern],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn invalidate_directory_sizes(&self, prefix: &str) -> anyhow::Result<()> {
+        let prefix = prefix.to_owned();
+        self.call(move |connection| {
+            let escaped = prefix
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_");
+            let unix_pattern = format!("{escaped}/%");
+            let windows_pattern = format!("{escaped}\\%");
+            connection.execute(
+                "DELETE FROM directory_sizes WHERE real_path = ?1 \
+                 OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
+                params![prefix, unix_pattern, windows_pattern],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn runtime_state_get(&self, key: &str) -> anyhow::Result<Option<i64>> {
+        let key = key.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT value FROM runtime_state WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn runtime_state_set(&self, key: &str, value: i64) -> anyhow::Result<()> {
+        let key = key.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO runtime_state (key, value, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![key, value, unix_now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn usn_states(&self) -> anyhow::Result<Vec<UsnState>> {
+        self.call(|connection| {
+            let mut statement =
+                connection.prepare("SELECT volume, journal_id, next_usn FROM usn_state")?;
+            let rows = statement.query_map([], |row| {
+                Ok(UsnState {
+                    volume: row.get(0)?,
+                    journal_id: row.get::<_, i64>(1)? as u64,
+                    next_usn: row.get(2)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn delete_usn_state(&self, volume: &str) -> anyhow::Result<()> {
+        let volume = volume.to_owned();
+        self.call(move |connection| {
+            connection.execute("DELETE FROM usn_state WHERE volume = ?1", params![volume])?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn upsert_usn_state(&self, state: &UsnState) -> anyhow::Result<()> {
+        let volume = state.volume.clone();
+        let journal_id = state.journal_id as i64;
+        let next_usn = state.next_usn;
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO usn_state (volume, journal_id, next_usn, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(volume) DO UPDATE SET journal_id = excluded.journal_id, \
+                   next_usn = excluded.next_usn, updated_at = excluded.updated_at",
+                params![volume, journal_id, next_usn, unix_now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn existing_index_dirs(&self, paths: Vec<String>) -> anyhow::Result<HashSet<String>> {
+        self.call(move |connection| {
+            let mut found = HashSet::new();
+            for chunk in paths.chunks(500) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT real_path FROM indexed_dirs WHERE real_path IN ({placeholders})"
+                );
+                let mut statement = connection.prepare(&sql)?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                for row in rows {
+                    found.insert(row?);
+                }
+            }
+            Ok(found)
+        })
+        .await
+    }
+
+    pub async fn count_indexed_dirs(&self) -> anyhow::Result<i64> {
+        self.call(|connection| {
+            connection.query_row("SELECT COUNT(*) FROM indexed_dirs", [], |row| row.get(0))
+        })
+        .await
+    }
+
+    pub async fn indexed_dirs_page(
+        &self,
+        after_path: Option<String>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(String, i64, i64, String)>> {
+        let after = after_path.unwrap_or_default();
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT real_path, id, mtime_ns, status FROM indexed_dirs \
+                 WHERE real_path > ?1 ORDER BY real_path LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![after, limit.max(1)], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn mark_index_partial(&self, real_path: &str) -> anyhow::Result<()> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE indexed_dirs SET total_size_bytes = 0, partial = 1 \
+                 WHERE real_path = ?1 AND status = 'ready'",
+                params![real_path],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn create_job(&self, record: JobRecord) -> anyhow::Result<(JobRecord, bool)> {
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "INSERT INTO jobs \
+                 (id, user_id, kind, job_key, status, progress, total, bytes_done, bytes_total, \
+                  payload, result, error, created_at, started_at, finished_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                 ON CONFLICT DO NOTHING",
+                params![
+                    record.id,
+                    record.user_id,
+                    record.kind,
+                    record.job_key,
+                    record.status,
+                    record.progress,
+                    record.total,
+                    record.bytes_done,
+                    record.bytes_total,
+                    record.payload,
+                    record.result,
+                    record.error,
+                    record.created_at,
+                    record.started_at,
+                    record.finished_at
+                ],
+            )?;
+            if changed > 0 {
+                return Ok((record, true));
+            }
+            let existing = connection
+                .query_row(
+                    "SELECT id, user_id, kind, job_key, status, progress, total, bytes_done, \
+                     bytes_total, payload, result, error, created_at, started_at, finished_at \
+                     FROM jobs WHERE kind = ?1 AND job_key = ?2 \
+                     AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1",
+                    params![record.kind, record.job_key],
+                    job_from_row,
+                )
+                .optional()?;
+            match existing {
+                Some(job) => Ok((job, false)),
+                None => Err(rusqlite::Error::QueryReturnedNoRows),
+            }
+        })
+        .await
+    }
+
+    pub async fn mark_job_running(&self, id: &str) -> anyhow::Result<()> {
+        let id = id.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE jobs SET status = 'running', started_at = ?1 \
+                 WHERE id = ?2 AND status = 'queued'",
+                params![unix_now(), id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn update_job_progress(
+        &self,
+        id: &str,
+        progress: i64,
+        total: i64,
+        bytes_done: i64,
+        bytes_total: i64,
+    ) -> anyhow::Result<()> {
+        let id = id.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE jobs SET progress = ?2, total = ?3, bytes_done = ?4, bytes_total = ?5 \
+                 WHERE id = ?1 AND status = 'running'",
+                params![id, progress, total, bytes_done, bytes_total],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn finish_job(
+        &self,
+        id: &str,
+        status: &str,
+        result: Option<&str>,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let id = id.to_owned();
+        let status = status.to_owned();
+        let result = result.map(str::to_owned);
+        let error = error.map(str::to_owned);
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE jobs SET status = ?2, result = ?3, error = ?4, finished_at = ?5 \
+                 WHERE id = ?1 AND status IN ('queued', 'running')",
+                params![id, status, result, error, unix_now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn find_job(&self, id: &str) -> anyhow::Result<Option<JobRecord>> {
+        let id = id.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, user_id, kind, job_key, status, progress, total, bytes_done, \
+                     bytes_total, payload, result, error, created_at, started_at, finished_at \
+                     FROM jobs WHERE id = ?1",
+                    params![id],
+                    job_from_row,
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn recover_jobs(&self) -> anyhow::Result<usize> {
+        self.call(|connection| {
+            let changed = connection.execute(
+                "UPDATE jobs SET status = 'failed', error = 'interrupted by server restart', \
+                 finished_at = ?1 WHERE status IN ('queued', 'running')",
+                params![unix_now()],
+            )?;
+            connection.execute(
+                "UPDATE directory_sizes SET status = 'stale' \
+                 WHERE status IN ('queued', 'running')",
+                [],
+            )?;
+            Ok(changed)
+        })
+        .await
+    }
+
+    pub async fn active_job_count(&self, kind: &str) -> anyhow::Result<i64> {
+        let kind = kind.to_owned();
+        self.call(move |connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE kind = ?1 AND status IN ('queued', 'running')",
+                params![kind],
+                |row| row.get(0),
+            )
+        })
+        .await
+    }
+
+    pub async fn job_counts(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
+        self.call(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT kind, status, COUNT(*) FROM jobs \
+                 WHERE status IN ('queued', 'running') GROUP BY kind, status",
+            )?;
+            let rows =
+                statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn prune_jobs(&self, before: i64) -> anyhow::Result<usize> {
+        self.call(move |connection| {
+            let removed = connection.execute(
+                "DELETE FROM jobs WHERE finished_at IS NOT NULL AND finished_at < ?1",
+                params![before],
+            )?;
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn prune_directory_sizes(&self, before: i64) -> anyhow::Result<usize> {
+        self.call(move |connection| {
+            let removed = connection.execute(
+                "DELETE FROM directory_sizes WHERE updated_at < ?1",
+                params![before],
+            )?;
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn directory_size_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        self.call(|connection| {
+            let mut statement = connection
+                .prepare("SELECT status, COUNT(*) FROM directory_sizes GROUP BY status")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn checkpoint(&self) -> anyhow::Result<()> {
+        self.call(|connection| {
+            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn stats(&self) -> anyhow::Result<DbStats> {
+        self.call(|connection| {
+            let page_count: i64 =
+                connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+            let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+            let freelist_count: i64 =
+                connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+            let path: String = connection
+                .query_row(
+                    "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
+            let wal_bytes = std::fs::metadata(format!("{path}-wal"))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            Ok(DbStats {
+                page_count,
+                page_size,
+                freelist_count,
+                wal_bytes,
+            })
+        })
+        .await
+    }
+
+    pub async fn index_status(
+        &self,
+        real_path: &str,
+    ) -> anyhow::Result<Option<(String, i64, Option<i64>, u64, bool)>> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT status, entry_count, indexed_at, total_size_bytes, partial \
+                     FROM indexed_dirs WHERE real_path = ?1",
+                    params![real_path],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get::<_, i64>(3)?.max(0) as u64,
+                            row.get::<_, i64>(4)? != 0,
+                        ))
+                    },
                 )
                 .optional()
         })
@@ -1119,7 +1796,8 @@ impl Db {
             "ASC"
         };
         let sql = format!(
-            "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime \
+            "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, e.mime_type, \
+                    e.has_preview, e.is_hidden \
              FROM index_entries e JOIN indexed_dirs d ON d.id = e.dir_id \
              WHERE d.real_path = ?1 AND d.status = 'ready' \
              ORDER BY e.is_dir DESC, {order_column} {direction}, e.name COLLATE NOCASE"
@@ -1155,6 +1833,10 @@ impl Db {
                     is_dir: row.get::<_, i64>(2)? != 0,
                     size: row.get(3)?,
                     mtime: row.get(4)?,
+                    created_at: row.get(5)?,
+                    mime_type: row.get(6)?,
+                    has_preview: row.get::<_, i64>(7)? != 0,
+                    is_hidden: row.get::<_, i64>(8)? != 0,
                 })
             })?;
             let entries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1184,7 +1866,8 @@ impl Db {
             "ASC"
         };
         let sql = format!(
-            "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime \
+            "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, e.mime_type, \
+                    e.has_preview, e.is_hidden \
              FROM index_entries e JOIN indexed_dirs d ON d.id = e.dir_id \
              WHERE d.real_path = ?1 AND d.status = 'ready' \
                AND (?4 = 1 OR e.name NOT LIKE '.%') \
@@ -1212,6 +1895,10 @@ impl Db {
                         is_dir: row.get::<_, i64>(2)? != 0,
                         size: row.get(3)?,
                         mtime: row.get(4)?,
+                        created_at: row.get(5)?,
+                        mime_type: row.get(6)?,
+                        has_preview: row.get::<_, i64>(7)? != 0,
+                        is_hidden: row.get::<_, i64>(8)? != 0,
                     })
                 },
             )?;
@@ -1231,6 +1918,7 @@ impl Db {
         root_path: &str,
         show_hidden: bool,
         limit: i64,
+        filters: IndexSearchFilters,
     ) -> anyhow::Result<Vec<IndexEntry>> {
         let query = query.to_owned();
         let root_path = root_path.to_owned();
@@ -1247,12 +1935,19 @@ impl Db {
             if query.chars().count() >= 3 {
                 let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
                 let mut statement = connection.prepare(
-                    "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime \
+                    "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, \
+                            e.mime_type, e.has_preview, e.is_hidden \
                      FROM index_fts JOIN index_entries e ON e.id = index_fts.rowid \
                      JOIN indexed_dirs d ON d.id = e.dir_id \
                      WHERE index_fts MATCH ?1
                        AND (e.real_path = ?3 OR e.real_path LIKE ?4 ESCAPE '!')
                        AND (?5 = 1 OR e.name NOT LIKE '.%')
+                       AND (?6 IS NULL OR e.size >= ?6)
+                       AND (?7 IS NULL OR e.size <= ?7)
+                       AND (?8 IS NULL OR e.mtime >= ?8)
+                       AND (?9 IS NULL OR e.mtime <= ?9)
+                       AND (?10 IS NULL OR e.is_dir = ?10)
+                       AND (?11 IS NULL OR e.mime_type LIKE ?11)
                      LIMIT ?2",
                 )?;
                 let rows = statement.query_map(
@@ -1261,7 +1956,17 @@ impl Db {
                         limit,
                         root_path,
                         root_pattern,
-                        show_hidden as i64
+                        show_hidden as i64,
+                        filters
+                            .min_size
+                            .map(|value| value.min(i64::MAX as u64) as i64),
+                        filters
+                            .max_size
+                            .map(|value| value.min(i64::MAX as u64) as i64),
+                        filters.modified_after,
+                        filters.modified_before,
+                        filters.is_dir.map(|value| value as i64),
+                        filters.mime_prefix
                     ],
                     |row| {
                         Ok(IndexEntry {
@@ -1270,6 +1975,10 @@ impl Db {
                             is_dir: row.get::<_, i64>(2)? != 0,
                             size: row.get(3)?,
                             mtime: row.get(4)?,
+                            created_at: row.get(5)?,
+                            mime_type: row.get(6)?,
+                            has_preview: row.get::<_, i64>(7)? != 0,
+                            is_hidden: row.get::<_, i64>(8)? != 0,
                         })
                     },
                 )?;
@@ -1279,15 +1988,38 @@ impl Db {
             } else {
                 let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
                 let mut statement = connection.prepare(
-                    "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime \
+                    "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, \
+                            e.mime_type, e.has_preview, e.is_hidden \
                      FROM index_entries e JOIN indexed_dirs d ON d.id = e.dir_id \
                      WHERE e.name LIKE ?1 ESCAPE '\\'
                        AND (e.real_path = ?3 OR e.real_path LIKE ?4 ESCAPE '!')
                        AND (?5 = 1 OR e.name NOT LIKE '.%')
+                       AND (?6 IS NULL OR e.size >= ?6)
+                       AND (?7 IS NULL OR e.size <= ?7)
+                       AND (?8 IS NULL OR e.mtime >= ?8)
+                       AND (?9 IS NULL OR e.mtime <= ?9)
+                       AND (?10 IS NULL OR e.is_dir = ?10)
+                       AND (?11 IS NULL OR e.mime_type LIKE ?11)
                      LIMIT ?2",
                 )?;
                 let rows = statement.query_map(
-                    params![pattern, limit, root_path, root_pattern, show_hidden as i64],
+                    params![
+                        pattern,
+                        limit,
+                        root_path,
+                        root_pattern,
+                        show_hidden as i64,
+                        filters
+                            .min_size
+                            .map(|value| value.min(i64::MAX as u64) as i64),
+                        filters
+                            .max_size
+                            .map(|value| value.min(i64::MAX as u64) as i64),
+                        filters.modified_after,
+                        filters.modified_before,
+                        filters.is_dir.map(|value| value as i64),
+                        filters.mime_prefix
+                    ],
                     |row| {
                         Ok(IndexEntry {
                             name: row.get(0)?,
@@ -1295,6 +2027,10 @@ impl Db {
                             is_dir: row.get::<_, i64>(2)? != 0,
                             size: row.get(3)?,
                             mtime: row.get(4)?,
+                            created_at: row.get(5)?,
+                            mime_type: row.get(6)?,
+                            has_preview: row.get::<_, i64>(7)? != 0,
+                            is_hidden: row.get::<_, i64>(8)? != 0,
                         })
                     },
                 )?;
@@ -1568,6 +2304,26 @@ fn share_from_row(row: &Row<'_>) -> rusqlite::Result<Share> {
         revoked: row.get::<_, i64>(8)? != 0,
         created_at: row.get(9)?,
         visit_count: row.get(10)?,
+    })
+}
+
+fn job_from_row(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
+    Ok(JobRecord {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        kind: row.get(2)?,
+        job_key: row.get(3)?,
+        status: row.get(4)?,
+        progress: row.get(5)?,
+        total: row.get(6)?,
+        bytes_done: row.get(7)?,
+        bytes_total: row.get(8)?,
+        payload: row.get(9)?,
+        result: row.get(10)?,
+        error: row.get(11)?,
+        created_at: row.get(12)?,
+        started_at: row.get(13)?,
+        finished_at: row.get(14)?,
     })
 }
 

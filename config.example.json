@@ -23,7 +23,10 @@
   "index": {
     "ignore": [".git", "node_modules", "@eaDir"],
     "max_entries_per_dir": 200000,
-    "auto_index_on_browse": true
+    "auto_index_on_browse": true,
+    "scheduled_scans": true,
+    "quick_scan_minutes": 10,
+    "full_scan_hours": 24
   },
   "uploads": {
     "max_file_bytes": 10737418240,
@@ -49,6 +52,17 @@
     "session_ttl_hours": 168,
     "cookie_secure": false,
     "trusted_proxies": []
+  },
+  "jobs": {
+    "io_workers": 1,
+    "queue_max": 256,
+    "dir_size_ttl_seconds": 300,
+    "dir_size_error_retry_seconds": 60,
+    "usage_cache_seconds": 45,
+    "dir_size_use_logical": true,
+    "audit_retention_days": 90,
+    "audit_max_rows": 200000,
+    "job_retention_days": 30
   },
   "log": { "level": "info", "format": "text" }
 }

@@ -10,6 +10,7 @@ export interface ProgressState {
   current: number;
   total: number;
   status: ProgressStatus;
+  onCancel?: (() => void) | null;
 }
 
 const initial: ProgressState = {
@@ -19,12 +20,25 @@ const initial: ProgressState = {
   current: 0,
   total: 0,
   status: 'running',
+  onCancel: null,
 };
 
 export const progress = writable<ProgressState>(initial);
 
 export function startProgress(title: string, total = 0, detail = ''): void {
-  progress.set({ visible: true, title, detail, current: 0, total, status: 'running' });
+  progress.set({
+    visible: true,
+    title,
+    detail,
+    current: 0,
+    total,
+    status: 'running',
+    onCancel: null,
+  });
+}
+
+export function setProgressCancel(onCancel: (() => void) | null): void {
+  progress.update((value) => ({ ...value, onCancel }));
 }
 
 export function updateProgress(current: number, detail = ''): void {

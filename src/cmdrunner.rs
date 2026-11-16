@@ -521,18 +521,13 @@ pub(crate) async fn load_root(
 }
 
 async fn audit(state: &Arc<AppState>, user_id: i64, line: &str, cwd: &str, headers: &HeaderMap) {
-    let ip = auth::client_ip(headers);
-    if let Err(error) = state
-        .db
-        .audit(
-            Some(user_id),
-            "command",
-            Some(cwd),
-            Some(line),
-            ip.as_deref(),
-        )
-        .await
-    {
-        tracing::warn!(error = %error, "failed to write command audit log");
-    }
+    state
+        .enqueue_audit(crate::db::AuditRecord {
+            user_id: Some(user_id),
+            action: "command".to_owned(),
+            path: Some(cwd.to_owned()),
+            detail: Some(line.to_owned()),
+            ip: auth::client_ip(headers),
+        })
+        .await;
 }

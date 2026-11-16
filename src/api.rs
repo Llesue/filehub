@@ -15,7 +15,6 @@ use crate::auth::{self, AuthKind};
 use crate::config;
 use crate::db::{ApiToken, User, unix_now};
 use crate::error::AppError;
-use crate::fsops;
 use crate::state::AppState;
 
 pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
@@ -43,7 +42,9 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/auth/tokens/{id}", delete(delete_token))
         .route("/admin/users", get(list_users).post(create_user))
         .route("/admin/users/{id}", put(update_user).delete(delete_user))
+        .route("/admin/users/usage", get(crate::usage::admin_batch))
         .route("/admin/users/{id}/usage", get(user_usage))
+        .route("/admin/status", get(crate::admin_fs::status))
         .route(
             "/admin/server-paths",
             get(crate::admin_fs::list_server_paths).post(crate::admin_fs::add_server_path),
@@ -101,6 +102,15 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/fs/rename", post(crate::files::rename))
         .route("/fs/copy", post(crate::files::copy))
         .route("/fs/move", post(crate::files::move_items))
+        .route("/fs/transfer-jobs", post(crate::files::transfer_job))
+        .route(
+            "/fs/transfer-jobs/{id}",
+            get(crate::files::job_status).delete(crate::files::job_cancel),
+        )
+        .route(
+            "/jobs/{id}",
+            get(crate::files::job_status).delete(crate::files::job_cancel),
+        )
         .route("/fs/delete/preview", post(crate::files::delete_preview))
         .route("/fs/delete", post(crate::files::delete_confirm))
         .route(
@@ -637,6 +647,7 @@ async fn update_user(
         .update_user(id, request.role.as_deref(), quota, request.disabled)
         .await
         .map_err(AppError::internal)?;
+    state.invalidate_usage(id);
 
     if let Some(password) = request.password {
         let password_hash = auth::hash_password_async(password)
@@ -682,11 +693,13 @@ async fn user_usage(
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
-    let home = std::path::PathBuf::from(&user.home_dir);
-    let used = tokio::task::spawn_blocking(move || fsops::path_size(&home))
-        .await
-        .map_err(|err| AppError::internal(anyhow::anyhow!("usage task failed: {err}")))??;
-    Ok(Json(json!({ "used_bytes": used })))
+    let ttl = state.settings().settings.jobs.usage_cache_seconds as i64;
+    let snapshot = crate::usage::load_snapshot(&state, &user, ttl).await?;
+    Ok(Json(json!({
+        "used_bytes": snapshot.used_bytes,
+        "quota_bytes": snapshot.quota_bytes,
+        "computed_at": snapshot.computed_at,
+    })))
 }
 
 async fn delete_user(
@@ -1026,12 +1039,13 @@ async fn audit(
     detail: Option<&str>,
     headers: &HeaderMap,
 ) {
-    let ip = auth::client_ip(headers);
-    if let Err(err) = state
-        .db
-        .audit(user_id, action, path, detail, ip.as_deref())
-        .await
-    {
-        tracing::warn!(error = %err, action, "failed to write audit log");
-    }
+    state
+        .enqueue_audit(crate::db::AuditRecord {
+            user_id,
+            action: action.to_owned(),
+            path: path.map(str::to_owned),
+            detail: detail.map(str::to_owned),
+            ip: auth::client_ip(headers),
+        })
+        .await;
 }

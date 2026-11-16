@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { api, type AdminRoot, type ServerPath, type SettingsResponse, type User } from '../api';
   import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
@@ -16,7 +16,10 @@
   let users = $state<User[]>([]);
   let paths = $state<ServerPath[]>([]);
   let settings = $state<SettingsResponse | null>(null);
-  let usage = $state<Record<number, number>>({});
+  let usage = $state<Record<number, number | null>>({});
+  let usageComputing = $state(false);
+  let usageTimer: ReturnType<typeof setTimeout> | null = null;
+  let status = $state<Awaited<ReturnType<typeof api.adminStatus>> | null>(null);
   let roots = $state<Record<number, AdminRoot[]>>({});
   let loading = $state(true);
   let createOpen = $state(false);
@@ -48,28 +51,65 @@
       users = userResult.users;
       paths = pathResult.paths;
       settings = settingsResult;
-      const usageEntries = await Promise.all(
-        users.map(async (user) => [user.id, (await api.userUsage(user.id)).used_bytes] as const),
-      );
-      usage = Object.fromEntries(usageEntries);
-      const rootEntries = await Promise.all(
-        users.map(async (user) => [user.id, (await api.listUserRoots(user.id)).roots] as const),
-      );
+      const [usageResult, rootEntries, statusResult] = await Promise.all([
+        api.adminUsage(),
+        Promise.all(
+          users.map(async (user) => [user.id, (await api.listUserRoots(user.id)).roots] as const),
+        ),
+        api.adminStatus(),
+      ]);
+      applyUsage(usageResult);
       roots = Object.fromEntries(rootEntries);
+      status = statusResult;
     } catch (error) {
       showNotice(error instanceof Error ? error.message : t($language, '管理数据加载失败'));
     } finally {
       loading = false;
+      scheduleUsagePoll();
     }
   }
 
+  function applyUsage(result: Awaited<ReturnType<typeof api.adminUsage>>): void {
+    usage = Object.fromEntries(
+      users.map((user) => [user.id, result.users[user.id]?.used_bytes ?? null] as const),
+    );
+    usageComputing = users.some((user) => result.users[user.id]?.computing ?? false);
+  }
+
+  function scheduleUsagePoll(): void {
+    if (usageTimer) {
+      clearTimeout(usageTimer);
+      usageTimer = null;
+    }
+    if (!usageComputing) return;
+    usageTimer = setTimeout(() => void refreshUsage(), 2000);
+  }
+
+  async function refreshUsage(): Promise<void> {
+    try {
+      applyUsage(await api.adminUsage());
+    } catch (error) {
+      console.warn('admin usage refresh failed', error);
+      usageComputing = false;
+    }
+    scheduleUsagePoll();
+  }
+
   onMount(() => void load());
+  onDestroy(() => {
+    if (usageTimer) clearTimeout(usageTimer);
+  });
 
   function formatBytes(value: number | null): string {
     if (value === null) return t($language, '不限制');
     if (value < 1024 ** 2) return `${(value / 1024).toFixed(0)} KB`;
     if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
     return `${(value / 1024 ** 3).toFixed(1)} GB`;
+  }
+
+  function usedLabel(userId: number): string {
+    const value = usage[userId];
+    return value === null || value === undefined ? t($language, '统计中…') : formatBytes(value);
   }
 
   function formatDate(value: number | null): string {
@@ -251,6 +291,52 @@
   </header>
 
   {#if loading}<p class="muted">{t($language, '加载中…')}</p>{:else}
+    {#if status}
+      <section class="admin-section">
+        <div class="section-heading">
+          <h2>{t($language, '系统状态')}</h2>
+        </div>
+        <div class="status-grid">
+          <span
+            >{t($language, '后台任务')}：{status.jobs.length > 0
+              ? status.jobs.map((job) => `${job.kind} ${job.queued}/${job.running}`).join(' · ')
+              : '—'}</span
+          >
+          <span
+            >{t($language, '目录大小缓存')}：{status.directory_sizes.length > 0
+              ? status.directory_sizes.map((entry) => `${entry.status} ${entry.count}`).join(' · ')
+              : '—'}</span
+          >
+          <span
+            >{t($language, '数据库')}：{formatBytes(
+              status.database.page_count * status.database.page_size,
+            )} · WAL {formatBytes(status.database.wal_bytes)}</span
+          >
+          <span>
+            {t($language, '索引维护')}：{status.index.scheduled
+              ? t($language, '快速 {quick} 分钟 / 全量 {full} 小时', {
+                  quick: status.index.quick_scan_minutes,
+                  full: status.index.full_scan_hours,
+                })
+              : t($language, '已关闭')}
+            {status.index.last_quick_scan
+              ? ` · ${t($language, '上次快速扫描')} ${formatDate(status.index.last_quick_scan)}`
+              : ''}
+          </span>
+        </div>
+        {#if status.slow_requests.length > 0}
+          <details class="slow-requests">
+            <summary>{t($language, '最近慢请求')}（{status.slow_requests.length}）</summary>
+            {#each status.slow_requests.slice(0, 10) as request, index (index)}
+              <div class="status-row">
+                <span>{request.method} {request.path}</span>
+                <span>{request.status} · {request.duration_ms} ms</span>
+              </div>
+            {/each}
+          </details>
+        {/if}
+      </section>
+    {/if}
     <section class="admin-section">
       <div class="section-heading">
         <h2>{t($language, '用户')}</h2>
@@ -268,7 +354,7 @@
             <button type="button" class="quota-button" onclick={() => (quotaUser = user)}
               >{t($language, '配额')} {formatBytes(user.quota_bytes)}</button
             >
-            <span class="meta">{t($language, '已用')} {formatBytes(usage[user.id] ?? 0)}</span>
+            <span class="meta">{t($language, '已用')} {usedLabel(user.id)}</span>
             <button type="button" class="text-button" onclick={() => (passwordUser = user)}
               >{t($language, '重置密码')}</button
             >
@@ -289,6 +375,11 @@
               <div class="root-row">
                 <span class="root-alias">{root.alias}</span>
                 <span class="root-path">{root.real_path}</span>
+                {#if root.covered_by}
+                  <span class="tag"
+                    >{t($language, '已被父根 {name} 覆盖', { name: root.covered_by })}</span
+                  >
+                {/if}
                 <button type="button" class="permission" onclick={() => void toggleRoot(user, root)}
                   >{root.read_only ? t($language, '只读') : t($language, '读写')}</button
                 >
@@ -538,6 +629,47 @@
     color: var(--text-2);
     font-size: 12.5px;
   }
+  .status-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    color: var(--text-2);
+    font-size: 12.5px;
+  }
+
+  .status-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-2);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .status-row:last-child {
+    border-bottom: 0;
+  }
+
+  .slow-requests {
+    margin-top: 10px;
+    color: var(--text-2);
+    font-size: 12.5px;
+  }
+
+  .slow-requests summary {
+    cursor: pointer;
+  }
+
+  .tag {
+    padding: 1px 6px;
+    border-radius: 99px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 11px;
+  }
+
   .user-meta {
     display: flex;
     gap: 16px;
@@ -723,5 +855,25 @@
   }
   .danger-text {
     color: var(--danger);
+  }
+  @media (max-width: 520px) {
+    .admin-header {
+      align-items: flex-start;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    h1 {
+      font-size: 22px;
+    }
+
+    .audit-button {
+      white-space: nowrap;
+    }
+
+    .user-meta {
+      flex-direction: column;
+      gap: 4px;
+    }
   }
 </style>

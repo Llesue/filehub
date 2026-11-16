@@ -267,6 +267,9 @@ pub async fn upload(
     tokio::fs::write(&target, body)
         .await
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+    state
+        .invalidate_path_caches(&target, Some(share.creator_id), false)
+        .await;
     Ok(Json(
         json!({ "name": target.file_name().and_then(|value| value.to_str()).unwrap_or(filename) }),
     ))
@@ -591,12 +594,13 @@ async fn load_root(state: &Arc<AppState>, user_id: i64, root_id: i64) -> Result<
 }
 
 async fn audit(state: &Arc<AppState>, user_id: i64, action: &str, path: &str, headers: &HeaderMap) {
-    let ip = auth::client_ip(headers);
-    if let Err(error) = state
-        .db
-        .audit(Some(user_id), action, Some(path), None, ip.as_deref())
-        .await
-    {
-        tracing::warn!(error = %error, action, "failed to write share audit log");
-    }
+    state
+        .enqueue_audit(crate::db::AuditRecord {
+            user_id: Some(user_id),
+            action: action.to_owned(),
+            path: Some(path.to_owned()),
+            detail: None,
+            ip: auth::client_ip(headers),
+        })
+        .await;
 }

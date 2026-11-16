@@ -101,7 +101,7 @@ sc.exe stop FileHub
 & "C:\Program Files\FileHub\filehub.exe" service uninstall
 ```
 
-Windows 索引优先使用 NTFS MFT，失败时回退普通目录扫描。USN Journal 增量索引尚未实现。
+Windows 索引优先使用 NTFS MFT，之后通过 USN Journal 做增量更新；USN 不可用时回退普通目录扫描。
 
 ## 配置
 
@@ -163,7 +163,7 @@ tests/        Rust 集成测试
 - 不支持非 UTF-8 文件名，也不进入索引/搜索
 - 不生成 HEIC/HEIF/RAW 缩略图
 - 视频缩略图依赖可选的系统 `ffmpeg`
-- Windows USN 增量索引尚未实现
+- Windows USN 增量索引已实现，但上线前应先在目标 NTFS 卷上验证 rename/delete/USN 失效回退场景。
 - 每个数据库只支持一个 FileHub 实例
 
 ## 许可证

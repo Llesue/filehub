@@ -101,7 +101,7 @@ sc.exe stop FileHub
 & "C:\Program Files\FileHub\filehub.exe" service uninstall
 ```
 
-Windows indexing uses the NTFS MFT fast path when available and falls back to a normal directory scan. USN Journal incremental indexing is planned.
+Windows indexing uses the NTFS MFT fast path when available, then USN Journal incremental updates; it falls back to a normal directory scan when USN is unavailable.
 
 ## Configuration
 
@@ -163,7 +163,7 @@ tests/        Rust integration tests
 - Non-UTF-8 filenames are not supported and are excluded from indexing/search.
 - HEIC/HEIF/RAW thumbnails are not generated.
 - Video thumbnails require an optional system `ffmpeg`.
-- Windows USN incremental indexing is not implemented yet.
+- Windows USN incremental indexing is implemented but should be validated against the target NTFS volume before production rollout.
 - FileHub is designed for a single application instance per database.
 
 ## License

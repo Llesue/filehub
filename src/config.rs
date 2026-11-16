@@ -21,6 +21,7 @@ pub struct Settings {
     pub editor: EditorSettings,
     pub ui: UiSettings,
     pub security: SecuritySettings,
+    pub jobs: JobsSettings,
     pub log: LogSettings,
     pub default_quota_bytes: i64,
     pub terminal_enabled: bool,
@@ -43,6 +44,7 @@ impl Default for Settings {
             editor: EditorSettings::default(),
             ui: UiSettings::default(),
             security: SecuritySettings::default(),
+            jobs: JobsSettings::default(),
             log: LogSettings::default(),
             default_quota_bytes: 15 * 1024 * 1024 * 1024,
             terminal_enabled: true,
@@ -108,6 +110,9 @@ pub struct IndexSettings {
     pub ignore: Vec<String>,
     pub max_entries_per_dir: usize,
     pub auto_index_on_browse: bool,
+    pub scheduled_scans: bool,
+    pub quick_scan_minutes: u64,
+    pub full_scan_hours: u64,
 }
 
 impl Default for IndexSettings {
@@ -116,6 +121,9 @@ impl Default for IndexSettings {
             ignore: vec![".git".into(), "node_modules".into(), "@eaDir".into()],
             max_entries_per_dir: 200_000,
             auto_index_on_browse: true,
+            scheduled_scans: true,
+            quick_scan_minutes: 10,
+            full_scan_hours: 24,
         }
     }
 }
@@ -212,6 +220,36 @@ impl Default for SecuritySettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct JobsSettings {
+    pub io_workers: usize,
+    pub queue_max: usize,
+    pub dir_size_ttl_seconds: u64,
+    pub dir_size_error_retry_seconds: u64,
+    pub usage_cache_seconds: u64,
+    pub dir_size_use_logical: bool,
+    pub audit_retention_days: u64,
+    pub audit_max_rows: u64,
+    pub job_retention_days: u64,
+}
+
+impl Default for JobsSettings {
+    fn default() -> Self {
+        Self {
+            io_workers: 1,
+            queue_max: 256,
+            dir_size_ttl_seconds: 300,
+            dir_size_error_retry_seconds: 60,
+            usage_cache_seconds: 45,
+            dir_size_use_logical: true,
+            audit_retention_days: 90,
+            audit_max_rows: 200_000,
+            job_retention_days: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogSettings {
     pub level: String,
     pub format: String,
@@ -242,6 +280,20 @@ impl Settings {
         }
         if self.security.session_ttl_hours == 0 {
             bail!("security.session_ttl_hours must be greater than zero");
+        }
+        if self.jobs.io_workers == 0 {
+            bail!("jobs.io_workers must be greater than zero");
+        }
+        if self.jobs.queue_max == 0 {
+            bail!("jobs.queue_max must be greater than zero");
+        }
+        if self.index.scheduled_scans {
+            if self.index.quick_scan_minutes == 0 {
+                bail!("index.quick_scan_minutes must be greater than zero");
+            }
+            if self.index.full_scan_hours == 0 {
+                bail!("index.full_scan_hours must be greater than zero");
+            }
         }
         Ok(())
     }

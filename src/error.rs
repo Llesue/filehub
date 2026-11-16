@@ -29,6 +29,10 @@ pub enum AppError {
     SetupRequired,
     #[error("too many requests")]
     TooManyRequests,
+    #[error("background queue is full")]
+    QueueFull,
+    #[error("operation cancelled")]
+    Cancelled,
     #[error("not found")]
     NotFound,
     #[error(transparent)]
@@ -103,6 +107,16 @@ impl IntoResponse for AppError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "RATE_LIMITED",
                 "Too many attempts, try again later".to_owned(),
+            ),
+            Self::QueueFull => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "QUEUE_FULL",
+                "Too many background jobs are pending; try again later".to_owned(),
+            ),
+            Self::Cancelled => (
+                StatusCode::CONFLICT,
+                "CANCELLED",
+                "The operation was cancelled".to_owned(),
             ),
             Self::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", "Not found".to_owned()),
             Self::Internal(err) => {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { api, type AuditEntry } from '../api';
   import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
@@ -11,21 +11,36 @@
   let loadingMore = $state(false);
   let nextCursor = $state<string | null>(null);
   let sentinel = $state<HTMLElement | null>(null);
+  let controller: AbortController | null = null;
+
+  function isAbortError(error: unknown): boolean {
+    return error instanceof DOMException && error.name === 'AbortError';
+  }
 
   async function load(cursor?: string): Promise<void> {
+    controller?.abort();
+    const current = new AbortController();
+    controller = current;
     if (cursor) loadingMore = true;
     else loading = true;
     try {
-      const result = await api.listAudit(100, cursor);
+      const result = await api.listAudit(100, cursor, current.signal);
+      if (current.signal.aborted) return;
       entries = cursor ? [...entries, ...result.entries] : result.entries;
       nextCursor = result.next_cursor;
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : t($language, '审计日志加载失败'));
+      if (!isAbortError(error)) {
+        showNotice(error instanceof Error ? error.message : t($language, '审计日志加载失败'));
+      }
     } finally {
-      loading = false;
-      loadingMore = false;
+      if (!current.signal.aborted) {
+        loading = false;
+        loadingMore = false;
+      }
     }
   }
+
+  onDestroy(() => controller?.abort());
 
   onMount(() => {
     void load();

@@ -64,6 +64,9 @@ export interface Entry {
   is_symlink: boolean;
   size: number;
   modified: number;
+  created_at: number;
+  mime_type: string;
+  has_preview: boolean;
 }
 
 export interface ListResponse {
@@ -105,6 +108,8 @@ export interface AdminRoot {
   real_path: string;
   read_only: boolean;
   sort_order: number;
+  covered_by: string | null;
+  covered_by_id: number | null;
 }
 
 export interface AuditEntry {
@@ -137,8 +142,51 @@ export interface TrustedLink {
 
 export interface Usage {
   quota_bytes: number | null;
-  used_bytes: number;
+  used_bytes: number | null;
   disks: Array<{ name: string; total: number; used: number; available: number }>;
+  computed_at?: number | null;
+  stale?: boolean;
+  computing?: boolean;
+}
+
+export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface JobInfo {
+  id: string;
+  user_id: number;
+  kind: string;
+  status: JobStatus;
+  progress: number;
+  total: number;
+  bytes_done: number;
+  bytes_total: number;
+  result: unknown;
+  error: string | null;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export interface TransferJobResult {
+  items: Array<{
+    source: string;
+    target?: string;
+    status: 'completed' | 'failed' | 'skipped';
+    size?: number;
+    error?: string;
+  }>;
+  failed: number;
+  partial: boolean;
+}
+
+export interface DirSizeInfo {
+  status: 'ready' | 'queued' | 'running' | 'error';
+  size: number | null;
+  indexed: boolean;
+  partial?: boolean;
+  stale?: boolean;
+  error?: string | null;
+  job_id?: string | null;
 }
 
 export interface FileContent {
@@ -172,6 +220,9 @@ export interface SearchEntry {
   is_dir: boolean;
   size: number;
   modified: number;
+  created?: number;
+  mime_type?: string;
+  has_preview?: boolean;
   rootId?: number;
 }
 
@@ -308,9 +359,10 @@ export const api = {
     path: string,
     sort = 'name',
     order = 'asc',
-    sizes = true,
+    sizes = false,
     cursor?: string,
     limit = 200,
+    signal?: AbortSignal,
   ): Promise<ListResponse> {
     const query = new URLSearchParams({
       root: String(root),
@@ -321,12 +373,12 @@ export const api = {
       limit: String(limit),
     });
     if (cursor) query.set('cursor', cursor);
-    return request<ListResponse>(`/list?${query.toString()}`);
+    return request<ListResponse>(`/list?${query.toString()}`, { signal });
   },
 
-  dirSize(root: number, path: string): Promise<{ size: number }> {
+  dirSize(root: number, path: string, signal?: AbortSignal): Promise<DirSizeInfo> {
     const query = new URLSearchParams({ root: String(root), path });
-    return request<{ size: number }>(`/fs/dir-size?${query.toString()}`);
+    return request<DirSizeInfo>(`/fs/dir-size?${query.toString()}`, { signal });
   },
 
   downloadUrl(root: number, path: string): string {
@@ -500,6 +552,44 @@ export const api = {
     return request<{ used_bytes: number }>(`/admin/users/${userId}/usage`);
   },
 
+  adminUsage(): Promise<{
+    users: Record<
+      number,
+      {
+        used_bytes: number | null;
+        quota_bytes: number | null;
+        computed_at: number | null;
+        computing: boolean;
+      }
+    >;
+  }> {
+    return request('/admin/users/usage');
+  },
+
+  adminStatus(): Promise<{
+    jobs: Array<{ kind: string; queued: number; running: number }>;
+    job_counts: Array<{ kind: string; status: string; count: number }>;
+    directory_sizes: Array<{ status: string; count: number }>;
+    database: { page_count: number; page_size: number; freelist_count: number; wal_bytes: number };
+    slow_requests: Array<{
+      method: string;
+      path: string;
+      status: number;
+      duration_ms: number;
+      request_id: string | null;
+      at: number;
+    }>;
+    index: {
+      scheduled: boolean;
+      quick_scan_minutes: number;
+      full_scan_hours: number;
+      last_quick_scan: number | null;
+      last_full_scan: number | null;
+    };
+  }> {
+    return request('/admin/status');
+  },
+
   deleteRoot(userId: number, rootId: number, csrf: string): Promise<void> {
     return request<void>(`/admin/users/${userId}/roots/${rootId}`, { method: 'DELETE' }, csrf);
   },
@@ -593,6 +683,38 @@ export const api = {
     );
   },
 
+  transferJob(
+    mode: 'copy' | 'move',
+    sourceRoot: number,
+    paths: string[],
+    destRoot: number,
+    destPath: string,
+    csrf: string,
+  ): Promise<{ job_id: string; status: string }> {
+    return request<{ job_id: string; status: string }>(
+      '/fs/transfer-jobs',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          source_root: sourceRoot,
+          paths,
+          dest_root: destRoot,
+          dest_path: destPath,
+          move_items: mode === 'move',
+        }),
+      },
+      csrf,
+    );
+  },
+
+  job(id: string, signal?: AbortSignal): Promise<JobInfo> {
+    return request<JobInfo>(`/jobs/${id}`, { signal });
+  },
+
+  cancelJob(id: string, csrf: string): Promise<JobInfo> {
+    return request<JobInfo>(`/jobs/${id}`, { method: 'DELETE' }, csrf);
+  },
+
   previewThumbUrl(root: number, path: string, edge = 2048): string {
     const query = new URLSearchParams({
       root: String(root),
@@ -684,12 +806,14 @@ export const api = {
   listAudit(
     limit = 100,
     cursor?: string,
+    signal?: AbortSignal,
   ): Promise<{ entries: AuditEntry[]; next_cursor: string | null }> {
     const query = new URLSearchParams({ limit: String(limit) });
     if (cursor) query.set('cursor', cursor);
-    return request<{ entries: AuditEntry[]; next_cursor: string | null }>(
-      `/admin/audit?${query.toString()}`,
-    );
+    return request<{
+      entries: AuditEntry[];
+      next_cursor: string | null;
+    }>(`/admin/audit?${query.toString()}`, { signal });
   },
 
   getPreferences(): Promise<PreferencesResponse> {
@@ -791,28 +915,70 @@ export const api = {
     return request<void>(`/admin/server-paths/${id}`, { method: 'DELETE' }, csrf);
   },
 
-  usage(): Promise<Usage> {
-    return request<Usage>('/usage');
+  usage(signal?: AbortSignal): Promise<Usage> {
+    return request<Usage>('/usage', { signal });
   },
 
   index(
     root: number,
-    path = '',
-    recursive = true,
-  ): Promise<{ directories: number; entries: number }> {
-    return request<{ directories: number; entries: number }>('/index', {
-      method: 'POST',
-      body: JSON.stringify({ root, path, recursive }),
-    });
+    path: string,
+    recursive: boolean,
+    csrf: string,
+  ): Promise<{ job_id: string; status: JobStatus; indexing: boolean; covered_by: string | null }> {
+    return request<{
+      job_id: string;
+      status: JobStatus;
+      indexing: boolean;
+      covered_by: string | null;
+    }>('/index', { method: 'POST', body: JSON.stringify({ root, path, recursive }) }, csrf);
   },
 
-  search(root: number, query: string, limit = 100): Promise<{ entries: SearchEntry[] }> {
+  indexStatus(
+    root: number,
+    path = '',
+    signal?: AbortSignal,
+  ): Promise<{
+    status: string;
+    entry_count: number;
+    indexed_at: number | null;
+    total_size_bytes: number;
+    partial: boolean;
+    job: JobInfo | null;
+  }> {
+    const parameters = new URLSearchParams({ root: String(root), path });
+    return request(`/index/status?${parameters.toString()}`, { signal });
+  },
+
+  search(
+    root: number,
+    query: string,
+    limit = 100,
+    signal?: AbortSignal,
+    filters: {
+      kind?: string;
+      minSize?: number;
+      maxSize?: number;
+      modifiedAfter?: number;
+      modifiedBefore?: number;
+      isDir?: boolean;
+    } = {},
+  ): Promise<{ entries: SearchEntry[] }> {
     const parameters = new URLSearchParams({
       root: String(root),
       q: query,
       limit: String(limit),
     });
-    return request<{ entries: SearchEntry[] }>(`/search?${parameters.toString()}`);
+    if (filters.kind) parameters.set('kind', filters.kind);
+    if (filters.minSize !== undefined) parameters.set('min_size', String(filters.minSize));
+    if (filters.maxSize !== undefined) parameters.set('max_size', String(filters.maxSize));
+    if (filters.modifiedAfter !== undefined) {
+      parameters.set('modified_after', String(filters.modifiedAfter));
+    }
+    if (filters.modifiedBefore !== undefined) {
+      parameters.set('modified_before', String(filters.modifiedBefore));
+    }
+    if (filters.isDir !== undefined) parameters.set('is_dir', String(filters.isDir));
+    return request<{ entries: SearchEntry[] }>(`/search?${parameters.toString()}`, { signal });
   },
 
   createUpload(

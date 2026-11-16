@@ -33,6 +33,7 @@ pub mod error;
 pub mod files;
 pub mod fsops;
 pub mod indexer;
+pub mod jobs;
 pub mod pathresolver;
 pub mod platform;
 pub mod preferences;

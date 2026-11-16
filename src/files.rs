@@ -18,7 +18,9 @@ use crate::authz;
 use crate::db::{Root, UploadSession, unix_now};
 use crate::error::AppError;
 use crate::fsops;
+use crate::jobs::{JobContext, JobKind, JobOutcome, SubmitOutcome};
 use crate::state::{AppState, DeleteItem, DeletePreview};
+use crate::usage;
 
 pub async fn roots(
     State(state): State<Arc<AppState>>,
@@ -59,6 +61,10 @@ pub async fn list(
         .await
         .map_err(AppError::internal)?;
     let show_hidden = preferences.show_hidden;
+    let settings = state.settings();
+    let video_enabled = settings.settings.thumbnails.enabled
+        && settings.settings.thumbnails.video
+        && state.ffmpeg.is_some();
     let root = load_root(&state, current.user.id, query.root).await?;
     let path = query.path.unwrap_or_default();
     let resolved = authz::resolve(&state, current.user.id, root.id, &path, false).await?;
@@ -88,19 +94,27 @@ pub async fn list(
         if indexed_mtime == current_mtime {
             let mut entries: Vec<fsops::Entry> = indexed_entries
                 .into_iter()
-                .map(|entry| fsops::Entry {
-                    name: entry.name,
-                    is_dir: entry.is_dir,
-                    is_symlink: false,
-                    size: entry.size,
-                    modified: entry.mtime,
+                .map(|entry| {
+                    let has_preview = entry.has_preview
+                        || (!entry.is_dir
+                            && crate::thumbs::can_preview(&entry.name, video_enabled));
+                    fsops::Entry {
+                        name: entry.name,
+                        is_dir: entry.is_dir,
+                        is_symlink: false,
+                        size: entry.size,
+                        modified: entry.mtime,
+                        created_at: entry.created_at,
+                        mime_type: entry.mime_type,
+                        has_preview,
+                    }
                 })
                 .collect();
             if entries.is_empty() && offset == 0 {
                 let _ = state.db.mark_index_stale(&real_path).await;
             } else {
                 if query.sizes.unwrap_or(false) {
-                    entries = enrich_directory_sizes(entries, resolved.absolute.clone()).await?;
+                    entries = enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
                 }
                 return Ok(Json(json!({
                     "root": root_json(&resolved.root),
@@ -130,8 +144,21 @@ pub async fn list(
     if !show_hidden {
         entries.retain(|entry| !entry.name.starts_with('.'));
     }
+    for entry in &mut entries {
+        entry.has_preview = !entry.is_dir && crate::thumbs::can_preview(&entry.name, video_enabled);
+    }
     if query.sizes.unwrap_or(false) {
-        entries = enrich_directory_sizes(entries, resolved.absolute.clone()).await?;
+        entries = enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
+    }
+    if settings.settings.index.auto_index_on_browse {
+        schedule_browse_index(
+            &state,
+            current.user.id,
+            resolved.root.clone(),
+            resolved.relative.clone(),
+            real_path.clone(),
+        )
+        .await;
     }
 
     Ok(Json(json!({
@@ -142,20 +169,97 @@ pub async fn list(
     })))
 }
 
+async fn schedule_browse_index(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root: Root,
+    relative: String,
+    real_path: String,
+) {
+    let key = format!("dir:{real_path}");
+    if state.jobs.active_job_exact(JobKind::Index, &key).is_some() {
+        return;
+    }
+    if state
+        .jobs
+        .active_job_for_path(JobKind::Index, &real_path)
+        .is_some()
+    {
+        return;
+    }
+    let payload = json!({
+        "root_id": root.id,
+        "path": relative,
+        "recursive": false,
+        "auto": true,
+    });
+    let job_state = Arc::clone(state);
+    let result = state
+        .jobs
+        .submit(
+            JobKind::Index,
+            key,
+            user_id,
+            payload,
+            1,
+            move |ctx| async move {
+                let cancel = ctx.token();
+                let mut progress = |directories: usize, _entries: usize| {
+                    ctx.report(directories, 1, 0, 0);
+                };
+                let stats = crate::indexer::index_path(
+                    &job_state,
+                    user_id,
+                    root,
+                    &relative,
+                    false,
+                    &cancel,
+                    &mut progress,
+                )
+                .await?;
+                Ok(JobOutcome::done(json!(stats), 1, 1))
+            },
+        )
+        .await;
+    match result {
+        Ok(_) => {}
+        Err(AppError::QueueFull) => {}
+        Err(error) => tracing::debug!(%error, path = %real_path, "failed to queue browse index"),
+    }
+}
+
 async fn enrich_directory_sizes(
+    state: &Arc<AppState>,
     mut entries: Vec<fsops::Entry>,
-    base: std::path::PathBuf,
+    base: &std::path::Path,
 ) -> Result<Vec<fsops::Entry>, AppError> {
-    tokio::task::spawn_blocking(move || {
-        for entry in &mut entries {
-            if entry.is_dir {
-                entry.size = fsops::path_size_limited(&base.join(&entry.name), 10_000) as i64;
-            }
+    for entry in &mut entries {
+        if !entry.is_dir {
+            continue;
         }
-        entries
-    })
-    .await
-    .map_err(|err| AppError::internal(anyhow::anyhow!("directory size task failed: {err}")))
+        let real_path = base.join(&entry.name).to_string_lossy().to_string();
+        if let Some((_mtime, size, partial, status)) = state
+            .db
+            .indexed_directory_state(&real_path)
+            .await
+            .map_err(AppError::internal)?
+            && status == "ready"
+            && !partial
+        {
+            entry.size = size.min(i64::MAX as u64) as i64;
+            continue;
+        }
+        if let Some((status, size, _mtime, _error, _updated)) = state
+            .db
+            .directory_size_state(&real_path)
+            .await
+            .map_err(AppError::internal)?
+            && status == "ready"
+        {
+            entry.size = size.max(0);
+        }
+    }
+    Ok(entries)
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,7 +659,8 @@ pub async fn complete_upload(
         }
     }
 
-    tokio::task::spawn_blocking(move || fsops::finalize_upload(&temp, &target_path))
+    let finalize_target = target_path.clone();
+    tokio::task::spawn_blocking(move || fsops::finalize_upload(&temp, &finalize_target))
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("finalize task failed: {err}")))??;
 
@@ -565,9 +670,9 @@ pub async fn complete_upload(
         .await
         .map_err(AppError::internal)?;
 
-    if let Some(parent) = target.absolute.parent() {
-        let _ = state.db.mark_index_stale(&parent.to_string_lossy()).await;
-    }
+    state
+        .invalidate_path_caches(&target_path, Some(current.user.id), false)
+        .await;
 
     audit(
         &state,
@@ -699,10 +804,9 @@ pub async fn delete_confirm(
         tokio::task::spawn_blocking(move || fsops::remove_path(&path, &relative))
             .await
             .map_err(|err| AppError::internal(anyhow::anyhow!("delete task failed: {err}")))??;
-
-        if let Some(parent) = resolved.absolute.parent() {
-            let _ = state.db.mark_index_stale(&parent.to_string_lossy()).await;
-        }
+        state
+            .invalidate_path_caches(&resolved.absolute, Some(current.user.id), true)
+            .await;
     }
 
     audit(&state, current.user.id, "delete", None, &headers).await;
@@ -898,14 +1002,15 @@ async fn audit(
     path: Option<&str>,
     headers: &HeaderMap,
 ) {
-    let ip = auth::client_ip(headers);
-    if let Err(err) = state
-        .db
-        .audit(Some(user_id), action, path, None, ip.as_deref())
-        .await
-    {
-        tracing::warn!(error = %err, action, "failed to write audit log");
-    }
+    state
+        .enqueue_audit(crate::db::AuditRecord {
+            user_id: Some(user_id),
+            action: action.to_owned(),
+            path: path.map(str::to_owned),
+            detail: None,
+            ip: auth::client_ip(headers),
+        })
+        .await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -922,11 +1027,232 @@ pub async fn dir_size(
     let current = auth::current_user(&state, &headers).await?;
     let root = load_root(&state, current.user.id, query.root).await?;
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
+    let real_path = resolved.absolute.to_string_lossy().to_string();
     let path = resolved.absolute.clone();
-    let size = tokio::task::spawn_blocking(move || fsops::path_size_limited(&path, 100_000))
+    let mtime = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || fsops::dir_mtime_ns(&path)
+    })
+    .await
+    .map_err(|err| AppError::internal(anyhow::anyhow!("dir size metadata task failed: {err}")))??;
+    let settings = state.settings();
+    let ttl = settings.settings.jobs.dir_size_ttl_seconds as i64;
+    let retry = settings.settings.jobs.dir_size_error_retry_seconds as i64;
+    let now = unix_now();
+
+    if let Some((indexed_mtime, size, partial, status)) = state
+        .db
+        .indexed_directory_state(&real_path)
         .await
-        .map_err(|err| AppError::internal(anyhow::anyhow!("dir size task failed: {err}")))?;
-    Ok(Json(json!({ "size": size })))
+        .map_err(AppError::internal)?
+    {
+        if status == "ready" && !partial && indexed_mtime == mtime {
+            return Ok(Json(json!({
+                "status": "ready",
+                "size": size,
+                "indexed": true,
+                "partial": false,
+                "stale": false,
+                "error": null,
+            })));
+        }
+        if status == "ready" || status == "error" {
+            let _ = state.db.mark_index_stale(&real_path).await;
+        }
+    }
+
+    if let Some((status, size, cached_mtime, error, updated_at)) = state
+        .db
+        .directory_size_state(&real_path)
+        .await
+        .map_err(AppError::internal)?
+    {
+        if status == "ready" && cached_mtime == mtime {
+            let stale = now.saturating_sub(updated_at) > ttl;
+            if stale {
+                let _ = enqueue_dir_size(
+                    &state,
+                    current.user.id,
+                    real_path.clone(),
+                    path.clone(),
+                    mtime,
+                )
+                .await;
+            }
+            return Ok(Json(json!({
+                "status": "ready",
+                "size": size.max(0) as u64,
+                "indexed": false,
+                "partial": error.is_some(),
+                "stale": stale,
+                "error": error,
+            })));
+        }
+        if status == "error" && now.saturating_sub(updated_at) <= retry {
+            return Ok(Json(json!({
+                "status": "error",
+                "size": null,
+                "indexed": false,
+                "partial": false,
+                "stale": false,
+                "error": error,
+            })));
+        }
+    }
+
+    let outcome = enqueue_dir_size(&state, current.user.id, real_path, path, mtime).await?;
+    let status = if outcome.job.status == "running" {
+        "running"
+    } else {
+        "queued"
+    };
+    Ok(Json(json!({
+        "status": status,
+        "size": null,
+        "indexed": false,
+        "partial": false,
+        "stale": false,
+        "error": null,
+        "job_id": (outcome.job.user_id == current.user.id).then_some(outcome.job.id),
+    })))
+}
+
+async fn enqueue_dir_size(
+    state: &Arc<AppState>,
+    user_id: i64,
+    real_path: String,
+    absolute: std::path::PathBuf,
+    mtime_ns: i64,
+) -> Result<SubmitOutcome, AppError> {
+    let payload = json!({
+        "real_path": real_path,
+        "mtime_ns": mtime_ns,
+    });
+    let key = real_path.clone();
+    if let Some(job) = state.jobs.active_job_for_path(JobKind::DirSize, &key) {
+        return Ok(SubmitOutcome {
+            job,
+            created: false,
+        });
+    }
+    state.jobs.cancel_descendants(JobKind::DirSize, &key).await;
+    let job_state = Arc::clone(state);
+    let job_path = absolute;
+    let job_real_path = real_path;
+    let settings = state.settings();
+    let ignore = settings.settings.index.ignore.clone();
+    let use_logical = settings.settings.jobs.dir_size_use_logical;
+    state
+        .jobs
+        .submit(
+            JobKind::DirSize,
+            key,
+            user_id,
+            payload,
+            1,
+            move |ctx| async move {
+                let _ = job_state
+                    .db
+                    .set_directory_size(&job_real_path, "running", 0, mtime_ns, None)
+                    .await;
+                let cancel = ctx.token();
+                let (sender, mut receiver) =
+                    tokio::sync::mpsc::channel::<(String, i64, i64, Option<String>)>(1024);
+                let scan_cancel = cancel.clone();
+                let scan_path = job_path;
+                let scan = tokio::task::spawn_blocking(move || {
+                    fsops::dir_size_scan(
+                        &scan_path,
+                        &ignore,
+                        &scan_cancel,
+                        use_logical,
+                        &mut |path, total, mtime, partial| {
+                            let error = partial
+                                .then(|| "some entries could not be read".to_owned());
+                            let _ = sender.blocking_send((
+                                path.to_string_lossy().to_string(),
+                                total.min(i64::MAX as u64) as i64,
+                                mtime,
+                                error,
+                            ));
+                        },
+                    )
+                });
+                let mut batch: Vec<(String, i64, i64, Option<String>)> = Vec::with_capacity(256);
+                let mut directories = 0_usize;
+                while let Some(row) = receiver.recv().await {
+                    batch.push(row);
+                    directories += 1;
+                    if batch.len() >= 256 {
+                        let rows = std::mem::take(&mut batch);
+                        if let Err(error) = job_state.db.set_directory_sizes_batch(rows).await {
+                            tracing::warn!(%error, path = %job_real_path, "failed to persist nested directory sizes");
+                        }
+                        ctx.report(directories, 0, 0, 0);
+                    }
+                }
+                if !batch.is_empty()
+                    && let Err(error) = job_state.db.set_directory_sizes_batch(batch).await
+                {
+                    tracing::warn!(%error, path = %job_real_path, "failed to persist nested directory sizes");
+                }
+                ctx.report(directories, 0, 0, 0);
+                let result = scan.await.map_err(|err| {
+                    AppError::internal(anyhow::anyhow!("dir size task failed: {err}"))
+                })?;
+                match result {
+                    Ok(scan) => {
+                        let _ = job_state
+                            .db
+                            .set_directory_size(
+                                &job_real_path,
+                                "ready",
+                                scan.total.min(i64::MAX as u64) as i64,
+                                mtime_ns,
+                                scan.error.as_deref(),
+                            )
+                            .await;
+                        Ok(JobOutcome::done(
+                            json!({
+                                "size": scan.total,
+                                "partial": scan.partial,
+                                "error": scan.error,
+                            }),
+                            directories,
+                            directories,
+                        ))
+                    }
+                    Err(AppError::Cancelled) => {
+                        let _ = job_state
+                            .db
+                            .set_directory_size(
+                                &job_real_path,
+                                "stale",
+                                0,
+                                mtime_ns,
+                                None,
+                            )
+                            .await;
+                        Err(AppError::Cancelled)
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = job_state
+                            .db
+                            .set_directory_size(
+                                &job_real_path,
+                                "error",
+                                0,
+                                mtime_ns,
+                                Some(&message),
+                            )
+                            .await;
+                        Err(error)
+                    }
+                }
+            },
+        )
+        .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -958,6 +1284,9 @@ pub async fn mkdir(
     })
     .await
     .map_err(|err| AppError::internal(anyhow::anyhow!("mkdir task failed: {err}")))??;
+    state
+        .invalidate_path_caches(&resolved.absolute, Some(current.user.id), false)
+        .await;
     audit(
         &state,
         current.user.id,
@@ -990,6 +1319,9 @@ pub async fn touch(
     tokio::task::spawn_blocking(move || fsops::touch_file(&absolute))
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("touch task failed: {err}")))??;
+    state
+        .invalidate_path_caches(&resolved.absolute, Some(current.user.id), false)
+        .await;
     audit(
         &state,
         current.user.id,
@@ -1033,6 +1365,12 @@ pub async fn rename(
     tokio::task::spawn_blocking(move || fsops::rename_path(&source_absolute, &target_absolute))
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("rename task failed: {err}")))??;
+    state
+        .invalidate_path_caches(&source.absolute, Some(current.user.id), true)
+        .await;
+    state
+        .invalidate_path_caches(&target.absolute, Some(current.user.id), true)
+        .await;
     audit(
         &state,
         current.user.id,
@@ -1052,12 +1390,32 @@ pub struct TransferRequest {
     dest_path: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TransferJobPayload {
+    source_root: i64,
+    paths: Vec<String>,
+    dest_root: i64,
+    dest_path: Option<String>,
+    move_items: bool,
+}
+
 pub async fn copy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(request): Json<TransferRequest>,
 ) -> Result<Json<Value>, AppError> {
-    transfer(state, headers, request, false).await
+    submit_transfer(
+        state,
+        headers,
+        TransferJobPayload {
+            source_root: request.source_root,
+            paths: request.paths,
+            dest_root: request.dest_root,
+            dest_path: request.dest_path,
+            move_items: false,
+        },
+    )
+    .await
 }
 
 pub async fn move_items(
@@ -1065,109 +1423,378 @@ pub async fn move_items(
     headers: HeaderMap,
     Json(request): Json<TransferRequest>,
 ) -> Result<Json<Value>, AppError> {
-    transfer(state, headers, request, true).await
+    submit_transfer(
+        state,
+        headers,
+        TransferJobPayload {
+            source_root: request.source_root,
+            paths: request.paths,
+            dest_root: request.dest_root,
+            dest_path: request.dest_path,
+            move_items: true,
+        },
+    )
+    .await
 }
 
-async fn transfer(
+#[derive(Debug, Deserialize)]
+pub struct TransferJobRequest {
+    source_root: i64,
+    paths: Vec<String>,
+    dest_root: i64,
+    dest_path: Option<String>,
+    move_items: Option<bool>,
+}
+
+pub async fn transfer_job(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<TransferJobRequest>,
+) -> Result<Json<Value>, AppError> {
+    submit_transfer(
+        state,
+        headers,
+        TransferJobPayload {
+            source_root: request.source_root,
+            paths: request.paths,
+            dest_root: request.dest_root,
+            dest_path: request.dest_path,
+            move_items: request.move_items.unwrap_or(false),
+        },
+    )
+    .await
+}
+
+async fn submit_transfer(
     state: Arc<AppState>,
     headers: HeaderMap,
-    request: TransferRequest,
-    move_items: bool,
+    payload: TransferJobPayload,
 ) -> Result<Json<Value>, AppError> {
     let current = auth::current_user(&state, &headers).await?;
-    let source_root = load_root(&state, current.user.id, request.source_root).await?;
-    let dest_root = load_root(&state, current.user.id, request.dest_root).await?;
-    if request.paths.is_empty() || request.paths.len() > 1000 {
+    auth::require_csrf(&current, &headers)?;
+    if payload.paths.is_empty() || payload.paths.len() > 1000 {
         return Err(AppError::bad_request("paths must contain 1-1000 items"));
     }
-    let dest_path = request.dest_path.unwrap_or_default();
-    let dest = authz::resolve(&state, current.user.id, dest_root.id, &dest_path, true).await?;
+    let kind = if payload.move_items {
+        JobKind::Move
+    } else {
+        JobKind::Copy
+    };
+    let key = auth::sha256_hex(&format!(
+        "{}:{}:{}:{}:{}",
+        payload.source_root,
+        payload.dest_root,
+        payload.dest_path.as_deref().unwrap_or_default(),
+        payload.move_items,
+        payload.paths.join("\u{1f}")
+    ));
+    let payload_value = serde_json::to_value(&payload)
+        .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+    let user_id = current.user.id;
+    let total = payload.paths.len();
+    let job_state = Arc::clone(&state);
+    let job_payload = payload;
+    let outcome =
+        state
+            .jobs
+            .submit(
+                kind,
+                key,
+                user_id,
+                payload_value,
+                total,
+                move |ctx| async move {
+                    execute_transfer_job(job_state, user_id, job_payload, ctx).await
+                },
+            )
+            .await?;
+    let status = if outcome.job.status == "running" {
+        "running"
+    } else {
+        "queued"
+    };
+    Ok(Json(json!({
+        "job_id": outcome.job.id,
+        "status": status,
+        "created": outcome.created,
+    })))
+}
+
+async fn execute_transfer_job(
+    state: Arc<AppState>,
+    user_id: i64,
+    payload: TransferJobPayload,
+    ctx: JobContext,
+) -> Result<JobOutcome, AppError> {
+    let user = state
+        .db
+        .find_user_by_id(user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let source_root = load_root(&state, user_id, payload.source_root).await?;
+    let dest_root = load_root(&state, user_id, payload.dest_root).await?;
+    let dest_path = payload.dest_path.clone().unwrap_or_default();
+    let dest = authz::resolve(&state, user_id, dest_root.id, &dest_path, true).await?;
     if !dest.absolute.is_dir() {
         return Err(AppError::bad_request("destination is not a directory"));
     }
 
     let mut sources = Vec::new();
-    for path in request.paths {
+    for path in &payload.paths {
         if path.is_empty() {
             return Err(AppError::invalid_path(
                 "the root directory cannot be transferred",
             ));
         }
-        let source =
-            authz::resolve(&state, current.user.id, source_root.id, &path, move_items).await?;
-        sources.push(source);
+        sources
+            .push(authz::resolve(&state, user_id, source_root.id, path, payload.move_items).await?);
     }
 
-    if !move_items && current.user.quota_bytes.is_some() {
-        let roots = state
-            .db
-            .list_roots(current.user.id)
-            .await
-            .map_err(AppError::internal)?;
-        let mut added = 0_u64;
-        for source in &sources {
-            let path = source.absolute.clone();
-            added = added.saturating_add(
-                tokio::task::spawn_blocking(move || fsops::path_size(&path))
-                    .await
-                    .map_err(|err| {
-                        AppError::internal(anyhow::anyhow!("size task failed: {err}"))
-                    })??,
-            );
-        }
-        let used = tokio::task::spawn_blocking(move || fsops::directory_usage(&roots))
-            .await
-            .map_err(|err| AppError::internal(anyhow::anyhow!("quota task failed: {err}")))??;
-        if used.saturating_add(added) > current.user.quota_bytes.unwrap_or_default().max(0) as u64 {
+    let total_items = sources.len();
+    let cancel = ctx.token();
+    let mut source_sizes = Vec::with_capacity(total_items);
+    let mut total_bytes = 0_u64;
+    for source in &sources {
+        let path = source.absolute.clone();
+        let scan_cancel = cancel.clone();
+        let size = tokio::task::spawn_blocking(move || {
+            fsops::path_size_cancellable(&path, &scan_cancel, &mut |_| {})
+        })
+        .await
+        .map_err(|err| AppError::internal(anyhow::anyhow!("size task failed: {err}")))??;
+        source_sizes.push(size);
+        total_bytes = total_bytes.saturating_add(size);
+        ctx.check_cancelled()?;
+    }
+
+    if !payload.move_items && user.quota_bytes.is_some() {
+        let used = usage::cached_or_scan(&state, &user).await?;
+        if used.saturating_add(total_bytes) > user.quota_bytes.unwrap_or_default().max(0) as u64 {
             return Err(AppError::QuotaExceeded);
         }
     }
 
-    let mut results = Vec::new();
-    for source in sources {
-        let name = source
-            .absolute
-            .file_name()
-            .ok_or_else(|| AppError::invalid_path("source has no file name"))?;
+    let mut results = Vec::with_capacity(total_items);
+    let mut failed = 0_usize;
+    let mut bytes_done_total = 0_u64;
+    for (index, source) in sources.iter().enumerate() {
+        ctx.check_cancelled()?;
+        let source_again = authz::resolve(
+            &state,
+            user_id,
+            source_root.id,
+            &source.relative,
+            payload.move_items,
+        )
+        .await?;
+        let dest_again =
+            authz::resolve(&state, user_id, dest_root.id, &dest.relative, true).await?;
+        if source_again.absolute != source.absolute || dest_again.absolute != dest.absolute {
+            failed += 1;
+            results.push(json!({
+                "source": source.relative,
+                "status": "failed",
+                "error": "path changed during transfer",
+            }));
+            continue;
+        }
+        let Some(name) = source.absolute.file_name() else {
+            failed += 1;
+            results.push(json!({
+                "source": source.relative,
+                "status": "failed",
+                "error": "source has no file name",
+            }));
+            continue;
+        };
         let candidate = dest.absolute.join(name);
-        if move_items && source.absolute == candidate {
+        if payload.move_items && source.absolute == candidate {
+            results.push(json!({
+                "source": source.relative,
+                "target": source.relative,
+                "status": "skipped",
+            }));
             continue;
         }
         let target = fsops::unique_target(&candidate);
         let source_path = source.absolute.clone();
         let target_path = target.clone();
-        tokio::task::spawn_blocking(move || {
+        let expected = source_sizes.get(index).copied().unwrap_or(0);
+        let job_cancel = ctx.token();
+        let base_done = bytes_done_total;
+        let move_items = payload.move_items;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<u64>(32);
+        let progress_ctx = ctx.clone();
+        let progress_task = tokio::spawn(async move {
+            while let Some(done) = receiver.recv().await {
+                progress_ctx.report(
+                    index,
+                    total_items,
+                    base_done.saturating_add(done),
+                    total_bytes,
+                );
+            }
+        });
+        let result = tokio::task::spawn_blocking(move || {
+            let mut last = 0_u64;
+            let mut progress = |done: u64, total: u64, _files: u64| {
+                if done.saturating_sub(last) >= 32 * 1024 * 1024 || done == total {
+                    last = done;
+                    let _ = sender.blocking_send(done);
+                }
+            };
             if move_items {
-                fsops::move_path(&source_path, &target_path)
+                fsops::move_path_with_progress(
+                    &source_path,
+                    &target_path,
+                    &job_cancel,
+                    expected,
+                    &mut progress,
+                )
             } else {
-                fsops::copy_path(&source_path, &target_path)
+                fsops::copy_path_with_progress(
+                    &source_path,
+                    &target_path,
+                    &job_cancel,
+                    expected,
+                    &mut progress,
+                )
             }
         })
         .await
-        .map_err(|err| AppError::internal(anyhow::anyhow!("transfer task failed: {err}")))??;
-        let _ = state
-            .db
-            .mark_index_stale(&source.absolute.to_string_lossy())
-            .await;
-        let _ = state
-            .db
-            .mark_index_stale(&dest.absolute.to_string_lossy())
-            .await;
-        results.push(json!({
-            "source": source.relative,
-            "target": target.strip_prefix(&dest.absolute).unwrap_or(&target).to_string_lossy(),
-        }));
+        .map_err(|err| AppError::internal(anyhow::anyhow!("transfer task failed: {err}")))?;
+        let _ = progress_task.await;
+
+        match result {
+            Ok(()) => {
+                bytes_done_total = bytes_done_total.saturating_add(expected);
+                ctx.report(index + 1, total_items, bytes_done_total, total_bytes);
+                let target_relative = target
+                    .strip_prefix(&dest.absolute)
+                    .unwrap_or(&target)
+                    .to_string_lossy()
+                    .to_string();
+                state
+                    .invalidate_path_caches(&target, Some(user_id), true)
+                    .await;
+                if payload.move_items {
+                    state
+                        .invalidate_path_caches(&source.absolute, Some(user_id), true)
+                        .await;
+                }
+                results.push(json!({
+                    "source": source.relative,
+                    "target": target_relative,
+                    "status": "completed",
+                    "size": expected,
+                }));
+            }
+            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    path = %source.relative,
+                    %error,
+                    "background transfer item failed"
+                );
+                results.push(json!({
+                    "source": source.relative,
+                    "status": "failed",
+                    "error": error.to_string(),
+                }));
+            }
+        }
     }
-    let action = if move_items { "move" } else { "copy" };
-    audit(
-        &state,
-        current.user.id,
-        action,
-        Some(&dest.relative),
-        &headers,
-    )
-    .await;
-    Ok(Json(json!({ "items": results })))
+
+    if failed == total_items && total_items > 0 {
+        return Err(AppError::bad_request(format!(
+            "all {failed} transfer items failed"
+        )));
+    }
+    let action = if payload.move_items { "move" } else { "copy" };
+    if let Err(error) = state
+        .db
+        .audit(Some(user_id), action, Some(&dest.relative), None, None)
+        .await
+    {
+        tracing::warn!(%error, action, "failed to write transfer audit log");
+    }
+    Ok(JobOutcome {
+        result: json!({
+            "items": results,
+            "failed": failed,
+            "partial": failed > 0,
+        }),
+        progress: total_items,
+        total: total_items,
+        bytes_done: bytes_done_total,
+        bytes_total: total_bytes,
+    })
+}
+
+async fn can_view_job(
+    state: &Arc<AppState>,
+    user: &crate::db::User,
+    job: &crate::jobs::Job,
+) -> Result<bool, AppError> {
+    if job.user_id == user.id || user.role == "admin" {
+        return Ok(true);
+    }
+    let roots = state
+        .db
+        .list_roots(user.id)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(roots.iter().any(|root| {
+        crate::platform::path_within(
+            std::path::Path::new(job.key()),
+            std::path::Path::new(&root.real_path),
+        )
+    }))
+}
+
+pub async fn job_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let job = state.jobs.get(&id).await?.ok_or(AppError::NotFound)?;
+    if !can_view_job(&state, &current.user, &job).await? {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(serde_json::to_value(job).map_err(|err| {
+        AppError::internal(anyhow::Error::from(err))
+    })?))
+}
+
+pub async fn job_cancel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    let job = state.jobs.get(&id).await?.ok_or(AppError::NotFound)?;
+    let is_admin = current.user.role == "admin";
+    let owner = job.user_id == current.user.id;
+    let shared = matches!(job.kind.as_str(), "dir_size" | "index")
+        && can_view_job(&state, &current.user, &job).await?;
+    if !owner && !is_admin && !shared {
+        return Err(AppError::NotFound);
+    }
+    let cancelled = if owner || is_admin {
+        state.jobs.cancel(&id, current.user.id, is_admin).await?
+    } else {
+        // A shared directory/index job belongs to the queue, not to the user
+        // who happened to enqueue it; any user with access to the path may
+        // cancel it. Passing the owner id satisfies the ownership check.
+        state.jobs.cancel(&id, job.user_id, false).await?
+    };
+    Ok(Json(serde_json::to_value(cancelled).map_err(|err| {
+        AppError::internal(anyhow::Error::from(err))
+    })?))
 }
 
 fn join_relative(base: &str, name: &str) -> String {

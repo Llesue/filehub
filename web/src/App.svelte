@@ -3,7 +3,7 @@
   import DOMPurify from 'dompurify';
   import { marked } from 'marked';
   import { onMount } from 'svelte';
-  import { SvelteSet } from 'svelte/reactivity';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import AccountDialog from './lib/components/AccountDialog.svelte';
   import NoticeDialog from './lib/components/NoticeDialog.svelte';
   import ProgressPanel from './lib/components/ProgressPanel.svelte';
@@ -24,14 +24,22 @@
   import Icon from './lib/components/Icon.svelte';
   import { initLanguage, language, localeOf, rootAlias, setLanguage, t } from './lib/i18n';
   import { showNotice, showNoticeAction } from './lib/notices';
-  import { failProgress, finishProgress, startProgress, updateProgress } from './lib/progress';
+  import {
+    failProgress,
+    finishProgress,
+    setProgressCancel,
+    startProgress,
+    updateProgress,
+  } from './lib/progress';
   import {
     api,
     ApiError,
     type AuthResponse,
     type Entry,
     type Root,
+    type JobInfo,
     type SystemFeatures,
+    type TransferJobResult,
     type UserPreferences,
     type SearchEntry,
     type Usage,
@@ -57,9 +65,25 @@
   let currentPath = $state('');
   let entries = $state<Entry[]>([]);
   let selected = $state<string[]>([]);
+  let dirSizes = $state<Record<string, number | null>>({});
+  let dirSizeErrors = $state<Record<string, string | null>>({});
   let selectionAnchor = $state<string | null>(null);
   let filesLoading = $state(false);
   let filesLoadingMore = $state(false);
+  let listGeneration = 0;
+  let listAbort: AbortController | null = null;
+  let loadMoreAbort: AbortController | null = null;
+  let usageAbort: AbortController | null = null;
+  let usagePollTimer: ReturnType<typeof setTimeout> | null = null;
+  let searchAbort: AbortController | null = null;
+  let dirSizeGeneration = 0;
+  let contentElement = $state<HTMLElement | null>(null);
+  let fileTable = $state<HTMLTableElement | null>(null);
+  let gridElement = $state<HTMLElement | null>(null);
+  let virtualStart = $state(0);
+  let virtualEnd = $state(0);
+  let virtualPadTop = $state(0);
+  let virtualPadBottom = $state(0);
   let nextCursor = $state<string | null>(null);
   let filesError = $state('');
   let uploading = $state(false);
@@ -76,6 +100,11 @@
   let searchIndexing = $state(false);
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   let searchInput = $state<HTMLInputElement | null>(null);
+  let searchFiltersOpen = $state(false);
+  let searchKind = $state('');
+  let searchMinMb = $state('');
+  let searchMaxMb = $state('');
+  let searchModified = $state('');
   const indexedRoots = new SvelteSet<number>();
   let searchToken = 0;
   let editorOpen = $state(false);
@@ -93,6 +122,8 @@
   let marqueePreview = $state<string[]>([]);
   let suppressSelectionClear = false;
   let appView = $state<'files' | 'settings' | 'admin' | 'audit' | 'shares'>('files');
+  let settingsMounted = $state(false);
+  let sharesMounted = $state(false);
   let contextMenu = $state<{ x: number; y: number; entry: Entry } | null>(null);
   let blankMenu = $state<{ x: number; y: number } | null>(null);
   let terminalOpen = $state(false);
@@ -124,11 +155,15 @@
   let activeRoot = $derived(roots.find((root) => root.id === activeRootId) ?? null);
   let pathSegments = $derived(currentPath.split('/').filter(Boolean));
   let quotaPercent = $derived(
-    usage?.quota_bytes ? Math.min(100, (usage.used_bytes / usage.quota_bytes) * 100) : 0,
+    usage?.quota_bytes && usage.used_bytes !== null
+      ? Math.min(100, (usage.used_bytes / usage.quota_bytes) * 100)
+      : 0,
   );
   let quotaLabel = $derived(
     usage
-      ? `${formatSize(usage.used_bytes)} / ${usage.quota_bytes ? formatSize(usage.quota_bytes) : '∞'}`
+      ? usage.used_bytes === null
+        ? t($language, '统计中…')
+        : `${formatSize(usage.used_bytes)} / ${usage.quota_bytes ? formatSize(usage.quota_bytes) : '∞'}`
       : '—',
   );
   let pageTitle = $derived.by(() => {
@@ -140,6 +175,26 @@
       pathSegments[pathSegments.length - 1] ||
       (activeRoot ? rootLabel(activeRoot.alias) : undefined);
     return current ? `FileHub - ${current}` : 'FileHub';
+  });
+
+  const VIRTUAL_THRESHOLD = 300;
+  const VIRTUAL_ROW_HEIGHT = 49;
+  let visibleEntries = $derived(
+    entries.length > VIRTUAL_THRESHOLD ? entries.slice(virtualStart, virtualEnd) : entries,
+  );
+
+  $effect(() => {
+    void entries.length;
+    void view;
+    void contentElement;
+    void fileTable;
+    void gridElement;
+    updateVirtualRange();
+  });
+
+  $effect(() => {
+    if (appView === 'settings') settingsMounted = true;
+    if (appView === 'shares') sharesMounted = true;
   });
 
   onMount(() => {
@@ -208,6 +263,7 @@
     };
 
     window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('resize', updateVirtualRange);
     const autoSaveTimer = window.setInterval(() => {
       if (editorOpen && editorDirty && !editorSaving) {
         void saveEditor(true);
@@ -215,7 +271,9 @@
     }, 30_000);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', updateVirtualRange);
       window.clearInterval(autoSaveTimer);
+      if (usagePollTimer) clearTimeout(usagePollTimer);
     };
   });
 
@@ -351,6 +409,13 @@
   }
 
   async function loadList(rootId: number, path: string): Promise<void> {
+    const generation = ++listGeneration;
+    listAbort?.abort();
+    loadMoreAbort?.abort();
+    abortDirSizeRequests();
+    dirSizeGeneration += 1;
+    const controller = new AbortController();
+    listAbort = controller;
     filesLoading = true;
     filesError = '';
     nextCursor = null;
@@ -363,11 +428,22 @@
           sortOrder = order === 'desc' ? 'desc' : 'asc';
         }
       }
-      const result = await api.list(rootId, path, sortField, sortOrder, false, undefined, 200);
+      const result = await api.list(
+        rootId,
+        path,
+        sortField,
+        sortOrder,
+        false,
+        undefined,
+        200,
+        controller.signal,
+      );
+      if (generation !== listGeneration || controller.signal.aborted) return;
       activeRootId = result.root.id;
       currentPath = result.path;
       entries = result.entries;
       nextCursor = result.next_cursor;
+      loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration);
       selected = [];
       selectionAnchor = null;
       const remembered = localStorage.getItem(`view:${result.root.id}:${result.path}`);
@@ -381,9 +457,10 @@
       }
       void loadUsage();
     } catch (error) {
+      if (isAbortError(error)) return;
       handleFilesError(error);
     } finally {
-      filesLoading = false;
+      if (generation === listGeneration) filesLoading = false;
     }
   }
 
@@ -400,27 +477,219 @@
     filesLoadingMore = true;
     const rootId = activeRootId;
     const path = currentPath;
+    const generation = listGeneration;
+    loadMoreAbort?.abort();
+    const controller = new AbortController();
+    loadMoreAbort = controller;
     try {
-      const result = await api.list(rootId, path, sortField, sortOrder, false, nextCursor, 200);
+      const result = await api.list(
+        rootId,
+        path,
+        sortField,
+        sortOrder,
+        false,
+        nextCursor,
+        200,
+        controller.signal,
+      );
+      if (generation !== listGeneration || controller.signal.aborted) return;
       if (rootId !== activeRootId || path !== currentPath) return;
       entries = [...entries, ...result.entries];
       nextCursor = result.next_cursor;
+      loadDirectorySizes(result.entries, result.root.id, result.path, dirSizeGeneration);
     } catch (error) {
-      handleFilesError(error);
+      if (!isAbortError(error)) handleFilesError(error);
     } finally {
-      filesLoadingMore = false;
+      if (generation === listGeneration) filesLoadingMore = false;
     }
   }
 
+  const dirSizeTimers = new SvelteMap<string, ReturnType<typeof setTimeout>>();
+  const dirSizeAttempts = new SvelteMap<string, number>();
+  const dirSizeControllers = new SvelteSet<AbortController>();
+
+  function abortDirSizeRequests(): void {
+    for (const controller of dirSizeControllers) controller.abort();
+    dirSizeControllers.clear();
+    for (const timer of dirSizeTimers.values()) clearTimeout(timer);
+    dirSizeTimers.clear();
+    dirSizeAttempts.clear();
+  }
+
+  function loadDirectorySizes(
+    items: Entry[],
+    rootId: number,
+    path: string,
+    generation: number,
+  ): void {
+    for (const entry of items) {
+      if (!entry.is_dir) continue;
+      const key = `${rootId}:${joinPath(path, entry.name)}`;
+      if (dirSizes[key] !== undefined || dirSizeTimers.has(key)) continue;
+      void requestDirectorySize(key, rootId, joinPath(path, entry.name), generation);
+    }
+  }
+
+  async function requestDirectorySize(
+    key: string,
+    rootId: number,
+    path: string,
+    generation: number,
+  ): Promise<void> {
+    if (generation !== dirSizeGeneration) return;
+    const controller = new AbortController();
+    dirSizeControllers.add(controller);
+    try {
+      const result = await api.dirSize(rootId, path, controller.signal);
+      if (generation !== dirSizeGeneration) return;
+      if (result.status === 'ready' && result.size !== null) {
+        dirSizes = { ...dirSizes, [key]: result.size };
+        dirSizeErrors = { ...dirSizeErrors, [key]: result.error ?? null };
+        dirSizeAttempts.delete(key);
+        return;
+      }
+      if (result.status === 'error') {
+        dirSizes = { ...dirSizes, [key]: null };
+        dirSizeErrors = {
+          ...dirSizeErrors,
+          [key]: result.error ?? t($language, '无法统计目录大小'),
+        };
+        dirSizeAttempts.delete(key);
+        return;
+      }
+      const attempts = (dirSizeAttempts.get(key) ?? 0) + 1;
+      if (attempts > 150) {
+        dirSizes = { ...dirSizes, [key]: null };
+        dirSizeErrors = { ...dirSizeErrors, [key]: t($language, '统计超时') };
+        dirSizeAttempts.delete(key);
+        return;
+      }
+      dirSizeAttempts.set(key, attempts);
+      const timer = setTimeout(() => {
+        dirSizeTimers.delete(key);
+        void requestDirectorySize(key, rootId, path, generation);
+      }, 2000);
+      dirSizeTimers.set(key, timer);
+    } catch (error) {
+      if (isAbortError(error) || generation !== dirSizeGeneration) return;
+      dirSizes = { ...dirSizes, [key]: null };
+      dirSizeErrors = {
+        ...dirSizeErrors,
+        [key]: error instanceof Error ? error.message : t($language, '无法统计目录大小'),
+      };
+      dirSizeAttempts.delete(key);
+    } finally {
+      dirSizeControllers.delete(controller);
+    }
+  }
+
+  function clearDirSizeCache(): void {
+    dirSizes = {};
+    dirSizeErrors = {};
+  }
+
   function entrySize(entry: Entry): string {
-    return entry.is_dir ? '—' : formatSize(entry.size);
+    if (!entry.is_dir) return formatSize(entry.size);
+    if (activeRootId === null) return t($language, '计算中…');
+    const size = dirSizes[`${activeRootId}:${joinPath(currentPath, entry.name)}`];
+    return size === undefined ? t($language, '计算中…') : size === null ? '—' : formatSize(size);
+  }
+
+  function entrySizeError(entry: Entry): string {
+    if (!entry.is_dir || activeRootId === null) return '';
+    return dirSizeErrors[`${activeRootId}:${joinPath(currentPath, entry.name)}`] ?? '';
   }
 
   function handleContentScroll(event: Event): void {
     const element = event.currentTarget as HTMLElement;
+    updateVirtualRange();
     if (element.scrollHeight - element.scrollTop - element.clientHeight < 240) {
       void loadMore();
     }
+  }
+
+  function galleryMetrics(element: HTMLElement): {
+    columns: number;
+    rowHeight: number;
+    gap: number;
+  } {
+    const style = getComputedStyle(element);
+    const columns = Math.max(
+      1,
+      style.gridTemplateColumns.split(' ').filter((value) => value.length > 0).length,
+    );
+    const gap = view === 'thumb' ? 16 : 10;
+    const card = element.querySelector<HTMLElement>('.file-card, .file-tile');
+    const cardHeight = card?.getBoundingClientRect().height ?? (view === 'thumb' ? 190 : 84);
+    return { columns, rowHeight: cardHeight + gap, gap };
+  }
+
+  function updateVirtualRange(): void {
+    if (!contentElement || entries.length <= VIRTUAL_THRESHOLD) {
+      virtualStart = 0;
+      virtualEnd = entries.length;
+      virtualPadTop = 0;
+      virtualPadBottom = 0;
+      return;
+    }
+    if (view === 'list') {
+      const table = fileTable;
+      if (!table) {
+        virtualStart = 0;
+        virtualEnd = Math.min(entries.length, 80);
+        virtualPadTop = 0;
+        virtualPadBottom = 0;
+        return;
+      }
+      const contentRect = contentElement.getBoundingClientRect();
+      const tableRect = table.getBoundingClientRect();
+      const headerHeight = table.tHead?.getBoundingClientRect().height ?? 0;
+      const tableTop = tableRect.top - contentRect.top + contentElement.scrollTop + headerHeight;
+      const relativeTop = contentElement.scrollTop - tableTop;
+      const overscan = 12;
+      const first = Math.floor(relativeTop / VIRTUAL_ROW_HEIGHT) - overscan;
+      const count = Math.ceil(contentElement.clientHeight / VIRTUAL_ROW_HEIGHT) + overscan * 2;
+      const start = Math.max(0, Math.min(first, entries.length));
+      virtualStart = start;
+      virtualEnd = Math.min(entries.length, start + count);
+      virtualPadTop = 0;
+      virtualPadBottom = 0;
+      return;
+    }
+
+    const grid = gridElement;
+    if (!grid) {
+      virtualStart = 0;
+      virtualEnd = Math.min(entries.length, 60);
+      virtualPadTop = 0;
+      virtualPadBottom = 0;
+      return;
+    }
+    const metrics = galleryMetrics(grid);
+    if (!grid.querySelector<HTMLElement>('.file-card, .file-tile')) {
+      virtualStart = 0;
+      virtualEnd = Math.min(entries.length, 60);
+      virtualPadTop = 0;
+      virtualPadBottom = 0;
+      requestAnimationFrame(updateVirtualRange);
+      return;
+    }
+    const contentRect = contentElement.getBoundingClientRect();
+    const gridRect = grid.getBoundingClientRect();
+    const gridTop = gridRect.top - contentRect.top + contentElement.scrollTop;
+    const relativeTop = contentElement.scrollTop - gridTop;
+    const totalRows = Math.ceil(entries.length / metrics.columns);
+    const startRow = Math.max(0, Math.floor(relativeTop / metrics.rowHeight) - 1);
+    const visibleRows = Math.ceil(contentElement.clientHeight / metrics.rowHeight) + 3;
+    const endRow = Math.min(totalRows, startRow + visibleRows);
+    virtualStart = Math.min(entries.length, startRow * metrics.columns);
+    virtualEnd = Math.min(entries.length, endRow * metrics.columns);
+    virtualPadTop = startRow * metrics.rowHeight;
+    virtualPadBottom = Math.max(0, (totalRows - endRow) * metrics.rowHeight);
+  }
+
+  function isAbortError(error: unknown): boolean {
+    return error instanceof DOMException && error.name === 'AbortError';
   }
 
   function handleFilesError(error: unknown): void {
@@ -433,10 +702,13 @@
   }
 
   async function loadUsage(): Promise<void> {
+    usageAbort?.abort();
+    const controller = new AbortController();
+    usageAbort = controller;
     try {
-      usage = await api.usage();
+      usage = await api.usage(controller.signal);
     } catch (error) {
-      if (!(error instanceof ApiError && error.status === 401)) {
+      if (!isAbortError(error) && !(error instanceof ApiError && error.status === 401)) {
         console.warn('could not load usage', error);
       }
     }
@@ -455,6 +727,8 @@
     if (searchTimer) {
       clearTimeout(searchTimer);
     }
+    searchAbort?.abort();
+    searchIndexing = false;
 
     const query = searchQuery.trim();
     if (!query || activeRootId === null) {
@@ -468,43 +742,119 @@
     }, 250);
   }
 
+  async function waitForIndexJob(
+    jobId: string,
+    token: number,
+    query: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 600; attempt += 1) {
+      if (signal.aborted) return;
+      try {
+        const job: JobInfo = await api.job(jobId, signal);
+        if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
+          return;
+        }
+      } catch (error) {
+        if (isAbortError(error)) return;
+        console.warn('background index status failed', error);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (token !== searchToken) return;
+    }
+  }
+
+  function searchFilterParams(): {
+    kind?: string;
+    minSize?: number;
+    maxSize?: number;
+    modifiedAfter?: number;
+  } {
+    const filters: {
+      kind?: string;
+      minSize?: number;
+      maxSize?: number;
+      modifiedAfter?: number;
+    } = {};
+    if (searchKind) filters.kind = searchKind;
+    const minMb = Number(searchMinMb);
+    if (searchMinMb.trim() && Number.isFinite(minMb) && minMb >= 0) {
+      filters.minSize = Math.floor(minMb * 1024 * 1024);
+    }
+    const maxMb = Number(searchMaxMb);
+    if (searchMaxMb.trim() && Number.isFinite(maxMb) && maxMb >= 0) {
+      filters.maxSize = Math.floor(maxMb * 1024 * 1024);
+    }
+    if (searchModified) {
+      const seconds = Number(searchModified);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        filters.modifiedAfter = Math.floor(Date.now() / 1000) - seconds;
+      }
+    }
+    return filters;
+  }
+
+  function applySearchFilters(): void {
+    const query = searchQuery.trim();
+    if (query) void runSearch(query);
+  }
+
+  function resetSearchFilters(): void {
+    searchKind = '';
+    searchMinMb = '';
+    searchMaxMb = '';
+    searchModified = '';
+  }
+
   async function runSearch(query: string): Promise<void> {
     if (roots.length === 0) return;
     const token = ++searchToken;
+    searchAbort?.abort();
+    const controller = new AbortController();
+    searchAbort = controller;
 
-    const collect = async (forceIndex: boolean): Promise<SearchEntry[]> => {
-      const indexing: Promise<unknown>[] = [];
+    const collect = async (): Promise<SearchEntry[]> => {
+      const indexing: Promise<void>[] = [];
       const settled = await Promise.allSettled(
         roots.map(async (root) => {
-          if (forceIndex || !indexedRoots.has(root.id)) {
+          if (!indexedRoots.has(root.id)) {
             indexedRoots.add(root.id);
-            indexing.push(
-              api.index(root.id, '', true).catch((error) => {
-                console.warn('background index failed', error);
-              }),
-            );
+            try {
+              const job = await api.index(root.id, '', true, csrf);
+              indexing.push(waitForIndexJob(job.job_id, token, query, controller.signal));
+            } catch (error) {
+              console.warn('background index failed', error);
+            }
           }
-          const result = await api.search(root.id, query, 100);
+          const result = await api.search(
+            root.id,
+            query,
+            100,
+            controller.signal,
+            searchFilterParams(),
+          );
           return result.entries.map((entry) => ({ ...entry, rootId: root.id }));
         }),
       );
       if (indexing.length > 0) {
         searchIndexing = true;
         void Promise.allSettled(indexing).then(() => {
+          if (token !== searchToken) return;
           searchIndexing = false;
-          if (token === searchToken && searchQuery === query) void runSearch(query);
+          if (searchQuery === query) void runSearch(query);
         });
       }
       return settled.flatMap((result) => (result.status === 'fulfilled' ? result.value : []));
     };
 
     try {
-      const results = await collect(false);
-      if (token !== searchToken) return;
+      const results = await collect();
+      if (token !== searchToken || controller.signal.aborted) return;
       searchResults = results.slice(0, 200);
       searchActive = true;
     } catch (error) {
-      if (token === searchToken) handleFilesError(error);
+      if (token === searchToken && !isAbortError(error)) handleFilesError(error);
     }
   }
 
@@ -532,10 +882,14 @@
   }
 
   function exitSearch(): void {
+    searchAbort?.abort();
+    if (searchTimer) clearTimeout(searchTimer);
     searchActive = false;
     searchQuery = '';
     searchResults = [];
     searchIndexing = false;
+    searchFiltersOpen = false;
+    resetSearchFilters();
   }
 
   function navigateToSegment(index: number): void {
@@ -724,6 +1078,7 @@
       } else if (dialog.entry) {
         await api.rename(rootId, joinPath(currentPath, dialog.entry.name), value, csrf);
       }
+      clearDirSizeCache();
       await loadList(rootId, currentPath);
     } catch (error) {
       handleFilesError(error);
@@ -746,6 +1101,46 @@
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
   }
 
+  async function waitForTransferJob(jobId: string): Promise<TransferJobResult | null> {
+    setProgressCancel(() => {
+      void api.cancelJob(jobId, csrf).catch((error) => {
+        console.warn('cancel job failed', error);
+      });
+    });
+    try {
+      for (;;) {
+        const job = await api.job(jobId);
+        const detail =
+          job.bytes_total > 0
+            ? `${formatSize(job.bytes_done)} / ${formatSize(job.bytes_total)}`
+            : job.status === 'running'
+              ? t($language, '处理中…')
+              : t($language, '排队中…');
+        updateProgress(job.total > 0 ? Math.min(job.progress, job.total) : job.progress, detail);
+        if (job.status === 'completed') {
+          const result = (job.result as TransferJobResult | null) ?? null;
+          if (result?.failed) {
+            showNotice(
+              t($language, '有 {count} 项操作失败。', { count: result.failed }),
+              'warning',
+              t($language, '部分失败'),
+            );
+          }
+          return result;
+        }
+        if (job.status === 'failed') {
+          throw new Error(job.error ?? t($language, '操作失败'));
+        }
+        if (job.status === 'cancelled') {
+          throw new Error(t($language, '操作已取消'));
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    } finally {
+      setProgressCancel(null);
+    }
+  }
+
   async function dropInto(event: DragEvent, destRoot: number, destPath: string): Promise<void> {
     event.preventDefault();
     event.stopPropagation();
@@ -759,9 +1154,18 @@
     }
     startProgress(t($language, '移动文件'), 1, payload.name);
     try {
-      await api.transfer('move', payload.rootId, [payload.path], destRoot, destPath, csrf);
+      const job = await api.transferJob(
+        'move',
+        payload.rootId,
+        [payload.path],
+        destRoot,
+        destPath,
+        csrf,
+      );
+      await waitForTransferJob(job.job_id);
       updateProgress(1, t($language, '完成'));
       finishProgress();
+      clearDirSizeCache();
       if (activeRootId !== null) await loadList(activeRootId, currentPath);
     } catch (error) {
       failProgress(error instanceof Error ? error.message : t($language, '移动失败'));
@@ -779,7 +1183,7 @@
       pending.entries.length,
     );
     try {
-      await api.transfer(
+      const job = await api.transferJob(
         pending.mode,
         rootId,
         pending.entries.map((entry) => joinPath(currentPath, entry.name)),
@@ -787,7 +1191,9 @@
         destPath,
         csrf,
       );
+      await waitForTransferJob(job.job_id);
       updateProgress(pending.entries.length, t($language, '完成'));
+      clearDirSizeCache();
       await loadList(rootId, currentPath);
       finishProgress();
     } catch (error) {
@@ -920,27 +1326,72 @@
     marquee = { x1: event.clientX, y1: event.clientY, x2: event.clientX, y2: event.clientY };
   }
 
+  function marqueeEntryNames(left: number, right: number, top: number, bottom: number): string[] {
+    if (view === 'list' && entries.length > VIRTUAL_THRESHOLD) {
+      const table = fileTable;
+      if (!table) return [];
+      const rect = table.getBoundingClientRect();
+      if (rect.left >= right || rect.right <= left || rect.bottom <= top || rect.top >= bottom) {
+        return [];
+      }
+      const headerHeight = table.tHead?.getBoundingClientRect().height ?? 0;
+      const startY = rect.top + headerHeight;
+      const first = Math.max(0, Math.floor((top - startY) / VIRTUAL_ROW_HEIGHT));
+      const last = Math.min(entries.length - 1, Math.floor((bottom - startY) / VIRTUAL_ROW_HEIGHT));
+      if (last < first) return [];
+      return entries.slice(first, last + 1).map((entry) => entry.name);
+    }
+    if (view !== 'list' && entries.length > VIRTUAL_THRESHOLD && gridElement) {
+      const rect = gridElement.getBoundingClientRect();
+      if (rect.left >= right || rect.right <= left || rect.bottom <= top || rect.top >= bottom) {
+        return [];
+      }
+      const metrics = galleryMetrics(gridElement);
+      const totalRows = Math.ceil(entries.length / metrics.columns);
+      const startRow = Math.max(0, Math.floor(virtualStart / metrics.columns));
+      const startY = rect.top + virtualPadTop;
+      const firstRow = Math.max(0, Math.floor((top - startY) / metrics.rowHeight) + startRow);
+      const lastRow = Math.min(
+        totalRows - 1,
+        Math.floor((bottom - startY) / metrics.rowHeight) + startRow,
+      );
+      if (lastRow < firstRow) return [];
+      const columnWidth = (rect.width - metrics.gap * (metrics.columns - 1)) / metrics.columns;
+      const firstColumn = Math.max(0, Math.floor((left - rect.left) / (columnWidth + metrics.gap)));
+      const lastColumn = Math.min(
+        metrics.columns - 1,
+        Math.floor((right - rect.left) / (columnWidth + metrics.gap)),
+      );
+      const names: string[] = [];
+      for (let row = firstRow; row <= lastRow; row += 1) {
+        for (let column = firstColumn; column <= lastColumn; column += 1) {
+          const entry = entries[row * metrics.columns + column];
+          if (entry) names.push(entry.name);
+        }
+      }
+      return names;
+    }
+    const names: string[] = [];
+    document.querySelectorAll<HTMLElement>('[data-entry-name]').forEach((element) => {
+      const rect = element.getBoundingClientRect();
+      const intersects =
+        rect.left < right && rect.right > left && rect.top < bottom && rect.bottom > top;
+      const name = element.dataset.entryName;
+      if (intersects && name) names.push(name);
+    });
+    return names;
+  }
+
   function updateMarquee(event: MouseEvent): void {
     if (appView !== 'files' || !marquee) return;
     const next = { ...marquee, x2: event.clientX, y2: event.clientY };
     marquee = next;
-    const left = Math.min(next.x1, next.x2);
-    const right = Math.max(next.x1, next.x2);
-    const top = Math.min(next.y1, next.y2);
-    const bottom = Math.max(next.y1, next.y2);
-    marqueePreview = Array.from(
-      document.querySelectorAll<HTMLElement>('[data-entry-name]'),
-    ).flatMap((element) => {
-      const rect = element.getBoundingClientRect();
-      const name = element.dataset.entryName;
-      return name &&
-        rect.left < right &&
-        rect.right > left &&
-        rect.top < bottom &&
-        rect.bottom > top
-        ? [name]
-        : [];
-    });
+    marqueePreview = marqueeEntryNames(
+      Math.min(next.x1, next.x2),
+      Math.max(next.x1, next.x2),
+      Math.min(next.y1, next.y2),
+      Math.max(next.y1, next.y2),
+    );
   }
 
   function finishMarquee(): void {
@@ -949,17 +1400,7 @@
     const right = Math.max(marquee.x1, marquee.x2);
     const top = Math.min(marquee.y1, marquee.y2);
     const bottom = Math.max(marquee.y1, marquee.y2);
-    const names: string[] = [];
-
-    document.querySelectorAll<HTMLElement>('[data-entry-name]').forEach((element) => {
-      const rect = element.getBoundingClientRect();
-      const intersects =
-        rect.left < right && rect.right > left && rect.top < bottom && rect.bottom > top;
-      const name = element.dataset.entryName;
-      if (intersects && name) {
-        names.push(name);
-      }
-    });
+    const names = marqueeEntryNames(left, right, top, bottom);
 
     if (names.length > 0) {
       selected = Array.from(new Set([...selected, ...names]));
@@ -1025,6 +1466,7 @@
         await api.completeUpload(created.upload_id, csrf);
       }
       updateProgress(files.length, t($language, '{count} 个文件完成', { count: files.length }));
+      clearDirSizeCache();
       await loadList(activeRootId, currentPath);
       finishProgress();
     } catch (error) {
@@ -1072,6 +1514,7 @@
               updateProgress(items.length, t($language, '完成'));
               finishProgress();
               confirmState = null;
+              clearDirSizeCache();
               await loadList(rootId, path);
             } catch (error) {
               failProgress(error instanceof Error ? error.message : t($language, '删除失败'));
@@ -1146,6 +1589,7 @@
       editorEtag = saved.etag;
       editorOriginalContent = editorContent;
       if (!auto) editorOpen = false;
+      clearDirSizeCache();
       await loadList(activeRootId, currentPath);
     } catch (error) {
       if (error instanceof ApiError && error.status === 412) {
@@ -1183,9 +1627,10 @@
 
   function formatSize(size: number): string {
     if (size < 1024) return `${size} B`;
-    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-    if (size < 1024 * 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
-    return `${(size / 1024 / 1024 / 1024).toFixed(1)} GB`;
+    if (size < 1024 ** 2) return `${(size / 1024).toFixed(1)} KB`;
+    if (size < 1024 ** 3) return `${(size / 1024 ** 2).toFixed(1)} MB`;
+    if (size < 1024 ** 4) return `${(size / 1024 ** 3).toFixed(1)} GB`;
+    return `${(size / 1024 ** 4).toFixed(1)} TB`;
   }
 
   function isImageName(name: string): boolean {
@@ -1538,7 +1983,7 @@
           </div>
         {/if}
 
-        <main class="content" onscroll={handleContentScroll}>
+        <main class="content" bind:this={contentElement} onscroll={handleContentScroll}>
           <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <div
@@ -1552,34 +1997,103 @@
             onclick={handleContentClick}
             oncontextmenu={handleBlankContextMenu}
           >
+            {#if settingsMounted}
+              <div class:view-hidden={appView !== 'settings'}>
+                {#if preferences}
+                  <PreferencesPage
+                    {user}
+                    {csrf}
+                    {roots}
+                    {preferences}
+                    system={systemFeatures}
+                    onPreferences={applyPreferences}
+                  />
+                {/if}
+              </div>
+            {/if}
+            {#if sharesMounted}
+              <div class:view-hidden={appView !== 'shares'}>
+                <SharesPage {csrf} />
+              </div>
+            {/if}
             {#if appView === 'settings'}
-              {#if preferences}
-                <PreferencesPage
-                  {user}
-                  {csrf}
-                  {roots}
-                  {preferences}
-                  system={systemFeatures}
-                  onPreferences={applyPreferences}
-                />
+              <!-- kept mounted above so returning to settings does not reload -->
+            {:else if appView === 'admin' || appView === 'audit'}
+              <div class:view-hidden={appView === 'audit'}>
+                <AdminPage {csrf} onAudit={() => (appView = 'audit')} />
+              </div>
+              {#if appView === 'audit'}
+                <AuditPage onBack={() => (appView = 'admin')} />
               {/if}
-            {:else if appView === 'admin'}
-              <AdminPage {csrf} onAudit={() => (appView = 'audit')} />
-            {:else if appView === 'audit'}
-              <AuditPage onBack={() => (appView = 'admin')} />
             {:else if appView === 'shares'}
-              <SharesPage {csrf} />
+              <!-- kept mounted above so returning to shares does not reload -->
             {:else}
               {#if searchActive}
                 <div class="search-header">
                   <span>{t($language, '搜索')} “{searchQuery}”</span>
-                  {#if searchIndexing}
-                    <span class="muted">{t($language, '索引中…')}</span>
-                  {/if}
-                  <button type="button" class="ghost" onclick={exitSearch}
-                    >{t($language, '清除')}</button
-                  >
+                  <div class="search-header-actions">
+                    {#if searchIndexing}
+                      <span class="muted">{t($language, '索引中…')}</span>
+                    {/if}
+                    <button
+                      type="button"
+                      class:active={searchFiltersOpen}
+                      class="ghost"
+                      onclick={() => (searchFiltersOpen = !searchFiltersOpen)}
+                      >{t($language, '筛选')}</button
+                    >
+                    <button type="button" class="ghost" onclick={exitSearch}
+                      >{t($language, '清除')}</button
+                    >
+                  </div>
                 </div>
+                {#if searchFiltersOpen}
+                  <div class="search-filters">
+                    <label>
+                      <span>{t($language, '类型')}</span>
+                      <select bind:value={searchKind} onchange={applySearchFilters}>
+                        <option value="">{t($language, '全部')}</option>
+                        <option value="image">{t($language, '图片')}</option>
+                        <option value="video">{t($language, '视频')}</option>
+                        <option value="audio">{t($language, '音频')}</option>
+                        <option value="text">{t($language, '文本')}</option>
+                        <option value="pdf">{t($language, 'PDF')}</option>
+                        <option value="dir">{t($language, '目录')}</option>
+                        <option value="file">{t($language, '文件')}</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>{t($language, '最小大小')}</span>
+                      <input
+                        type="text"
+                        inputmode="decimal"
+                        bind:value={searchMinMb}
+                        onchange={applySearchFilters}
+                        placeholder="MB"
+                      />
+                    </label>
+                    <label>
+                      <span>{t($language, '最大大小')}</span>
+                      <input
+                        type="text"
+                        inputmode="decimal"
+                        bind:value={searchMaxMb}
+                        onchange={applySearchFilters}
+                        placeholder="MB"
+                      />
+                    </label>
+                    <label>
+                      <span>{t($language, '修改时间')}</span>
+                      <select bind:value={searchModified} onchange={applySearchFilters}>
+                        <option value="">{t($language, '全部时间')}</option>
+                        <option value="86400">{t($language, '今天')}</option>
+                        <option value="604800">{t($language, '最近 7 天')}</option>
+                        <option value="2592000">{t($language, '最近 30 天')}</option>
+                        <option value="31536000">{t($language, '最近一年')}</option>
+                      </select>
+                    </label>
+                  </div>
+                {/if}
                 {#if searchResults.length === 0}
                   <div class="files-state">{t($language, '没有找到匹配的文件')}</div>
                 {:else}
@@ -1635,7 +2149,7 @@
                   </section>
                 {:else if view === 'list'}
                   <div class="browser">
-                    <table class="file-table">
+                    <table class="file-table" bind:this={fileTable}>
                       <thead>
                         <tr>
                           <th class="check"></th>
@@ -1702,7 +2216,13 @@
                         </tr>
                       </thead>
                       <tbody>
-                        {#each entries as entry (entry.name)}
+                        {#if entries.length > VIRTUAL_THRESHOLD && virtualStart > 0}
+                          <tr class="virtual-spacer" aria-hidden="true">
+                            <td colspan="5" style:height={`${virtualStart * VIRTUAL_ROW_HEIGHT}px`}
+                            ></td>
+                          </tr>
+                        {/if}
+                        {#each visibleEntries as entry (entry.name)}
                           {@const nameParts = splitFileName(entry.name)}
                           <tr
                             data-entry-name={entry.name}
@@ -1748,7 +2268,7 @@
                                 <span class="tag">{t($language, '链接')}</span>
                               {/if}
                             </td>
-                            <td class="size">{entrySize(entry)}</td>
+                            <td class="size" title={entrySizeError(entry)}>{entrySize(entry)}</td>
                             <td class="modified">{formatRelativeDate(entry.modified)}</td>
                             <td class="actions">
                               <button
@@ -1767,13 +2287,25 @@
                             </td>
                           </tr>
                         {/each}
+                        {#if entries.length > VIRTUAL_THRESHOLD && virtualEnd < entries.length}
+                          <tr class="virtual-spacer" aria-hidden="true">
+                            <td
+                              colspan="5"
+                              style:height={`${(entries.length - virtualEnd) * VIRTUAL_ROW_HEIGHT}px`}
+                            ></td>
+                          </tr>
+                        {/if}
                       </tbody>
                     </table>
                   </div>
                 {:else if view === 'thumb'}
                   <div class="browser">
-                    <div class="file-grid">
-                      {#each entries as entry (entry.name)}
+                    <div
+                      class="file-grid"
+                      bind:this={gridElement}
+                      style={`--virtual-pad-top:${virtualPadTop}px;--virtual-pad-bottom:${virtualPadBottom}px`}
+                    >
+                      {#each visibleEntries as entry (entry.name)}
                         {@const nameParts = splitFileName(entry.name)}
                         <div
                           class="file-card"
@@ -1817,7 +2349,7 @@
                           />
                           <div class="card-icon">
                             <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={40} />
-                            {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && (isImageName(entry.name) || isVideoName(entry.name)) && activeRootId !== null}
+                            {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && entry.has_preview && activeRootId !== null}
                               <img
                                 class="thumb-image"
                                 src={api.thumbUrl(
@@ -1846,8 +2378,12 @@
                   </div>
                 {:else}
                   <div class="browser">
-                    <div class="tile-grid">
-                      {#each entries as entry (entry.name)}
+                    <div
+                      class="tile-grid"
+                      bind:this={gridElement}
+                      style={`--virtual-pad-top:${virtualPadTop}px;--virtual-pad-bottom:${virtualPadBottom}px`}
+                    >
+                      {#each visibleEntries as entry (entry.name)}
                         {@const nameParts = splitFileName(entry.name)}
                         <div
                           class="file-tile"
@@ -1891,7 +2427,7 @@
                           />
                           <div class="tile-icon">
                             <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={34} />
-                            {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && (isImageName(entry.name) || isVideoName(entry.name)) && activeRootId !== null}
+                            {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && entry.has_preview && activeRootId !== null}
                               <img
                                 class="thumb-image"
                                 src={api.thumbUrl(
@@ -2770,6 +3306,15 @@
     background: var(--hover);
   }
 
+  .file-table tbody tr.virtual-spacer:hover {
+    background: transparent;
+  }
+
+  .file-table tbody tr.virtual-spacer td {
+    padding: 0;
+    border: 0;
+  }
+
   .file-table tbody tr.selected {
     background: var(--accent-soft);
   }
@@ -2888,6 +3433,52 @@
     font-size: 14px;
   }
 
+  .search-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .search-header .ghost.active {
+    background: var(--accent-soft);
+    color: var(--accent-text);
+  }
+
+  .search-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: -2px 0 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .search-filters label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-2);
+    font-size: 12.5px;
+  }
+
+  .search-filters input,
+  .search-filters select {
+    width: 96px;
+    height: 30px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text);
+    font: inherit;
+  }
+
+  .search-filters select {
+    width: auto;
+  }
+
   .search-header .ghost {
     height: 30px;
     padding: 0 10px;
@@ -2965,6 +3556,8 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
     gap: 10px;
+    padding-top: var(--virtual-pad-top, 0);
+    padding-bottom: var(--virtual-pad-bottom, 0);
   }
 
   .file-tile {
@@ -3042,6 +3635,8 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
     gap: 16px;
+    padding-top: var(--virtual-pad-top, 0);
+    padding-bottom: var(--virtual-pad-bottom, 0);
   }
 
   .file-card {
@@ -3228,6 +3823,10 @@
     background: var(--accent-soft);
     opacity: 0.55;
     pointer-events: none;
+  }
+
+  .view-hidden {
+    display: none;
   }
 
   .editor-overlay {
@@ -3546,6 +4145,24 @@
   @media (max-width: 520px) {
     .segmented {
       display: none;
+    }
+
+    .topbar {
+      gap: 6px;
+      padding: 0 8px;
+    }
+
+    .topbar-brand .brand-name {
+      display: none;
+    }
+
+    .search {
+      min-width: 0;
+      padding: 0 10px;
+    }
+
+    .top-actions {
+      gap: 4px;
     }
   }
 </style>

@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::Router;
+use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, header};
-use axum::response::IntoResponse;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -13,7 +16,7 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::state::AppState;
+use crate::state::{AppState, SlowRequest};
 use crate::web;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -30,6 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(web::serve_static)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(state.clone(), slow_request))
         .layer(CatchPanicLayer::new())
         .layer(SetResponseHeaderLayer::overriding(
             header::CONTENT_SECURITY_POLICY,
@@ -52,17 +56,67 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> impl IntoResponse {
+async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut response = axum::Json(json!({
         "status": "ok",
         "service": "filehub",
         "version": env!("CARGO_PKG_VERSION"),
+        "jobs": state.jobs.summary(),
+        "active_jobs": state.jobs.active_count(),
     }))
     .into_response();
 
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn slow_request(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let duration_ms = started.elapsed().as_millis();
+    if duration_ms >= 1_000 {
+        let status = response.status().as_u16();
+        if duration_ms >= 10_000 {
+            tracing::error!(
+                method = %method,
+                path = %path,
+                status,
+                duration_ms,
+                request_id = request_id.as_deref().unwrap_or(""),
+                "very slow request"
+            );
+        } else {
+            tracing::warn!(
+                method = %method,
+                path = %path,
+                status,
+                duration_ms,
+                request_id = request_id.as_deref().unwrap_or(""),
+                "slow request"
+            );
+        }
+        state.push_slow_request(SlowRequest {
+            method,
+            path,
+            status,
+            duration_ms,
+            request_id,
+            at: crate::db::unix_now(),
+        });
+    }
     response
 }
 
@@ -85,11 +139,13 @@ pub async fn run_until(
         version = env!("CARGO_PKG_VERSION"),
         "filehub starting"
     );
-
-    axum::serve(listener, router(state))
+    state.start_background_tasks();
+    let serve_state = Arc::clone(&state);
+    axum::serve(listener, router(serve_state))
         .with_graceful_shutdown(shutdown)
         .await
         .context("http server failed")?;
+    state.flush_audit().await;
 
     Ok(())
 }
