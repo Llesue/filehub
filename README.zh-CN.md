@@ -8,6 +8,10 @@ FileHub 是一个单可执行文件的自托管文件管理器。它在浏览器
 
 ![FileHub 主界面](docs/assets/filehub-main-v2.png)
 
+## 为什么做 FileHub
+
+很多年前，我在 WD My Cloud 上第一次使用 FileBrowser，被它简洁优雅的界面和在低性能机器上的快速响应所打动。后来，我有了多用户鉴权、以及管理 NAS 上任意目录的需求，FileBrowser 渐渐无法满足我；又惊闻 FileBrowser 已宣布停止更新，于是萌生了一个想法：借助 OpenCode 和 DeepSeek，开发一个属于自己的 FileBrowser。
+
 ## 功能
 
 - 浏览、上传、下载、重命名、复制、移动和删除文件/目录
