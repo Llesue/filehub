@@ -149,25 +149,64 @@ pub fn collect_zip(
         if resolved.relative.is_empty() {
             return Err(AppError::invalid_path("cannot archive the root directory"));
         }
-
-        let name = resolved
-            .absolute
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| AppError::invalid_path("invalid archive entry name"))?
-            .to_owned();
-
-        collect_one(
-            &resolved.absolute,
-            &name,
+        collect_zip_path(
+            resolved,
             &mut entries,
             &mut total_bytes,
             max_bytes,
             max_files,
+            false,
         )?;
     }
 
     Ok(entries)
+}
+
+/// Collect one resolved path (file or directory) for a ZIP download. Unlike
+/// `collect_zip`, a share root with an empty relative path is allowed.
+pub fn collect_zip_path(
+    resolved: &ResolvedPath,
+    entries: &mut Vec<ZipEntry>,
+    total_bytes: &mut u64,
+    max_bytes: u64,
+    max_files: usize,
+    skip_hidden: bool,
+) -> Result<(), AppError> {
+    let name = resolved
+        .absolute
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::invalid_path("invalid archive entry name"))?
+        .to_owned();
+    collect_one(
+        &resolved.absolute,
+        &name,
+        entries,
+        total_bytes,
+        max_bytes,
+        max_files,
+        skip_hidden,
+    )
+}
+
+pub fn collect_zip_named(
+    path: &Path,
+    name: &str,
+    entries: &mut Vec<ZipEntry>,
+    total_bytes: &mut u64,
+    max_bytes: u64,
+    max_files: usize,
+    skip_hidden: bool,
+) -> Result<(), AppError> {
+    collect_one(
+        path,
+        name,
+        entries,
+        total_bytes,
+        max_bytes,
+        max_files,
+        skip_hidden,
+    )
 }
 
 fn collect_one(
@@ -177,6 +216,7 @@ fn collect_one(
     total_bytes: &mut u64,
     max_bytes: u64,
     max_files: usize,
+    skip_hidden: bool,
 ) -> Result<(), AppError> {
     let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
 
@@ -191,6 +231,9 @@ fn collect_one(
             if child_name.starts_with(".filehub-upload-") {
                 continue;
             }
+            if skip_hidden && child_name.starts_with('.') {
+                continue;
+            }
             collect_one(
                 &entry.path(),
                 &format!("{name}/{child_name}"),
@@ -198,6 +241,7 @@ fn collect_one(
                 total_bytes,
                 max_bytes,
                 max_files,
+                skip_hidden,
             )?;
         }
         return Ok(());
@@ -207,11 +251,11 @@ fn collect_one(
         return Ok(());
     }
 
-    if entries.len() >= max_files {
+    if max_files != 0 && entries.len() >= max_files {
         return Err(AppError::too_large("too many files for a single ZIP"));
     }
     *total_bytes = total_bytes.saturating_add(metadata.len());
-    if *total_bytes > max_bytes {
+    if max_bytes != 0 && *total_bytes > max_bytes {
         return Err(AppError::too_large("ZIP exceeds the configured byte limit"));
     }
 
@@ -310,6 +354,57 @@ pub fn write_text_atomic(path: &Path, contents: &[u8]) -> Result<(), AppError> {
 
 pub fn delete_temp(path: &Path) {
     let _ = std::fs::remove_file(path);
+}
+
+/// Remove stale `.filehub-edit-*.tmp` files under `root`.
+///
+/// Only files with the exact editor temp prefix are touched. Symlinks are not
+/// followed and the walk is capped so a huge tree cannot stall maintenance.
+pub fn cleanup_edit_temp(root: &Path, cutoff: i64, max_dirs: usize) -> (usize, usize, bool) {
+    let mut removed = 0_usize;
+    let mut visited = 0_usize;
+    let mut truncated = false;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        if visited >= max_dirs {
+            truncated = true;
+            break;
+        }
+        visited += 1;
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(".filehub-edit-") || !name.ends_with(".tmp") {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(i64::MAX);
+            if modified < cutoff && std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    (removed, visited, truncated)
 }
 
 pub fn canonical_directory(path: &str) -> Result<PathBuf, AppError> {

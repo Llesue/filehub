@@ -53,6 +53,8 @@ sudo cp config.example.json /etc/filehub/config.json
 sudo chown -R filehub:filehub /home/filehub
 ```
 
+Missing data directories are created automatically at startup (`/home/filehub`, `users`, `cache`); make sure the service user owns them in advance.
+
 Run in the foreground:
 
 ```bash
@@ -73,10 +75,19 @@ WorkingDirectory=/home/filehub
 ExecStart=/usr/local/bin/filehub --config /etc/filehub/config.json
 Restart=on-failure
 RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/filehub
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+`NoNewPrivileges` and an empty `CapabilityBoundingSet` prevent privilege and capability escalation, `PrivateTmp` isolates `/tmp`, `ProtectSystem=strict` makes the filesystem read-only, `ReadWritePaths` restores write access only for `/home/filehub`, `UMask=0077` keeps new files private, and `RestrictAddressFamilies` limits the service to IP and Unix sockets. If you move `users_root`, `cache_dir`, or `db_path` outside `/home/filehub`, add those paths to `ReadWritePaths` (use the parent directory for `db_path`). Do not set `ProtectHome=yes`: it hides `/home` and makes `/home/filehub` inaccessible to the service.
 
 The default address is `http://<host>:8080/`. On first start, FileHub prints a setup token to the log (or uses `FILEHUB_SETUP_TOKEN`). Open the UI and use that token to create the first administrator.
 
@@ -98,7 +109,7 @@ This produces `target/x86_64-pc-windows-msvc/release/filehub.exe`. Copy it to th
 sc.exe start FileHub
 ```
 
-The service runs as `LocalSystem`, starts automatically, and stores its database, users, cache, and logs under `C:\ProgramData\FileHub`. Service logs are written to `filehub.log.YYYY-MM-DD` in that directory.
+The service runs as `LocalSystem`, starts automatically, and stores its database, users, cache, and logs under `C:\ProgramData\FileHub`. Service logs rotate daily to `%ProgramData%\FileHub\filehub.log.<date>` (for example `filehub.log.2026-11-16`). `log.retention_days` controls cleanup: the default is `14`, `0` disables cleanup, and the maximum is `3650`. Expired files are removed at startup and during the hourly maintenance pass.
 
 To read the service log and retrieve the first-run setup token:
 
@@ -117,6 +128,95 @@ sc.exe stop FileHub
 ```
 
 Windows indexing uses the NTFS MFT fast path when available, then USN Journal incremental updates; it falls back to a normal directory scan when USN is unavailable.
+
+## Reverse proxy
+
+Do not expose FileHub directly to the public internet. Terminate TLS in Caddy or Nginx and forward traffic to FileHub over loopback or a private network. When the proxy runs on the same host, set `listen` to `127.0.0.1:8080` so FileHub cannot be reached around the proxy.
+
+The proxy must preserve the original `Host` header and forward the client address in `X-Forwarded-For` and `X-Real-IP`, plus the public scheme in `X-Forwarded-Proto`. Overwrite these headers instead of appending to values supplied by the client; otherwise a client can forge its own audit IP.
+
+FileHub only honors forwarding headers when the TCP peer is listed in `security.trusted_proxies`. Add the source address the proxy uses to connect to FileHub (`127.0.0.1`, `::1`, or the Docker bridge address/subnet). If the list does not match, audit records show the proxy address instead of the real client. Set `security.cookie_secure` to `true` whenever the public URL uses HTTPS; if you enable it while testing over plain HTTP, the browser will not store the session cookie.
+
+```json
+{
+  "security": {
+    "cookie_secure": true,
+    "trusted_proxies": ["127.0.0.1", "::1"]
+  }
+}
+```
+
+Proxy requirements:
+
+- WebSocket: `/api/v1/terminal/ws` needs HTTP/1.1 and the `Upgrade`/`Connection` headers. Caddy handles this automatically; Nginx needs the `map` block shown below.
+- Upload body limit: set it above `uploads.chunk_size` (8 MiB by default). The examples use 32 MiB; raise it if you increase the chunk size.
+- Downloads and ZIP streams: disable proxy buffering (`proxy_buffering off` and `proxy_request_buffering off` in Nginx, `flush_interval -1` in Caddy). FileHub does not send `X-Accel-Buffering`, so buffering must be disabled in the proxy.
+- Long transfers: the examples use a 1-hour read/send timeout. Increase it, or lower `downloads.zip_max_bytes`, if very large ZIP archives can take longer.
+
+### Caddy
+
+```caddyfile
+files.example.com {
+    request_body {
+        max_size 32MB
+    }
+
+    reverse_proxy 127.0.0.1:8080 {
+        header_up Host {host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        flush_interval -1
+        transport http {
+            read_timeout 1h
+            write_timeout 1h
+        }
+    }
+}
+```
+
+Caddy obtains TLS certificates automatically and supports WebSocket upgrades through `reverse_proxy` without extra directives. The `header_up` lines replace forwarding headers that a client may have sent.
+
+### Nginx
+
+Define the upgrade map in the `http` context (for example in `/etc/nginx/conf.d/filehub-upgrade.conf`), then use a `server` block like this:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name files.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/files.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/files.example.com/privkey.pem;
+
+    client_max_body_size 32m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+```
+
+Use `$remote_addr` rather than `$proxy_add_x_forwarded_for`: the latter appends to a client-supplied `X-Forwarded-For` header, so the first address can still be forged. If the proxy runs in Docker, use the container address or bridge network in `proxy_pass` and add the matching source address to `security.trusted_proxies`.
 
 ## Configuration
 

@@ -7,14 +7,14 @@
 
   let {
     root,
-    path,
+    paths,
     name,
     isDir,
     csrf,
     onClose,
   }: {
     root: number;
-    path: string;
+    paths: string[];
     name: string;
     isDir: boolean;
     csrf: string;
@@ -24,7 +24,7 @@
   let password = $state('');
   let expiresDays = $state('0');
   let readOnlyOverride = $state<boolean | null>(null);
-  const readOnly = $derived(readOnlyOverride ?? isDir);
+  const readOnly = $derived(readOnlyOverride ?? (isDir || paths.length > 1));
   let error = $state('');
   let busy = $state(false);
   let created = $state<{ url: string; token: string } | null>(null);
@@ -38,7 +38,8 @@
       const result = await api.createShare(
         {
           root,
-          path,
+          path: paths[0],
+          paths: paths.length > 1 ? paths : undefined,
           password: password.trim() || undefined,
           expires_at,
           read_only: readOnly,
@@ -109,7 +110,7 @@
             <option value="30">{t($language, '30 天')}</option>
           </select>
         </label>
-        {#if isDir}
+        {#if isDir && paths.length === 1}
           <label class="check">
             <input
               type="checkbox"

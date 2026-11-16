@@ -231,3 +231,125 @@ async fn share_crud_password_and_download() {
     .await;
     assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn public_directory_share_reports_read_only() {
+    let app = setup_app().await;
+    let create = |read_only: Option<bool>| {
+        let router = app.router.clone();
+        let cookie = app.cookie.clone();
+        let csrf = app.csrf.clone();
+        let root_id = app.root_id;
+        async move {
+            let mut payload = json!({"root": root_id, "path": "folder"});
+            if let Some(read_only) = read_only {
+                payload["read_only"] = json!(read_only);
+            }
+            let response = send_json(
+                &router,
+                Method::POST,
+                "/api/v1/shares",
+                Some(&cookie),
+                Some(&csrf),
+                payload,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await["token"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+
+    let read_only_token = create(None).await;
+    let meta = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{read_only_token}"),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(meta.status(), StatusCode::OK);
+    let body = json_body(meta).await;
+    assert_eq!(body["is_dir"], true);
+    assert_eq!(body["read_only"], true);
+
+    let write_token = create(Some(false)).await;
+    let meta = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{write_token}"),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(meta.status(), StatusCode::OK);
+    assert_eq!(json_body(meta).await["read_only"], false);
+}
+
+#[tokio::test]
+async fn list_reports_current_directory_read_only() {
+    let app = setup_app().await;
+    let me = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/me",
+        Some(&app.cookie),
+        None,
+        None,
+    )
+    .await;
+    let me = json_body(me).await;
+    let user_id = me["user"]["id"].as_i64().unwrap();
+    let roots = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&app.cookie),
+        None,
+        None,
+    )
+    .await;
+    let root = json_body(roots).await["roots"][0].clone();
+    let alias = root["alias"].as_str().unwrap().to_owned();
+    let root_id = root["id"].as_i64().unwrap();
+
+    let list_uri = format!("/api/v1/list?root={root_id}&path=folder");
+    let response = send(
+        &app.router,
+        Method::GET,
+        &list_uri,
+        Some(&app.cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(json_body(response).await["read_only"], false);
+
+    let update = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/admin/users/{user_id}/roots/{root_id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"alias": alias, "read_only": true, "sort_order": 0}),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        &list_uri,
+        Some(&app.cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["read_only"], true);
+}

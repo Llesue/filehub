@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,6 +33,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/0014_index_metadata_runtime.sql"),
     ),
     (15, include_str!("../migrations/0015_usn_state.sql")),
+    (
+        16,
+        include_str!("../migrations/0016_pending_index_dirs.sql"),
+    ),
+    (17, include_str!("../migrations/0017_share_uploads.sql")),
+    (18, include_str!("../migrations/0018_branding.sql")),
+    (19, include_str!("../migrations/0019_collection_shares.sql")),
 ];
 
 pub fn unix_now() -> i64 {
@@ -126,6 +133,30 @@ pub struct UploadSession {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ShareUploadSession {
+    pub id: String,
+    pub share_id: i64,
+    pub dir_path: String,
+    pub filename: String,
+    pub total_size: i64,
+    pub chunk_size: i64,
+    pub received: i64,
+    pub chunk_bitmap: Vec<u8>,
+    pub temp_path: String,
+    pub expires_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrandingIcon {
+    pub icon: Vec<u8>,
+    pub mime_type: String,
+    pub version: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IndexSearchFilters {
     pub min_size: Option<u64>,
@@ -202,6 +233,8 @@ pub struct ServerPath {
 
 pub struct Share {
     pub id: i64,
+    pub kind: String,
+    pub item_count: i64,
     pub token_hash: String,
     pub creator_id: i64,
     pub real_path: String,
@@ -212,6 +245,15 @@ pub struct Share {
     pub revoked: bool,
     pub created_at: i64,
     pub visit_count: i64,
+}
+
+pub struct ShareItem {
+    pub id: i64,
+    pub share_id: i64,
+    pub real_path: String,
+    pub display_name: String,
+    pub is_dir: bool,
+    pub sort_order: i64,
 }
 
 pub struct TrustedLink {
@@ -1007,6 +1049,202 @@ impl Db {
         .await
     }
 
+    pub async fn insert_share_upload(&self, upload: &ShareUploadSession) -> anyhow::Result<()> {
+        let upload = upload.clone();
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO share_upload_sessions \
+                 (id, share_id, dir_path, filename, total_size, chunk_size, received, \
+                  chunk_bitmap, temp_path, expires_at, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    upload.id,
+                    upload.share_id,
+                    upload.dir_path,
+                    upload.filename,
+                    upload.total_size,
+                    upload.chunk_size,
+                    upload.received,
+                    upload.chunk_bitmap,
+                    upload.temp_path,
+                    upload.expires_at,
+                    upload.created_at,
+                    upload.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn find_share_upload(
+        &self,
+        id: &str,
+        share_id: i64,
+    ) -> anyhow::Result<Option<ShareUploadSession>> {
+        let id = id.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, share_id, dir_path, filename, total_size, chunk_size, received, \
+                     chunk_bitmap, temp_path, expires_at, created_at, updated_at \
+                     FROM share_upload_sessions WHERE id = ?1 AND share_id = ?2",
+                    params![id, share_id],
+                    |row| {
+                        Ok(ShareUploadSession {
+                            id: row.get(0)?,
+                            share_id: row.get(1)?,
+                            dir_path: row.get(2)?,
+                            filename: row.get(3)?,
+                            total_size: row.get(4)?,
+                            chunk_size: row.get(5)?,
+                            received: row.get(6)?,
+                            chunk_bitmap: row.get(7)?,
+                            temp_path: row.get(8)?,
+                            expires_at: row.get(9)?,
+                            created_at: row.get(10)?,
+                            updated_at: row.get(11)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn update_share_upload_progress(
+        &self,
+        id: &str,
+        share_id: i64,
+        received: i64,
+        chunk_bitmap: Vec<u8>,
+    ) -> anyhow::Result<bool> {
+        let id = id.to_owned();
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "UPDATE share_upload_sessions \
+                 SET received = ?1, chunk_bitmap = ?2, updated_at = ?3 \
+                 WHERE id = ?4 AND share_id = ?5",
+                params![received, chunk_bitmap, unix_now(), id, share_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn delete_share_upload(&self, id: &str, share_id: i64) -> anyhow::Result<()> {
+        let id = id.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "DELETE FROM share_upload_sessions WHERE id = ?1 AND share_id = ?2",
+                params![id, share_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn take_expired_share_upload_temps(&self, now: i64) -> anyhow::Result<Vec<String>> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT temp_path FROM share_upload_sessions WHERE expires_at < ?1")?;
+            let paths = statement
+                .query_map(params![now], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            connection.execute(
+                "DELETE FROM share_upload_sessions WHERE expires_at < ?1",
+                params![now],
+            )?;
+            Ok(paths)
+        })
+        .await
+    }
+
+    pub async fn branding_icon(&self) -> anyhow::Result<Option<BrandingIcon>> {
+        self.call(|connection| {
+            connection
+                .query_row(
+                    "SELECT icon, mime_type, version, updated_at FROM branding WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok(BrandingIcon {
+                            icon: row.get(0)?,
+                            mime_type: row.get(1)?,
+                            version: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn set_branding_icon(&self, icon: Vec<u8>, mime_type: &str) -> anyhow::Result<i64> {
+        let mime_type = mime_type.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO branding (id, icon, mime_type, version, updated_at) \
+                 VALUES (1, ?1, ?2, 1, ?3) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   icon = excluded.icon, mime_type = excluded.mime_type, \
+                   version = branding.version + 1, updated_at = excluded.updated_at",
+                params![icon, mime_type, unix_now()],
+            )?;
+            let version =
+                connection.query_row("SELECT version FROM branding WHERE id = 1", [], |row| {
+                    row.get(0)
+                })?;
+            Ok(version)
+        })
+        .await
+    }
+
+    pub async fn delete_branding_icon(&self) -> anyhow::Result<bool> {
+        self.call(|connection| {
+            let removed = connection.execute("DELETE FROM branding WHERE id = 1", [])?;
+            Ok(removed > 0)
+        })
+        .await
+    }
+
+    pub async fn count_active_uploads(&self, user_id: i64, now: i64) -> anyhow::Result<usize> {
+        self.call(move |connection| {
+            let count = connection.query_row(
+                "SELECT COUNT(*) FROM upload_sessions WHERE user_id = ?1 AND expires_at > ?2",
+                params![user_id, now],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(count.max(0) as usize)
+        })
+        .await
+    }
+
+    pub async fn prune_expired_sessions(&self, now: i64) -> anyhow::Result<usize> {
+        self.call(move |connection| {
+            let removed =
+                connection.execute("DELETE FROM sessions WHERE expires_at < ?1", params![now])?;
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn take_expired_upload_temps(&self, now: i64) -> anyhow::Result<Vec<String>> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT temp_path FROM upload_sessions WHERE expires_at < ?1")?;
+            let paths = statement
+                .query_map(params![now], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            connection.execute(
+                "DELETE FROM upload_sessions WHERE expires_at < ?1",
+                params![now],
+            )?;
+            Ok(paths)
+        })
+        .await
+    }
+
     pub async fn add_root(
         &self,
         user_id: i64,
@@ -1251,6 +1489,64 @@ impl Db {
                     },
                 )
                 .optional()
+        })
+        .await
+    }
+
+    pub async fn indexed_directory_states(
+        &self,
+        paths: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, (i64, u64, bool, String)>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT mtime_ns, total_size_bytes, partial, status FROM indexed_dirs \
+                 WHERE real_path = ?1",
+            )?;
+            let mut states = HashMap::new();
+            for path in paths {
+                if let Some(state) = statement
+                    .query_row(params![path], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get::<_, i64>(1)?.max(0) as u64,
+                            row.get::<_, i64>(2)? != 0,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .optional()?
+                {
+                    states.insert(path, state);
+                }
+            }
+            Ok(states)
+        })
+        .await
+    }
+
+    pub async fn directory_size_states(
+        &self,
+        paths: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, (String, i64, Option<String>)>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT status, size_bytes, error FROM directory_sizes WHERE real_path = ?1",
+            )?;
+            let mut states = HashMap::new();
+            for path in paths {
+                if let Some(state) = statement
+                    .query_row(params![path], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })
+                    .optional()?
+                {
+                    states.insert(path, state);
+                }
+            }
+            Ok(states)
         })
         .await
     }
@@ -1525,6 +1821,54 @@ impl Db {
         .await
     }
 
+    pub async fn append_pending_index_dirs(&self, paths: &[String]) -> anyhow::Result<usize> {
+        let paths = paths.to_vec();
+        self.call(move |connection| {
+            let now = unix_now();
+            let mut inserted = 0_usize;
+            for path in paths {
+                inserted += connection.execute(
+                    "INSERT OR IGNORE INTO pending_index_dirs (real_path, created_at) \
+                     VALUES (?1, ?2)",
+                    params![path, now],
+                )?;
+            }
+            Ok(inserted)
+        })
+        .await
+    }
+
+    pub async fn take_pending_index_dirs(&self, limit: i64) -> anyhow::Result<Vec<String>> {
+        self.call(move |connection| {
+            let limit = limit.clamp(1, 5000);
+            let mut statement = connection
+                .prepare("SELECT real_path FROM pending_index_dirs ORDER BY real_path LIMIT ?1")?;
+            let paths = statement
+                .query_map(params![limit], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for path in &paths {
+                connection.execute(
+                    "DELETE FROM pending_index_dirs WHERE real_path = ?1",
+                    params![path],
+                )?;
+            }
+            Ok(paths)
+        })
+        .await
+    }
+
+    pub async fn prune_indexed_pending_dirs(&self) -> anyhow::Result<usize> {
+        self.call(|connection| {
+            let removed = connection.execute(
+                "DELETE FROM pending_index_dirs \
+                 WHERE real_path IN (SELECT real_path FROM indexed_dirs)",
+                [],
+            )?;
+            Ok(removed)
+        })
+        .await
+    }
+
     pub async fn create_job(&self, record: JobRecord) -> anyhow::Result<(JobRecord, bool)> {
         self.call(move |connection| {
             let changed = connection.execute(
@@ -1707,6 +2051,14 @@ impl Db {
         .await
     }
 
+    pub async fn clear_directory_sizes(&self) -> anyhow::Result<usize> {
+        self.call(|connection| {
+            let removed = connection.execute("DELETE FROM directory_sizes", [])?;
+            Ok(removed)
+        })
+        .await
+    }
+
     pub async fn directory_size_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
         self.call(|connection| {
             let mut statement = connection
@@ -1717,10 +2069,14 @@ impl Db {
         .await
     }
 
-    pub async fn checkpoint(&self) -> anyhow::Result<()> {
+    /// Run a TRUNCATE checkpoint and return whether another connection was
+    /// still reading (busy). Busy checkpoints are retried by the next
+    /// maintenance pass.
+    pub async fn checkpoint(&self) -> anyhow::Result<bool> {
         self.call(|connection| {
-            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-            Ok(())
+            let busy: i64 =
+                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            Ok(busy != 0)
         })
         .await
     }
@@ -2124,8 +2480,8 @@ impl Db {
         self.call(move |connection| {
             connection.execute(
                 "INSERT INTO shares \
-                 (token_hash, creator_id, real_path, is_dir, password_hash, expires_at, read_only, revoked, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+                 (token_hash, creator_id, real_path, is_dir, password_hash, expires_at, read_only, revoked, created_at, kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, 'single')",
                 params![
                     token_hash,
                     creator_id,
@@ -2142,6 +2498,99 @@ impl Db {
         .await
     }
 
+    pub async fn insert_collection_share(
+        &self,
+        token_hash: &str,
+        creator_id: i64,
+        items: &[(String, String, bool)],
+        password_hash: Option<&str>,
+        expires_at: Option<i64>,
+        read_only: bool,
+    ) -> anyhow::Result<i64> {
+        let token_hash = token_hash.to_owned();
+        let password_hash = password_hash.map(str::to_owned);
+        let items = items.to_vec();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO shares \
+                 (token_hash, creator_id, real_path, is_dir, password_hash, expires_at, read_only, revoked, created_at, kind) \
+                 VALUES (?1, ?2, '', 0, ?3, ?4, ?5, 0, ?6, 'collection')",
+                params![token_hash, creator_id, password_hash, expires_at, read_only as i64, unix_now()],
+            )?;
+            let share_id = transaction.last_insert_rowid();
+            for (index, (real_path, display_name, is_dir)) in items.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO share_items (share_id, real_path, display_name, is_dir, sort_order) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![share_id, real_path, display_name, *is_dir as i64, index as i64],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(share_id)
+        })
+        .await
+    }
+
+    pub async fn share_items(&self, share_id: i64) -> anyhow::Result<Vec<ShareItem>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, share_id, real_path, display_name, is_dir, sort_order \
+                 FROM share_items WHERE share_id = ?1 ORDER BY sort_order, id",
+            )?;
+            let rows = statement.query_map(params![share_id], |row| {
+                Ok(ShareItem {
+                    id: row.get(0)?,
+                    share_id: row.get(1)?,
+                    real_path: row.get(2)?,
+                    display_name: row.get(3)?,
+                    is_dir: row.get::<_, i64>(4)? != 0,
+                    sort_order: row.get(5)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn share_item(
+        &self,
+        share_id: i64,
+        item_id: i64,
+    ) -> anyhow::Result<Option<ShareItem>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, share_id, real_path, display_name, is_dir, sort_order \
+                     FROM share_items WHERE share_id = ?1 AND id = ?2",
+                    params![share_id, item_id],
+                    |row| {
+                        Ok(ShareItem {
+                            id: row.get(0)?,
+                            share_id: row.get(1)?,
+                            real_path: row.get(2)?,
+                            display_name: row.get(3)?,
+                            is_dir: row.get::<_, i64>(4)? != 0,
+                            sort_order: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn count_share_items(&self, share_id: i64) -> anyhow::Result<i64> {
+        self.call(move |connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM share_items WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get(0),
+            )
+        })
+        .await
+    }
+
     pub async fn list_shares(
         &self,
         creator_id: i64,
@@ -2151,8 +2600,9 @@ impl Db {
         self.call(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, creator_id, real_path, is_dir, password_hash, \
-                 expires_at, read_only, revoked, created_at, visit_count FROM shares \
-                 WHERE creator_id = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                 expires_at, read_only, revoked, created_at, visit_count, kind, \
+                 (SELECT COUNT(*) FROM share_items i WHERE i.share_id = shares.id) AS item_count \
+                 FROM shares WHERE creator_id = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
             )?;
             let rows = statement.query_map(params![creator_id, limit, offset], share_from_row)?;
             rows.collect()
@@ -2270,7 +2720,8 @@ impl Db {
             connection
                 .query_row(
                     "SELECT id, token_hash, creator_id, real_path, is_dir, password_hash, \
-                     expires_at, read_only, revoked, created_at, visit_count FROM shares WHERE token_hash = ?1",
+                     expires_at, read_only, revoked, created_at, visit_count, kind, 0 AS item_count \
+                     FROM shares WHERE token_hash = ?1",
                     params![token_hash],
                     share_from_row,
                 )
@@ -2304,6 +2755,8 @@ fn share_from_row(row: &Row<'_>) -> rusqlite::Result<Share> {
         revoked: row.get::<_, i64>(8)? != 0,
         created_at: row.get(9)?,
         visit_count: row.get(10)?,
+        kind: row.get(11)?,
+        item_count: row.get(12)?,
     })
 }
 
@@ -2333,7 +2786,9 @@ fn configure(connection: &Connection) -> anyhow::Result<()> {
             "PRAGMA journal_mode = WAL;\
              PRAGMA foreign_keys = ON;\
              PRAGMA busy_timeout = 5000;\
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;\
+             PRAGMA wal_autocheckpoint = 1000;\
+             PRAGMA journal_size_limit = 67108864;",
         )
         .context("failed to configure SQLite")?;
     Ok(())

@@ -7,7 +7,7 @@ WINDOWS_TARGET := x86_64-pc-windows-msvc
 RELEASE_BIN := target/$(TARGET)/release/filehub
 WINDOWS_BIN := target/$(WINDOWS_TARGET)/release/filehub.exe
 
-.PHONY: help setup web-install web-build fmt check test build build-windows release bump-version dev audit clean
+.PHONY: help setup web-install web-build fmt check test build build-windows release bump-version bump-version-patch bump-version-major dev audit clean
 
 help:
 	@printf '%s\n' \
@@ -20,6 +20,8 @@ help:
 		'make build-windows  交叉构建 Windows exe' \
 		'make release    check + test + build + SHA-256' \
 		'make bump-version  修改 Cargo/package 版本号（minor）' \
+		'make bump-version-patch  patch 版本号 +1' \
+		'make bump-version-major  major 版本号 +1' \
 		'make audit      依赖与许可证审计' \
 		'make clean      清理构建产物'
 
@@ -59,6 +61,12 @@ build-windows: web-build
 
 bump-version:
 	node scripts/bump-version.mjs
+
+bump-version-patch:
+	node scripts/bump-version.mjs --patch
+
+bump-version-major:
+	node scripts/bump-version.mjs --major
 
 release: check test build
 	@cd target/$(TARGET)/release && sha256sum filehub > filehub.sha256

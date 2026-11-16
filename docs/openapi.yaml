@@ -140,10 +140,38 @@ paths:
       summary: 当前用户授权根
       responses:
         '200': { description: OK }
+  /api/v1/branding:
+    get:
+      tags: [branding]
+      security: []
+      summary: 公开品牌信息（名称、图标地址、版本）
+      responses:
+        '200': { description: OK }
+  /api/v1/branding/icon:
+    get:
+      tags: [branding]
+      security: []
+      summary: 品牌图标（PNG，支持 ETag/304）
+      responses:
+        '200': { description: Image }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/admin/branding/icon:
+    post:
+      tags: [branding, admin]
+      summary: 上传品牌图标（PNG/JPEG/WebP，最大 2MiB，2048px）
+      responses:
+        '200': { description: Version and icon URL }
+        '400': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [branding, admin]
+      summary: 恢复默认图标（首字母）
+      responses:
+        '200': { description: OK }
   /api/v1/list:
     get:
       tags: [files]
       summary: 目录列表
+      description: 响应包含 `read_only`，表示当前目录（含嵌套只读根和可信链接）是否只读。
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, schema: { type: string, default: '' } }
@@ -152,6 +180,16 @@ paths:
       responses:
         '200': { description: OK }
         '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/properties:
+    get:
+      tags: [files]
+      summary: 文件/目录属性（含图片尺寸与 EXIF）
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/fs/dir-size:
     get:
@@ -540,6 +578,7 @@ paths:
       tags: [shares]
       security: []
       summary: 公开分享元数据/目录列表
+      description: 目录分享响应包含 `read_only`；集合分享返回扁平 `entries`（含 `item_id`），只读分享的页面不应显示上传控件。
       parameters:
         - { name: token, in: path, required: true, schema: { type: string } }
         - { name: path, in: query, schema: { type: string } }

@@ -331,6 +331,101 @@ async fn audit_pagination_uses_keyset_cursor() {
 }
 
 #[tokio::test]
+async fn size_sort_uses_directory_sizes_and_refreshes_unknown_directories() {
+    let app = setup_app().await;
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+
+    async fn list_names(app: &TestApp, order: &str) -> Vec<String> {
+        let response = send(
+            &app.router,
+            Method::GET,
+            &format!(
+                "/api/v1/list?root={}&path=&sort=size&order={order}",
+                app.root_id
+            ),
+            Some(&app.cookie),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    let names = list_names(&app, "desc").await;
+    let position = |name: &str| names.iter().position(|value| value == name).unwrap();
+    assert_eq!(names.first().map(String::as_str), Some("d1"), "{names:?}");
+    assert!(position("src") < position("dst"), "{names:?}");
+    assert!(position("dst") < position("photo.png"), "{names:?}");
+
+    let nested = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/api/v1/list?root={}&path=d1&sort=size&order=desc",
+            app.root_id
+        ),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    let nested = json_body(nested).await;
+    let nested_names: Vec<&str> = nested["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(nested_names, vec!["d2", "a.txt"], "{nested_names:?}");
+
+    let ascending = list_names(&app, "asc").await;
+    let ascending_position = |name: &str| ascending.iter().position(|value| value == name).unwrap();
+    assert!(
+        ascending_position("src") < ascending_position("d1"),
+        "{ascending:?}"
+    );
+    assert!(
+        ascending_position("d1") < ascending_position("dst"),
+        "{ascending:?}"
+    );
+
+    std::fs::create_dir(app.home.join("fresh")).unwrap();
+    std::fs::write(app.home.join("fresh/big.bin"), vec![7_u8; 12_345]).unwrap();
+    let pending = list_names(&app, "desc").await;
+    let pending_fresh = pending
+        .iter()
+        .position(|value| value == "fresh")
+        .expect("fresh directory is missing");
+    assert!(
+        pending_fresh
+            < pending
+                .iter()
+                .position(|value| value == "photo.png")
+                .unwrap(),
+        "directories must sort before files: {pending:?}"
+    );
+
+    let mut refreshed = pending;
+    for _ in 0..120 {
+        refreshed = list_names(&app, "desc").await;
+        if refreshed.first().map(String::as_str) == Some("fresh") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        refreshed.first().map(String::as_str),
+        Some("fresh"),
+        "background dir-size refresh did not reorder: {refreshed:?}"
+    );
+}
+
+#[tokio::test]
 async fn index_aggregate_size_is_used_by_dir_size() {
     let app = setup_app().await;
     let response = send_json(
@@ -363,6 +458,34 @@ async fn index_aggregate_size_is_used_by_dir_size() {
     assert_eq!(value["status"], "ready");
     assert_eq!(value["indexed"], true);
     assert_eq!(value["size"].as_u64().unwrap(), 12);
+}
+
+#[tokio::test]
+async fn quick_scan_persists_new_directories_when_the_batch_limit_is_hit() {
+    let app = setup_app().await;
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+
+    for index in 0..520 {
+        std::fs::create_dir_all(app.home.join(format!("d1/n{index}"))).unwrap();
+    }
+
+    let cancel = CancellationToken::new();
+    let mut progress = |_checked: usize, _total: usize| {};
+    filehub::indexer::quick_scan(&app.state, &cancel, &mut progress)
+        .await
+        .unwrap();
+
+    let pending = app.state.db.take_pending_index_dirs(1000).await.unwrap();
+    assert!(
+        pending.len() >= 20,
+        "overflow candidates were dropped: {} pending",
+        pending.len()
+    );
+    assert!(
+        pending.iter().all(|path| path.contains("d1/n")),
+        "{pending:?}"
+    );
 }
 
 async fn run_index(app: &TestApp) -> Value {
@@ -437,6 +560,10 @@ async fn quick_scan_refreshes_changed_directories() {
 #[tokio::test]
 async fn search_filters_size_kind_and_directory() {
     let app = setup_app().await;
+    std::fs::write(app.home.join("doc.pdf"), b"%PDF-1.4").unwrap();
+    std::fs::write(app.home.join("song.mp3"), b"ID3fake").unwrap();
+    std::fs::write(app.home.join("clip.mp4"), b"fake").unwrap();
+    std::fs::write(app.home.join("note.md"), b"# note").unwrap();
     let job = run_index(&app).await;
     assert_eq!(job["status"], "completed", "{job}");
 
@@ -472,6 +599,27 @@ async fn search_filters_size_kind_and_directory() {
 
     let future = search("/api/v1/search?q=txt&modified_after=9999999999").await;
     assert!(future.is_empty(), "{future:?}");
+
+    let images = search("/api/v1/search?q=photo&kind=image").await;
+    assert_eq!(images, vec!["photo.png".to_owned()]);
+    let audio = search("/api/v1/search?q=song&kind=audio").await;
+    assert_eq!(audio, vec!["song.mp3".to_owned()]);
+    let videos = search("/api/v1/search?q=clip&kind=video").await;
+    assert_eq!(videos, vec!["clip.mp4".to_owned()]);
+    let pdfs = search("/api/v1/search?q=doc&kind=pdf").await;
+    assert_eq!(pdfs, vec!["doc.pdf".to_owned()]);
+    let text = search("/api/v1/search?q=note&kind=text").await;
+    assert_eq!(text, vec!["note.md".to_owned()]);
+    let mismatched = search("/api/v1/search?q=photo&kind=video").await;
+    assert!(mismatched.is_empty(), "{mismatched:?}");
+
+    let files = search("/api/v1/search?q=txt&kind=file").await;
+    assert!(files.contains(&"a.txt".to_owned()));
+    assert!(!files.contains(&"d1".to_owned()));
+    let small_files = search("/api/v1/search?q=txt&kind=file&max_size=5").await;
+    assert!(small_files.contains(&"a.txt".to_owned()));
+    assert!(!small_files.contains(&"b.txt".to_owned()));
+    assert!(!small_files.contains(&"two.txt".to_owned()));
 }
 
 #[tokio::test]

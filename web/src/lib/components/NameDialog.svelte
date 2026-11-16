@@ -1,5 +1,6 @@
 <script lang="ts">
   import { language, t } from '../i18n';
+  import { focusTrap } from '../focusTrap';
 
   let {
     open,
@@ -45,9 +46,16 @@
       overlayPressed = false;
     }}
   >
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <form class="name-dialog" onsubmit={submit} onclick={(event) => event.stopPropagation()}>
+    <form
+      class="name-dialog"
+      onsubmit={submit}
+      onclick={(event) => event.stopPropagation()}
+      use:focusTrap
+      onkeydown={(event) => {
+        if (event.key === 'Escape') onClose();
+      }}
+    >
       <h2>{title}</h2>
       <label>
         <span>{label}</span>

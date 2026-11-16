@@ -361,6 +361,29 @@ pub async fn quick_scan(
     let mut after: Option<String> = None;
     let mut parents: HashSet<PathBuf> = HashSet::new();
     let mut new_dir_candidates: HashSet<String> = HashSet::new();
+    match state
+        .db
+        .take_pending_index_dirs(QUICK_SCAN_CHILD_LIMIT as i64)
+        .await
+    {
+        Ok(pending) if !pending.is_empty() => {
+            let checked = tokio::task::spawn_blocking(move || {
+                pending
+                    .into_iter()
+                    .filter(|path| Path::new(path).is_dir())
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            match checked {
+                Ok(paths) => new_dir_candidates.extend(paths),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to validate deferred index directories");
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to load deferred index directories"),
+    }
 
     loop {
         if cancel.is_cancelled() {
@@ -462,85 +485,133 @@ pub async fn quick_scan(
 
     if !new_dir_candidates.is_empty() {
         let candidates: Vec<String> = new_dir_candidates.into_iter().collect();
-        let existing = state
-            .db
-            .existing_index_dirs(candidates.clone())
-            .await
-            .map_err(AppError::internal)?;
-        let mut new_dirs: Vec<String> = candidates
-            .into_iter()
-            .filter(|path| !existing.contains(path))
-            .collect();
-        new_dirs.sort();
-        for path in new_dirs.into_iter().take(100) {
-            if cancel.is_cancelled() {
-                return Err(AppError::Cancelled);
-            }
-            let Some((user_id, root, relative)) = best_root_for_path(&root_entries, &path) else {
-                continue;
-            };
-            let key = format!("dir:{path}");
-            if state.jobs.active_job_exact(JobKind::Index, &key).is_some()
-                || state
-                    .jobs
-                    .active_job_for_path(JobKind::Index, &path)
-                    .is_some()
-            {
-                continue;
-            }
-            let job_state = Arc::clone(state);
-            let job_root = root.clone();
-            let job_relative = relative.clone();
-            let result = state
+        queue_new_directory_indexes(
+            state,
+            &root_entries,
+            candidates,
+            cancel,
+            &mut stats.new_directories,
+        )
+        .await?;
+    }
+
+    Ok(stats)
+}
+
+const QUICK_SCAN_CHILD_LIMIT: usize = 500;
+
+async fn queue_new_directory_indexes(
+    state: &Arc<AppState>,
+    root_entries: &[(i64, Root)],
+    candidates: Vec<String>,
+    cancel: &CancellationToken,
+    new_directories: &mut usize,
+) -> Result<(), AppError> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let existing = state
+        .db
+        .existing_index_dirs(candidates.clone())
+        .await
+        .map_err(AppError::internal)?;
+    let mut new_dirs: Vec<String> = candidates
+        .into_iter()
+        .filter(|path| !existing.contains(path))
+        .collect();
+    new_dirs.sort();
+    let mut queued = 0_usize;
+    let mut cursor = 0_usize;
+    while cursor < new_dirs.len() {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        if queued >= QUICK_SCAN_CHILD_LIMIT {
+            break;
+        }
+        let path = new_dirs[cursor].clone();
+        let Some((user_id, root, relative)) = best_root_for_path(root_entries, &path) else {
+            cursor += 1;
+            continue;
+        };
+        let key = format!("dir:{path}");
+        if state.jobs.active_job_exact(JobKind::Index, &key).is_some()
+            || state
                 .jobs
-                .submit(
-                    JobKind::Index,
-                    key,
-                    user_id,
-                    serde_json::json!({
-                        "root_id": root.id,
-                        "path": relative,
-                        "recursive": true,
-                        "auto": "quick-scan",
-                    }),
-                    1,
-                    move |ctx| async move {
-                        let cancel = ctx.token();
-                        let mut progress = |directories: usize, _entries: usize| {
-                            ctx.report(directories, 1, 0, 0);
-                        };
-                        let stats = index_path(
-                            &job_state,
-                            user_id,
-                            job_root,
-                            &job_relative,
-                            true,
-                            &cancel,
-                            &mut progress,
-                        )
-                        .await?;
-                        let directories = stats.directories;
-                        Ok(JobOutcome::done(
-                            serde_json::json!(stats),
-                            directories,
-                            directories.max(1),
-                        ))
-                    },
-                )
-                .await;
-            match result {
-                Ok(outcome) if outcome.created => stats.new_directories += 1,
-                Ok(_) => {}
-                Err(AppError::QueueFull) => break,
-                Err(error) => {
-                    tracing::debug!(%error, path, "failed to queue quick-scan child index");
-                    break;
+                .active_job_for_path(JobKind::Index, &path)
+                .is_some()
+        {
+            cursor += 1;
+            continue;
+        }
+        let job_state = Arc::clone(state);
+        let job_root = root.clone();
+        let job_relative = relative.clone();
+        let result = state
+            .jobs
+            .submit(
+                JobKind::Index,
+                key,
+                user_id,
+                serde_json::json!({
+                    "root_id": root.id,
+                    "path": relative,
+                    "recursive": true,
+                    "auto": "quick-scan",
+                }),
+                1,
+                move |ctx| async move {
+                    let cancel = ctx.token();
+                    let mut progress = |directories: usize, _entries: usize| {
+                        ctx.report(directories, 1, 0, 0);
+                    };
+                    let stats = index_path(
+                        &job_state,
+                        user_id,
+                        job_root,
+                        &job_relative,
+                        true,
+                        &cancel,
+                        &mut progress,
+                    )
+                    .await?;
+                    let directories = stats.directories;
+                    Ok(JobOutcome::done(
+                        serde_json::json!(stats),
+                        directories,
+                        directories.max(1),
+                    ))
+                },
+            )
+            .await;
+        match result {
+            Ok(outcome) => {
+                if outcome.created {
+                    *new_directories += 1;
                 }
+                cursor += 1;
+                queued += 1;
+            }
+            Err(AppError::QueueFull) => break,
+            Err(error) => {
+                tracing::debug!(%error, path, "failed to queue quick-scan child index");
+                break;
             }
         }
     }
 
-    Ok(stats)
+    if cursor < new_dirs.len() {
+        let deferred = &new_dirs[cursor..];
+        match state.db.append_pending_index_dirs(deferred).await {
+            Ok(inserted) => tracing::info!(
+                inserted,
+                remaining = deferred.len(),
+                "deferred new directories to a later quick scan"
+            ),
+            Err(error) => tracing::warn!(%error, "failed to persist deferred index directories"),
+        }
+    }
+    Ok(())
 }
 
 fn best_root_for_path(roots: &[(i64, Root)], path: &str) -> Option<(i64, Root, String)> {
@@ -669,6 +740,12 @@ fn collect_dirs_channel(
             .and_then(|volume| usn_states.iter().find(|state| state.volume == volume));
         match crate::winindex::incremental(base, previous, ignore) {
             Ok(Some(changes)) => {
+                tracing::debug!(
+                    removed = changes.removed.len(),
+                    changed_dirs = changes.scans.len(),
+                    new_dirs = changes.new_dirs.len(),
+                    "USN incremental index applied"
+                );
                 let mut complete = changes.complete;
                 for scan in changes.scans {
                     if cancel.is_cancelled() {

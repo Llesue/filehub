@@ -25,6 +25,7 @@ pub mod api;
 pub mod app;
 pub mod auth;
 pub mod authz;
+pub mod branding;
 pub mod cmdrunner;
 pub mod config;
 pub mod db;
@@ -37,6 +38,7 @@ pub mod jobs;
 pub mod pathresolver;
 pub mod platform;
 pub mod preferences;
+pub mod properties;
 pub mod search;
 #[cfg(windows)]
 #[allow(unsafe_code)]

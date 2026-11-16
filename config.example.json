@@ -6,8 +6,9 @@
   "thumbnails": {
     "enabled": true,
     "workers": 2,
-    "max_source_bytes": 52428800,
+    "max_source_bytes": 536870912,
     "max_pixels": 50000000,
+    "jpeg_max_pixels": 250000000,
     "video": true,
     "video_seek_seconds": 1,
     "video_timeout_secs": 15,
@@ -46,12 +47,14 @@
   "ui": {
     "default_theme": "system",
     "default_locale": "en",
+    "brand_name": "FileHub",
     "locales": ["zh-CN", "en"]
   },
   "security": {
     "session_ttl_hours": 168,
     "cookie_secure": false,
-    "trusted_proxies": []
+    "trusted_proxies": [],
+    "public_rate_limit_per_minute": 240
   },
   "jobs": {
     "io_workers": 1,
@@ -64,5 +67,5 @@
     "audit_max_rows": 200000,
     "job_retention_days": 30
   },
-  "log": { "level": "info", "format": "text" }
+  "log": { "level": "info", "format": "text", "retention_days": 14 }
 }

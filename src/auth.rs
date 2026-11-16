@@ -231,16 +231,107 @@ pub fn session_ttl_seconds(state: &Arc<AppState>) -> i64 {
     (hours as i64).saturating_mul(3600)
 }
 
+/// Header injected by the client-IP middleware. Handlers must only trust this
+/// value, never `X-Forwarded-For` from the wire.
+pub const CLIENT_IP_HEADER: &str = "x-filehub-client-ip";
+
 pub fn client_ip(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CLIENT_IP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Resolve the audit client IP from the TCP peer and (only when the peer is a
+/// trusted proxy) the forwarding headers.
+pub fn resolve_client_ip(
+    peer: std::net::SocketAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &[String],
+) -> Option<String> {
+    let peer_ip = normalize_ip(peer.ip());
+    if trusted_proxies
+        .iter()
+        .any(|rule| ip_matches_rule(peer_ip, rule))
+        && let Some(forwarded) = forwarded_ip(headers)
+    {
+        return Some(forwarded);
+    }
+    Some(peer_ip.to_string())
+}
+
+pub fn valid_ip_rule(rule: &str) -> bool {
+    parse_ip_rule(rule).is_some()
+}
+
+fn forwarded_ip(headers: &HeaderMap) -> Option<String> {
     for name in ["x-forwarded-for", "x-real-ip"] {
         if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
             let first = value.split(',').next().unwrap_or(value).trim();
-            if !first.is_empty() {
-                return Some(first.to_owned());
+            if let Ok(ip) = first.parse::<std::net::IpAddr>() {
+                return Some(normalize_ip(ip).to_string());
             }
         }
     }
     None
+}
+
+fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(value) => value
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(value)),
+        value => value,
+    }
+}
+
+fn parse_ip_rule(rule: &str) -> Option<(std::net::IpAddr, u8)> {
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return None;
+    }
+    let (address, prefix) = match rule.split_once('/') {
+        Some((address, prefix)) => (address.trim(), Some(prefix.trim())),
+        None => (rule, None),
+    };
+    let address = address.parse::<std::net::IpAddr>().ok()?;
+    let max = match address {
+        std::net::IpAddr::V4(_) => 32,
+        std::net::IpAddr::V6(_) => 128,
+    };
+    let prefix = match prefix {
+        Some(value) => value.parse::<u8>().ok().filter(|value| *value <= max)?,
+        None => max,
+    };
+    Some((normalize_ip(address), prefix))
+}
+
+fn ip_matches_rule(peer: std::net::IpAddr, rule: &str) -> bool {
+    let Some((network, prefix)) = parse_ip_rule(rule) else {
+        return false;
+    };
+    match (network, peer) {
+        (std::net::IpAddr::V4(network), std::net::IpAddr::V4(peer)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(network) & mask == u32::from(peer) & mask
+        }
+        (std::net::IpAddr::V6(network), std::net::IpAddr::V6(peer)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(network) & mask == u128::from(peer) & mask
+        }
+        _ => false,
+    }
 }
 
 pub fn user_agent(headers: &HeaderMap) -> Option<String> {

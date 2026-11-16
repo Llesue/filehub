@@ -8,7 +8,11 @@ const en: Record<string, string> = {
   存储目录: 'Storage directories',
   暂无目录: 'No locations',
   分享: 'Shares',
+  '分享 {count} 个文件': 'Share {count} files',
+  目录请单独分享: 'Share folders separately',
   分享管理: 'Share management',
+  文件: 'Files',
+  并发: 'Concurrency',
   管理: 'Admin',
   设置: 'Settings',
   尚未接入: 'Not connected',
@@ -57,7 +61,6 @@ const en: Record<string, string> = {
   大小: 'Size',
   链接: 'Link',
   目录: 'Folder',
-  文件: 'Files',
   修改时间: 'Modified',
   编辑: 'Edit',
   预览: 'Preview',
@@ -454,6 +457,9 @@ const en: Record<string, string> = {
   '{count} 分钟前': '{count} minutes ago',
   '{count} 小时前': '{count} hours ago',
   '{count} 天前': '{count} days ago',
+  '{count} 周前': '{count} weeks ago',
+  '{count} 个月前': '{count} months ago',
+  '{count} 年前': '{count} years ago',
   正在加载: 'Loading',
   '索引中…': 'Indexing…',
   '已选 {count} 项': '{count} selected',
@@ -470,6 +476,43 @@ const en: Record<string, string> = {
   '删除 {name}': 'Delete {name}',
   有未保存修改: 'Unsaved changes',
   已保存: 'Saved',
+  品牌: 'Branding',
+  '下载 / ZIP': 'Downloads / ZIP',
+  'ZIP 最大下载': 'ZIP size limit',
+  'ZIP 最大文件数': 'ZIP file limit',
+  'ZIP 并发数': 'ZIP concurrency',
+
+  属性: 'Properties',
+  详情: 'Details',
+  路径: 'Path',
+  创建时间: 'Created',
+  访问时间: 'Accessed',
+  链接状态: 'Link status',
+  可用: 'Available',
+  断链: 'Broken',
+  无权限: 'No permission',
+  目标: 'Target',
+  图片尺寸: 'Image size',
+  格式: 'Format',
+  制造商: 'Make',
+  型号: 'Model',
+  镜头: 'Lens',
+  拍摄时间: 'Taken at',
+  曝光: 'Exposure',
+  光圈: 'Aperture',
+  ISO: 'ISO',
+  焦距: 'Focal length',
+  方向: 'Orientation',
+
+  品牌名称: 'Brand name',
+  品牌图标: 'Brand icon',
+  上传图标: 'Upload icon',
+  恢复默认图标: 'Reset icon',
+  图标已更新: 'Icon updated',
+  '图标不能超过 2MB': 'Icon must be 2 MB or smaller',
+  '仅支持 PNG/JPEG/WebP，最大 2MB，建议正方形。':
+    'PNG/JPEG/WebP only, up to 2 MB; square images recommended.',
+  '使用你的账号访问 {brand}。': 'Sign in to {brand} with your account.',
   '复制到…': 'Copy to…',
   '移动到…': 'Move to…',
   我的文件: 'My Files',
@@ -482,6 +525,29 @@ const en: Record<string, string> = {
   显示预览图: 'Show preview',
   显示原图: 'Show original',
   关闭预览: 'Close preview',
+  重新生成缩略图: 'Regenerate thumbnail',
+  缩略图限制: 'Thumbnail limits',
+  'ZIP 下载限制': 'ZIP download limits',
+  '最大 ZIP 大小（GB，0 不限）': 'Max ZIP size (GB, 0 = unlimited)',
+  '最大文件数（0 不限）': 'Max files (0 = unlimited)',
+  上传已取消: 'Upload cancelled',
+  '{count} 个文件上传失败': '{count} files failed to upload',
+  '{count} 个文件': '{count} files',
+  集合分享: 'Collection',
+  重试失败文件: 'Retry failed files',
+  源文件上限: 'Source size',
+  像素上限: 'Pixel limit',
+  'JPEG 像素上限': 'JPEG pixel limit',
+  缩略图已重新生成: 'Thumbnail regenerated',
+  图片超过源文件大小限制: 'Image exceeds the source size limit',
+  图片尺寸过大: 'Image dimensions are too large',
+  视频抽帧超时: 'Video frame extraction timed out',
+  视频抽帧失败: 'Video frame extraction failed',
+  暂不支持该格式: 'Format not supported',
+  读取文件失败: 'Failed to read file',
+  图片解码失败: 'Image decode failed',
+  '图片过大，无法预览': 'Image is too large to preview',
+  下载原图: 'Download original',
   上一项: 'Previous',
   下一项: 'Next',
 };
@@ -511,9 +577,19 @@ export function initLanguage(): void {
   } catch {
     // ignore
   }
-  const lang: Lang = stored === 'en' || stored === 'zh-CN' ? stored : 'en';
+  const languages =
+    typeof navigator === 'undefined'
+      ? []
+      : (navigator.languages?.length ? navigator.languages : [navigator.language]);
+  const lang: Lang = stored === 'en' || stored === 'zh-CN' ? stored : detectBrowserLanguage(languages);
   language.set(lang);
   document.documentElement.lang = lang;
+}
+
+export function detectBrowserLanguage(languages: readonly string[] | undefined): Lang {
+  const primary = languages?.find((value) => typeof value === 'string' && value.length > 0);
+  if (!primary) return 'zh-CN';
+  return primary.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
 }
 
 export function setLanguage(lang: Lang): void {

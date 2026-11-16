@@ -62,6 +62,30 @@ pub struct SetupState {
     pub token: String,
 }
 
+#[derive(Default)]
+pub struct WindowRateLimiter {
+    windows: Mutex<HashMap<String, (i64, u32)>>,
+}
+
+impl WindowRateLimiter {
+    pub fn allow(&self, key: &str, limit: u32, window_secs: i64) -> bool {
+        if limit == 0 {
+            return true;
+        }
+        let now = unix_now();
+        let mut windows = self.windows.lock();
+        if windows.len() > 10_000 {
+            windows.retain(|_, (start, _)| now.saturating_sub(*start) < window_secs);
+        }
+        let entry = windows.entry(key.to_owned()).or_insert((now, 0));
+        if now.saturating_sub(entry.0) >= window_secs {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= limit
+    }
+}
+
 pub struct AppState {
     pub db: Db,
     pub config: ConfigFile,
@@ -73,10 +97,12 @@ pub struct AppState {
     pub ffmpeg: Option<PathBuf>,
     pub thumb_semaphore: Arc<Semaphore>,
     pub thumb_large_semaphore: Option<Arc<Semaphore>>,
+    zip_semaphore: Mutex<Arc<Semaphore>>,
     pub jobs: Arc<JobManager>,
     pub audit_tx: tokio::sync::mpsc::Sender<AuditMessage>,
     pub usage_cache: Mutex<HashMap<i64, UsageSnapshot>>,
     pub usage_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    pub public_rate: WindowRateLimiter,
     pub slow_requests: Mutex<VecDeque<SlowRequest>>,
 }
 
@@ -155,6 +181,7 @@ impl AppState {
         jobs.recover().await?;
         let (audit_tx, audit_rx) = tokio::sync::mpsc::channel::<AuditMessage>(1024);
         spawn_audit_writer(db.clone(), audit_rx);
+        let zip_permits = snapshot.settings.downloads.zip_concurrency.max(1);
 
         Ok(Arc::new(Self {
             db,
@@ -171,10 +198,12 @@ impl AppState {
             thumb_semaphore: Arc::new(Semaphore::new(thumb_small_workers)),
             thumb_large_semaphore: thumb_large_workers
                 .map(|workers| Arc::new(Semaphore::new(workers))),
+            zip_semaphore: Mutex::new(Arc::new(Semaphore::new(zip_permits))),
             jobs,
             audit_tx,
             usage_cache: Mutex::new(HashMap::new()),
             usage_locks: Mutex::new(HashMap::new()),
+            public_rate: WindowRateLimiter::default(),
             slow_requests: Mutex::new(VecDeque::new()),
         }))
     }
@@ -187,8 +216,14 @@ impl AppState {
         let overrides = self.db.settings_overrides().await?;
         let snapshot = build_snapshot(&self.config, &overrides)?;
         ensure_directories(&snapshot)?;
+        let permits = snapshot.settings.downloads.zip_concurrency.max(1);
         self.snapshot.store(Arc::new(snapshot));
+        *self.zip_semaphore.lock() = Arc::new(Semaphore::new(permits));
         Ok(())
+    }
+
+    pub fn zip_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.zip_semaphore.lock())
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -428,7 +463,7 @@ impl AppState {
         }
     }
 
-    async fn run_maintenance(&self) {
+    pub async fn run_maintenance(&self) {
         let settings = self.settings();
         let jobs = &settings.settings.jobs;
         let now = unix_now();
@@ -452,12 +487,120 @@ impl AppState {
             Ok(removed) => tracing::info!(removed, "pruned stale directory sizes"),
             Err(error) => tracing::warn!(%error, "failed to prune directory sizes"),
         }
-        if let Err(error) = self.db.checkpoint().await {
-            tracing::warn!(%error, "WAL checkpoint failed");
+        match self.db.prune_expired_sessions(now).await {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "pruned expired sessions"),
+            Err(error) => tracing::warn!(%error, "failed to prune expired sessions"),
+        }
+        match self.db.prune_indexed_pending_dirs().await {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "pruned indexed pending-directory candidates"),
+            Err(error) => tracing::warn!(%error, "failed to prune pending index directories"),
+        }
+        match self.db.take_expired_upload_temps(now).await {
+            Ok(paths) if !paths.is_empty() => {
+                let mut removed = 0_usize;
+                for path in &paths {
+                    let temp = std::path::Path::new(path);
+                    let expected = temp
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".filehub-upload-"));
+                    if expected && std::fs::remove_file(temp).is_ok() {
+                        removed += 1;
+                    }
+                }
+                tracing::info!(
+                    sessions = paths.len(),
+                    removed,
+                    "pruned expired upload sessions"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "failed to prune expired upload sessions"),
+        }
+        match self.db.take_expired_share_upload_temps(now).await {
+            Ok(paths) if !paths.is_empty() => {
+                let mut removed = 0_usize;
+                for path in &paths {
+                    let temp = std::path::Path::new(path);
+                    let expected = temp
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".filehub-upload-"));
+                    if expected && std::fs::remove_file(temp).is_ok() {
+                        removed += 1;
+                    }
+                }
+                tracing::info!(
+                    sessions = paths.len(),
+                    removed,
+                    "pruned expired share upload sessions"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "failed to prune expired share upload sessions"),
+        }
+        self.cleanup_editor_temps(now).await;
+        #[cfg(windows)]
+        match crate::platform::prune_service_logs(settings.settings.log.retention_days) {
+            0 => {}
+            removed => tracing::info!(removed, "pruned old service logs"),
+        }
+        match self.db.checkpoint().await {
+            Ok(true) => tracing::debug!("WAL checkpoint was busy; will retry next pass"),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "WAL checkpoint failed"),
         }
         self.usage_cache
             .lock()
             .retain(|_, snapshot| now.saturating_sub(snapshot.computed_at) < 600);
+    }
+
+    /// Editor temp files only leak when the process dies mid-save, so a daily
+    /// bounded walk is enough; it is not worth scanning the whole users tree
+    /// every hour.
+    async fn cleanup_editor_temps(&self, now: i64) {
+        const INTERVAL: i64 = 24 * 3600;
+        const MAX_DIRS: usize = 100_000;
+
+        let last = match self
+            .db
+            .runtime_state_get("maintenance.edit_temp_cleanup_at")
+            .await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => 0,
+            Err(error) => {
+                tracing::warn!(%error, "failed to read edit temp cleanup state");
+                return;
+            }
+        };
+        if now.saturating_sub(last) < INTERVAL {
+            return;
+        }
+
+        let users_root = self.settings().settings.users_root.clone();
+        let cutoff = now - INTERVAL;
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::fsops::cleanup_edit_temp(&users_root, cutoff, MAX_DIRS)
+        })
+        .await;
+        match outcome {
+            Ok((removed, visited, truncated)) => {
+                if removed > 0 || truncated {
+                    tracing::info!(removed, visited, truncated, "cleaned editor temp files");
+                }
+                if let Err(error) = self
+                    .db
+                    .runtime_state_set("maintenance.edit_temp_cleanup_at", now)
+                    .await
+                {
+                    tracing::warn!(%error, "failed to persist edit temp cleanup state");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "edit temp cleanup task failed"),
+        }
     }
 }
 

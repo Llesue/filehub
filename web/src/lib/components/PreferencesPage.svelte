@@ -286,7 +286,7 @@
     height: 64px;
     flex: 0 0 auto;
     place-items: center;
-    overflow: hidden;
+    overflow: visible;
     padding: 0;
     box-sizing: border-box;
     border: 1px solid var(--border);
@@ -300,12 +300,13 @@
     display: block;
     width: 100%;
     height: 100%;
+    border-radius: 50%;
     object-fit: cover;
   }
   .avatar-edit {
     position: absolute;
-    right: 2px;
-    bottom: 2px;
+    right: -10px;
+    bottom: -8px;
     display: grid;
     width: 23px;
     height: 23px;

@@ -61,6 +61,7 @@ pub struct ThumbnailsSettings {
     pub workers: usize,
     pub max_source_bytes: u64,
     pub max_pixels: u64,
+    pub jpeg_max_pixels: u64,
     pub video: bool,
     pub video_seek_seconds: u64,
     pub video_timeout_secs: u64,
@@ -72,8 +73,9 @@ impl Default for ThumbnailsSettings {
         Self {
             enabled: true,
             workers: 2,
-            max_source_bytes: 50 * 1024 * 1024,
+            max_source_bytes: 512 * 1024 * 1024,
             max_pixels: 50_000_000,
+            jpeg_max_pixels: 250_000_000,
             video: true,
             video_seek_seconds: 1,
             video_timeout_secs: 15,
@@ -188,6 +190,7 @@ pub struct UiSettings {
     pub default_theme: String,
     pub default_locale: String,
     pub locales: Vec<String>,
+    pub brand_name: String,
 }
 
 impl Default for UiSettings {
@@ -196,6 +199,7 @@ impl Default for UiSettings {
             default_theme: "system".into(),
             default_locale: "en".into(),
             locales: vec!["zh-CN".into(), "en".into()],
+            brand_name: "FileHub".into(),
         }
     }
 }
@@ -206,6 +210,7 @@ pub struct SecuritySettings {
     pub session_ttl_hours: u64,
     pub cookie_secure: bool,
     pub trusted_proxies: Vec<String>,
+    pub public_rate_limit_per_minute: u32,
 }
 
 impl Default for SecuritySettings {
@@ -214,6 +219,7 @@ impl Default for SecuritySettings {
             session_ttl_hours: 168,
             cookie_secure: false,
             trusted_proxies: Vec::new(),
+            public_rate_limit_per_minute: 240,
         }
     }
 }
@@ -253,6 +259,7 @@ impl Default for JobsSettings {
 pub struct LogSettings {
     pub level: String,
     pub format: String,
+    pub retention_days: u64,
 }
 
 impl Default for LogSettings {
@@ -260,6 +267,7 @@ impl Default for LogSettings {
         Self {
             level: "info".into(),
             format: "text".into(),
+            retention_days: 14,
         }
     }
 }
@@ -280,6 +288,21 @@ impl Settings {
         }
         if self.security.session_ttl_hours == 0 {
             bail!("security.session_ttl_hours must be greater than zero");
+        }
+        if self.log.retention_days > 3650 {
+            bail!("log.retention_days must not exceed 3650");
+        }
+        let brand_name = self.ui.brand_name.trim();
+        if brand_name.is_empty() {
+            bail!("ui.brand_name must not be empty");
+        }
+        if brand_name.chars().count() > 64 {
+            bail!("ui.brand_name must not exceed 64 characters");
+        }
+        for rule in &self.security.trusted_proxies {
+            if !crate::auth::valid_ip_rule(rule) {
+                bail!("security.trusted_proxies contains an invalid IP or CIDR: {rule}");
+            }
         }
         if self.jobs.io_workers == 0 {
             bail!("jobs.io_workers must be greater than zero");
@@ -388,39 +411,78 @@ pub fn build_snapshot(
 }
 
 pub fn ensure_directories(snapshot: &Snapshot) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&snapshot.settings.cache_dir).with_context(|| {
-        format!(
-            "failed to create cache directory {}",
-            snapshot.settings.cache_dir.display()
-        )
-    })?;
+    let settings = &snapshot.settings;
+    if let Some(parent) = settings
+        .db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_directory(parent, "database directory", false)?;
+    }
 
-    let users_root_is_default = snapshot
-        .sources
-        .get("users_root")
-        .is_some_and(|source| *source == Source::Default);
+    #[cfg(unix)]
+    {
+        // Linux deployments must be able to start with an empty data root.
+        ensure_directory(&settings.users_root, "users root", true)?;
+        ensure_directory(&settings.cache_dir, "cache directory", true)?;
+    }
 
-    if users_root_is_default {
-        std::fs::create_dir_all(&snapshot.settings.users_root).with_context(|| {
-            format!(
-                "failed to create users root {}",
-                snapshot.settings.users_root.display()
-            )
-        })?;
-    } else {
-        let metadata = std::fs::metadata(&snapshot.settings.users_root).with_context(|| {
-            format!(
-                "users root does not exist: {}",
-                snapshot.settings.users_root.display()
-            )
-        })?;
-        if !metadata.is_dir() {
-            bail!(
-                "users root is not a directory: {}",
-                snapshot.settings.users_root.display()
-            );
+    #[cfg(not(unix))]
+    {
+        ensure_directory(&settings.cache_dir, "cache directory", false)?;
+        let users_root_is_default = snapshot
+            .sources
+            .get("users_root")
+            .is_some_and(|source| *source == Source::Default);
+        if users_root_is_default {
+            ensure_directory(&settings.users_root, "users root", false)?;
+        } else {
+            let metadata = std::fs::metadata(&settings.users_root).with_context(|| {
+                format!(
+                    "users root does not exist: {}",
+                    settings.users_root.display()
+                )
+            })?;
+            if !metadata.is_dir() {
+                bail!(
+                    "users root is not a directory: {}",
+                    settings.users_root.display()
+                );
+            }
         }
     }
+
+    Ok(())
+}
+
+fn ensure_directory(path: &Path, label: &str, private: bool) -> anyhow::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!("{label} is not a directory: {}", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path).with_context(|| {
+                format!(
+                    "failed to create {label} {}; check ownership and permissions",
+                    path.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to access {label} {}", path.display()));
+        }
+    }
+
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure {label} {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = private;
 
     Ok(())
 }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { language, t } from '../i18n';
+  import { focusTrap } from '../focusTrap';
 
   let {
     open,
@@ -50,12 +51,15 @@
       overlayPressed = false;
     }}
   >
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <form
       class="password-dialog"
+      use:focusTrap
       onsubmit={(event) => void submit(event)}
       onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => {
+        if (event.key === 'Escape') onClose();
+      }}
     >
       <h2>{t($language, '修改密码')}</h2>
       <label

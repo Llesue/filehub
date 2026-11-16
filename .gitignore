@@ -42,8 +42,7 @@ web/.svelte-kit/
 /AGENTS.md
 /PLAN.md
 /CONTRIBUTING.md
-.omo/
-.codegraph
+/docs/plans/
 .claude/
 .opencode/
 

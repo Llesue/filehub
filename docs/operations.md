@@ -12,7 +12,7 @@ sudo cp config.example.json /etc/filehub/config.json
 sudo chown -R filehub:filehub /home/filehub
 ```
 
-使用专用非 root 用户运行，确保 `users_root`、`db_path` 父目录、`cache_dir` 可写。
+使用专用非 root 用户运行，确保 `users_root`、`db_path` 父目录、`cache_dir` 可写。这些目录缺失时会在启动或 `reload_settings` 时自动创建（Unix 下 `users_root`/`cache_dir` 会收紧到 `0700`），但属主仍需提前配置；外部存储根不会被自动创建。
 
 ## systemd
 
@@ -30,10 +30,27 @@ Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/filehub
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+加固项说明：
+
+- `NoNewPrivileges=true`：禁止服务通过 setuid/setgid 程序或 capability 提权
+- `PrivateTmp=true`：服务使用独立的 `/tmp`，看不到宿主机其他进程的临时文件
+- `ProtectSystem=strict`：整个文件系统只读，仅 `/dev`、`/proc`、`/sys` 保持可写；配置目录 `/etc/filehub` 因此只读，符合运行需要
+- `ReadWritePaths=/home/filehub`：只放开数据目录写权限，覆盖 `users_root`、`cache_dir` 和 `db_path` 的父目录；如果这些路径配置到别处，需要逐个加入
+- `UMask=0077`：服务创建的新文件默认仅属主可读写，避免上传文件和临时文件被其他用户读取
+- `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`：只允许 IPv4、IPv6 和 Unix socket，禁止其他地址族
+- `CapabilityBoundingSet=`：清空 capability 集合，服务不保留任何 Linux capability
+
+不要设置 `ProtectHome=yes`：systemd 会隐藏整个 `/home`，`/home/filehub` 下的数据对服务不可见，启动、索引、上传都会失败。也不能用 `ProtectHome=read-only`，因为 FileHub 必须写数据目录；保持 `ProtectHome` 未设置即可。
 
 日志输出到 stdout/stderr，由 journald 收集：
 
@@ -41,18 +58,102 @@ WantedBy=multi-user.target
 journalctl -u filehub -f
 ```
 
+## Windows 服务日志
+
+Windows 服务日志按天写入 `%ProgramData%\FileHub\filehub.log.<date>`（例如 `filehub.log.2026-11-16`）。`log.retention_days` 控制保留天数：默认 `14`，`0` 表示不清理，最大 `3650`。服务启动时和每小时维护任务会删除超过保留期的 `filehub.log.*` 文件。Linux 前台或 systemd 运行时不走这条路径，日志仍由 journald 管理。
+
 ## 反向代理
 
-FileHub 默认监听 HTTP，建议由 Caddy/Nginx 终止 TLS。反向代理需：
+不要把 FileHub 直接暴露到公网。由 Caddy 或 Nginx 终止 TLS，再通过回环地址或私有网络把流量转发给 FileHub。反向代理和 FileHub 在同一台机器时，建议把 `listen` 设为 `127.0.0.1:8080`，避免绕过代理直接访问。
 
-- 透传 `Host`、`X-Forwarded-For`、`X-Forwarded-Proto`
-- 请求体上限至少覆盖最大分片（默认 8MiB，留余量）
-- 下载/ZIP 关闭代理缓冲，避免大文件卡住
-- HTTPS 下把 `security.cookie_secure` 设为 `true`
+代理必须保留原始 `Host`，并转发客户端地址 `X-Forwarded-For`、`X-Real-IP` 和原始协议 `X-Forwarded-Proto`（`http`/`https`）。这些头必须由代理覆盖，不能追加客户端预置的值，否则客户端可以伪造审计 IP。
+
+FileHub 只在对端地址命中 `security.trusted_proxies` 时才信任转发头。把代理连接 FileHub 时使用的源地址填进去（`127.0.0.1`、`::1` 或 Docker 网桥地址/网段）。不匹配时，审计日志记录的是代理地址。公网使用 HTTPS 时把 `security.cookie_secure` 设为 `true`；如果仍在用 HTTP 测试却开启它，浏览器不会保存会话 Cookie。
+
+```json
+{
+  "security": {
+    "cookie_secure": true,
+    "trusted_proxies": ["127.0.0.1", "::1"]
+  }
+}
+```
+
+反向代理配置要点：
+
+- WebSocket：`/api/v1/terminal/ws` 需要 HTTP/1.1 以及 `Upgrade`/`Connection` 头。Caddy 自动处理；Nginx 需要下面的 `map` 块。
+- 上传请求体上限：要大于 `uploads.chunk_size`（默认 8 MiB），示例给 32 MiB；调大分片后同步调大。
+- 下载/ZIP 流式响应：关闭代理缓冲（Nginx `proxy_buffering off` 与 `proxy_request_buffering off`，Caddy `flush_interval -1`）。FileHub 不会发送 `X-Accel-Buffering`，必须在代理侧显式关闭。
+- 长下载/大 ZIP：示例给 1 小时读写超时；如果归档可能更久，继续调大，或降低 `downloads.zip_max_bytes`。
+
+### Caddy
+
+```caddyfile
+files.example.com {
+    request_body {
+        max_size 32MB
+    }
+
+    reverse_proxy 127.0.0.1:8080 {
+        header_up Host {host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        flush_interval -1
+        transport http {
+            read_timeout 1h
+            write_timeout 1h
+        }
+    }
+}
+```
+
+Caddy 会自动申请 TLS 证书，`reverse_proxy` 默认支持 WebSocket 升级。`header_up` 会覆盖客户端预置的转发头。
+
+### Nginx
+
+把升级映射放在 `http` 上下文（例如 `/etc/nginx/conf.d/filehub-upgrade.conf`），然后使用下面的 `server` 块：
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name files.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/files.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/files.example.com/privkey.pem;
+
+    client_max_body_size 32m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+```
+
+`$proxy_add_x_forwarded_for` 会追加客户端预置的 XFF，第一个地址仍可伪造，所以这里必须用 `$remote_addr` 覆盖。代理运行在 Docker 中时，`proxy_pass` 使用容器地址或网桥地址，并把对应的源地址加入 `security.trusted_proxies`。
 
 ## 备份与恢复
 
-SQLite 使用 WAL，不能只复制 `.db` 文件。推荐：
+SQLite 使用 WAL：正常运行时最近的写入可能还在 `filehub.db-wal` 中（自动 checkpoint 阈值 1000 页，WAL 上限约 64MB）。优雅关闭会执行 `wal_checkpoint(TRUNCATE)` 并清空 WAL；硬崩溃后残留的 WAL 会在下次启动时自动恢复。不能只复制 `.db` 文件。推荐：
 
 ```bash
 sqlite3 /home/filehub/filehub.db ".backup '/backup/filehub-$(date +%F).db'"

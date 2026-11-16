@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { focusTrap } from '../focusTrap';
   import { onMount } from 'svelte';
   import { api, type Entry, type Root } from '../api';
   import { language, rootAlias, t } from '../i18n';
@@ -84,9 +85,16 @@
       overlayPressed = false;
     }}
   >
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <form class="transfer-dialog" onsubmit={submit} onclick={(event) => event.stopPropagation()}>
+    <form
+      class="transfer-dialog"
+      onsubmit={submit}
+      onclick={(event) => event.stopPropagation()}
+      use:focusTrap
+      onkeydown={(event) => {
+        if (event.key === 'Escape') onClose();
+      }}
+    >
       <h2>{mode === 'copy' ? t($language, '复制到') : t($language, '移动到')}</h2>
       <p class="hint">{t($language, '共 {count} 项，点击选择目标目录。', { count })}</p>
       <label>

@@ -9,6 +9,7 @@ struct TestApp {
     home: std::path::PathBuf,
     router: Router,
     cookie: String,
+    csrf: String,
     root_id: i64,
 }
 
@@ -23,11 +24,14 @@ async fn setup_app() -> TestApp {
         Method::POST,
         "/api/v1/setup",
         None,
+        None,
         json!({"token":"test-token","username":"admin","password":"correct horse"}),
     )
     .await;
     assert_eq!(setup.status(), StatusCode::OK);
     let cookie = session_cookie(&setup);
+    let body = json_body(setup).await;
+    let csrf = body["csrf_token"].as_str().unwrap().to_owned();
     let roots = send(&router, Method::GET, "/api/v1/roots", Some(&cookie)).await;
     let root_id = json_body(roots).await["roots"][0]["id"].as_i64().unwrap();
     let home = dir.path().join("users/admin");
@@ -43,6 +47,7 @@ async fn setup_app() -> TestApp {
         home,
         router,
         cookie,
+        csrf,
         root_id,
     }
 }
@@ -63,6 +68,7 @@ async fn send_json(
     method: Method,
     uri: &str,
     cookie: Option<&str>,
+    csrf: Option<&str>,
     body: Value,
 ) -> Response<Body> {
     let mut builder = Request::builder()
@@ -71,6 +77,9 @@ async fn send_json(
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(cookie) = cookie {
         builder = builder.header(header::COOKIE, cookie);
+    }
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
     }
     app.clone()
         .oneshot(builder.body(Body::from(body.to_string())).unwrap())
@@ -171,4 +180,265 @@ async fn thumbnails_are_generated_cached_and_safe() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(response).await["error"]["code"], "INVALID_PATH");
     let _ = &app.home;
+}
+
+fn ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[tokio::test]
+async fn video_thumbnails_fall_back_to_first_frame_and_reject_broken_files() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg is not installed; skipping video thumbnail regression");
+        return;
+    }
+    let app = setup_app().await;
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x48:rate=10",
+            "-t",
+            "0.4",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(app.home.join("short.mp4"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to generate the test clip");
+
+    let uri = format!("/api/v1/thumb?root={}&path=short.mp4&w=64", app.root_id);
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a clip shorter than the seek offset should still return the first frame"
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/jpeg"
+    );
+
+    std::fs::write(app.home.join("broken.mp4"), b"not a video").unwrap();
+    let uri = format!("/api/v1/thumb?root={}&path=broken.mp4&w=64", app.root_id);
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.4",
+            "-c:a",
+            "aac",
+        ])
+        .arg(app.home.join("audio-only.mp4"))
+        .status()
+        .unwrap();
+    if status.success() {
+        let uri = format!(
+            "/api/v1/thumb?root={}&path=audio-only.mp4&w=64",
+            app.root_id
+        );
+        let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "audio-only files must not produce a video thumbnail"
+        );
+    }
+}
+
+fn tool_available(command: &str, args: &[&str]) -> bool {
+    std::process::Command::new(command)
+        .args(args)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[tokio::test]
+async fn large_and_variant_jpegs_generate_thumbnails() {
+    if !tool_available("magick", &["-version"]) {
+        eprintln!("ImageMagick is not installed; skipping JPEG variant regression");
+        return;
+    }
+    let app = setup_app().await;
+    let variants = [
+        ("big.jpg", vec!["-size", "10000x8000", "xc:#3366cc"]),
+        (
+            "gray.jpg",
+            vec![
+                "-size",
+                "800x600",
+                "gradient:black-white",
+                "-colorspace",
+                "Gray",
+            ],
+        ),
+        (
+            "progressive.jpg",
+            vec![
+                "-size",
+                "800x600",
+                "gradient:red-blue",
+                "-interlace",
+                "Plane",
+            ],
+        ),
+        (
+            "cmyk.jpg",
+            vec![
+                "-size",
+                "800x600",
+                "gradient:red-blue",
+                "-colorspace",
+                "CMYK",
+            ],
+        ),
+    ];
+    for (name, arguments) in variants {
+        let status = std::process::Command::new("magick")
+            .args(&arguments)
+            .arg(app.home.join(name))
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to generate {name}");
+        let uri = format!("/api/v1/thumb?root={}&path={name}&w=64", app.root_id);
+        let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name} thumbnail failed");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+    }
+}
+
+#[tokio::test]
+async fn thumbnail_failures_report_reason_and_can_be_retried() {
+    let app = setup_app().await;
+    let uri = format!("/api/v1/thumb?root={}&path=broken.png&w=64", app.root_id);
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let status_uri = format!(
+        "/api/v1/thumb/status?root={}&path=broken.png&w=64",
+        app.root_id
+    );
+    let response = send(&app.router, Method::GET, &status_uri, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = json_body(response).await;
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["reason"], "decode");
+
+    let retry = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/thumb/retry",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "broken.png", "w": 64}),
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert!(
+        json_body(retry).await["cleared"].as_u64().unwrap() >= 1,
+        "retry should clear the failure marker"
+    );
+
+    let response = send(&app.router, Method::GET, &status_uri, Some(&app.cookie)).await;
+    assert_eq!(json_body(response).await["state"], "missing");
+}
+
+#[tokio::test]
+async fn oversized_source_reports_max_source_reason() {
+    let app = setup_app().await;
+    std::fs::write(app.home.join("too-big.png"), vec![0_u8; 4096]).unwrap();
+    let update = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/admin/settings",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"key": "thumbnails.max_source_bytes", "value": 1024}),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let uri = format!("/api/v1/thumb?root={}&path=too-big.png&w=64", app.root_id);
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let status_uri = format!(
+        "/api/v1/thumb/status?root={}&path=too-big.png&w=64",
+        app.root_id
+    );
+    let status =
+        json_body(send(&app.router, Method::GET, &status_uri, Some(&app.cookie)).await).await;
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["reason"], "max_source");
+}
+
+#[tokio::test]
+async fn thumbnails_sniff_image_format_and_skip_size_limit_for_video() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg is not installed; skipping video size regression");
+        return;
+    }
+    let app = setup_app().await;
+    // A PNG saved with a .jpeg name must still decode.
+    std::fs::copy(app.home.join("photo.png"), app.home.join("mislabeled.jpeg")).unwrap();
+    let uri = format!(
+        "/api/v1/thumb?root={}&path=mislabeled.jpeg&w=64",
+        app.root_id
+    );
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x48:rate=10",
+            "-t",
+            "0.5",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(app.home.join("large.mp4"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let update = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/admin/settings",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"key": "thumbnails.max_source_bytes", "value": 1024}),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let uri = format!("/api/v1/thumb?root={}&path=large.mp4&w=64", app.root_id);
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "videos must not be rejected by the image source-size limit"
+    );
 }

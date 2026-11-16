@@ -70,6 +70,7 @@ pub async fn list(
     let resolved = authz::resolve(&state, current.user.id, root.id, &path, false).await?;
     let sort = query.sort.unwrap_or_else(|| "name".to_owned());
     let order = query.order.unwrap_or_else(|| "asc".to_owned());
+    let sort_by_size = sort == "size";
     let real_path = resolved.absolute.to_string_lossy().to_string();
     let current_mtime = fsops::dir_mtime_ns(&resolved.absolute).unwrap_or_default();
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
@@ -85,19 +86,22 @@ pub async fn list(
         .transpose()?
         .unwrap_or(0);
 
-    if let Some((indexed_mtime, indexed_entries, has_more)) = state
-        .db
-        .indexed_children_page(&real_path, &sort, &order, show_hidden, offset, limit)
-        .await
-        .map_err(AppError::internal)?
+    if !sort_by_size
+        && let Some((indexed_mtime, indexed_entries, has_more)) = state
+            .db
+            .indexed_children_page(&real_path, &sort, &order, show_hidden, offset, limit)
+            .await
+            .map_err(AppError::internal)?
     {
         if indexed_mtime == current_mtime {
             let mut entries: Vec<fsops::Entry> = indexed_entries
                 .into_iter()
                 .map(|entry| {
-                    let has_preview = entry.has_preview
-                        || (!entry.is_dir
-                            && crate::thumbs::can_preview(&entry.name, video_enabled));
+                    // Recompute preview support from the current settings so a
+                    // stale indexed flag cannot keep requesting thumbnails
+                    // that are now disabled.
+                    let has_preview =
+                        !entry.is_dir && crate::thumbs::can_preview(&entry.name, video_enabled);
                     fsops::Entry {
                         name: entry.name,
                         is_dir: entry.is_dir,
@@ -114,11 +118,14 @@ pub async fn list(
                 let _ = state.db.mark_index_stale(&real_path).await;
             } else {
                 if query.sizes.unwrap_or(false) {
-                    entries = enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
+                    let (enriched, _) =
+                        enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
+                    entries = enriched;
                 }
                 return Ok(Json(json!({
                     "root": root_json(&resolved.root),
                     "path": resolved.relative,
+                    "read_only": resolved.access_read_only,
                     "entries": entries,
                     "next_cursor": has_more.then(|| (offset + limit).to_string()),
                 })));
@@ -129,10 +136,47 @@ pub async fn list(
     }
 
     let task = resolved.clone();
+    let scan_sort = sort.clone();
+    let scan_order = order.clone();
     let mut all_entries =
-        tokio::task::spawn_blocking(move || fsops::list_dir(&task, &sort, &order))
+        tokio::task::spawn_blocking(move || fsops::list_dir(&task, &scan_sort, &scan_order))
             .await
             .map_err(|err| AppError::internal(anyhow::anyhow!("list task failed: {err}")))??;
+
+    if sort_by_size {
+        if !show_hidden {
+            all_entries.retain(|entry| !entry.name.starts_with('.'));
+        }
+        let (mut entries, unknown) =
+            enrich_directory_sizes(&state, all_entries, &resolved.absolute).await?;
+        sort_entries_by_size(&mut entries, &order);
+        for entry in &mut entries {
+            entry.has_preview =
+                !entry.is_dir && crate::thumbs::can_preview(&entry.name, video_enabled);
+        }
+        enqueue_unknown_dir_sizes(&state, current.user.id, &resolved.absolute, unknown);
+        let total = entries.len();
+        let entries: Vec<fsops::Entry> = entries.into_iter().skip(offset).take(limit).collect();
+        if settings.settings.index.auto_index_on_browse {
+            schedule_browse_index(
+                &state,
+                current.user.id,
+                resolved.root.clone(),
+                resolved.relative.clone(),
+                real_path.clone(),
+            )
+            .await;
+        }
+        return Ok(Json(json!({
+            "root": root_json(&resolved.root),
+            "path": resolved.relative,
+            "read_only": resolved.access_read_only,
+            "entries": entries,
+            "next_cursor": (offset.saturating_add(limit) < total)
+                .then(|| (offset + limit).to_string()),
+        })));
+    }
+
     let has_more = all_entries.len() > offset.saturating_add(limit);
     let mut entries = if offset >= all_entries.len() {
         Vec::new()
@@ -148,7 +192,8 @@ pub async fn list(
         entry.has_preview = !entry.is_dir && crate::thumbs::can_preview(&entry.name, video_enabled);
     }
     if query.sizes.unwrap_or(false) {
-        entries = enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
+        let (enriched, _) = enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
+        entries = enriched;
     }
     if settings.settings.index.auto_index_on_browse {
         schedule_browse_index(
@@ -164,6 +209,7 @@ pub async fn list(
     Ok(Json(json!({
         "root": root_json(&resolved.root),
         "path": resolved.relative,
+        "read_only": resolved.access_read_only,
         "entries": entries,
         "next_cursor": has_more.then(|| (offset + limit).to_string()),
     })))
@@ -232,34 +278,91 @@ async fn enrich_directory_sizes(
     state: &Arc<AppState>,
     mut entries: Vec<fsops::Entry>,
     base: &std::path::Path,
-) -> Result<Vec<fsops::Entry>, AppError> {
-    for entry in &mut entries {
-        if !entry.is_dir {
-            continue;
-        }
-        let real_path = base.join(&entry.name).to_string_lossy().to_string();
-        if let Some((_mtime, size, partial, status)) = state
-            .db
-            .indexed_directory_state(&real_path)
-            .await
-            .map_err(AppError::internal)?
+) -> Result<(Vec<fsops::Entry>, Vec<String>), AppError> {
+    let dirs: Vec<(usize, String)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.is_dir)
+        .map(|(index, entry)| (index, base.join(&entry.name).to_string_lossy().to_string()))
+        .collect();
+    if dirs.is_empty() {
+        return Ok((entries, Vec::new()));
+    }
+    let paths: Vec<String> = dirs.iter().map(|(_, path)| path.clone()).collect();
+    let indexed = state
+        .db
+        .indexed_directory_states(paths.clone())
+        .await
+        .map_err(AppError::internal)?;
+    let cached = state
+        .db
+        .directory_size_states(paths)
+        .await
+        .map_err(AppError::internal)?;
+    let mut unknown = Vec::new();
+    for (index, path) in dirs {
+        if let Some((_mtime, size, partial, status)) = indexed.get(&path)
             && status == "ready"
             && !partial
         {
-            entry.size = size.min(i64::MAX as u64) as i64;
+            entries[index].size = (*size).min(i64::MAX as u64) as i64;
             continue;
         }
-        if let Some((status, size, _mtime, _error, _updated)) = state
-            .db
-            .directory_size_state(&real_path)
-            .await
-            .map_err(AppError::internal)?
+        if let Some((status, size, _error)) = cached.get(&path)
             && status == "ready"
         {
-            entry.size = size.max(0);
+            entries[index].size = (*size).max(0);
+            continue;
         }
+        unknown.push(path);
     }
-    Ok(entries)
+    Ok((entries, unknown))
+}
+
+fn sort_entries_by_size(entries: &mut [fsops::Entry], order: &str) {
+    let descending = order.eq_ignore_ascii_case("desc");
+    entries.sort_by(|left, right| {
+        let dirs_first = right.is_dir.cmp(&left.is_dir);
+        let known = |entry: &fsops::Entry| !entry.is_dir || entry.size > 0;
+        let known_first = known(right).cmp(&known(left));
+        let size = match (descending, left.size.cmp(&right.size)) {
+            (true, std::cmp::Ordering::Less) => std::cmp::Ordering::Greater,
+            (true, std::cmp::Ordering::Greater) => std::cmp::Ordering::Less,
+            (_, ordering) => ordering,
+        };
+        dirs_first
+            .then(known_first)
+            .then(size)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+}
+
+fn enqueue_unknown_dir_sizes(
+    state: &Arc<AppState>,
+    user_id: i64,
+    base: &std::path::Path,
+    unknown: Vec<String>,
+) {
+    if unknown.is_empty() {
+        return;
+    }
+    let state = Arc::clone(state);
+    let base = base.to_path_buf();
+    tokio::spawn(async move {
+        for path in unknown.into_iter().take(50) {
+            let absolute = std::path::PathBuf::from(&path);
+            if !crate::platform::path_within(&absolute, &base) {
+                continue;
+            }
+            let stat_path = absolute.clone();
+            let Ok(Ok(mtime)) =
+                tokio::task::spawn_blocking(move || fsops::dir_mtime_ns(&stat_path)).await
+            else {
+                continue;
+            };
+            let _ = enqueue_dir_size(&state, user_id, path, absolute, mtime).await;
+        }
+    });
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,7 +380,16 @@ pub async fn download(
     let current = auth::current_user(&state, &headers).await?;
     let root = load_root(&state, current.user.id, query.root).await?;
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
-    let info_path = resolved.absolute.clone();
+    serve_file(&headers, &resolved.absolute, query.inline.unwrap_or(false)).await
+}
+
+/// Shared file response used by authenticated downloads and public shares.
+pub(crate) async fn serve_file(
+    headers: &HeaderMap,
+    absolute: &std::path::Path,
+    inline: bool,
+) -> Result<Response, AppError> {
+    let info_path = absolute.to_path_buf();
     let info = tokio::task::spawn_blocking(move || fsops::file_info(&info_path))
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("metadata task failed: {err}")))??;
@@ -290,20 +402,19 @@ pub async fn download(
         return Ok(StatusCode::NOT_MODIFIED.into_response());
     }
 
-    let file = tokio::fs::File::open(&resolved.absolute)
+    let file = tokio::fs::File::open(absolute)
         .await
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
-    let filename = resolved
-        .absolute
+    let filename = absolute
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("download");
-    let mime = mime_guess::from_path(&resolved.absolute).first_or_octet_stream();
+    let mime = mime_guess::from_path(absolute).first_or_octet_stream();
     let is_pdf = filename.to_ascii_lowercase().ends_with(".pdf");
     let safe_inline = is_pdf
         || ((matches!(mime.type_().as_str(), "image" | "video" | "audio"))
             && mime.subtype().as_str() != "svg+xml");
-    let disposition = if query.inline.unwrap_or(false) && safe_inline {
+    let disposition = if inline && safe_inline {
         "inline".to_owned()
     } else {
         format!(
@@ -393,20 +504,77 @@ pub async fn zip(
             .map_err(|err| {
                 AppError::internal(anyhow::anyhow!("zip preparation failed: {err}"))
             })??;
+    zip_response(&state, entries, "filehub.zip")
+}
 
+fn zip_options(name: &str) -> SimpleFileOptions {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    let method = if matches!(
+        extension.as_str(),
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "heic"
+            | "mp4"
+            | "mov"
+            | "mkv"
+            | "webm"
+            | "avi"
+            | "m4v"
+            | "mp3"
+            | "aac"
+            | "ogg"
+            | "flac"
+            | "zip"
+            | "7z"
+            | "gz"
+            | "xz"
+            | "bz2"
+            | "rar"
+            | "zst"
+    ) {
+        CompressionMethod::Stored
+    } else {
+        CompressionMethod::Deflated
+    };
+    SimpleFileOptions::default()
+        .compression_method(method)
+        .large_file(true)
+}
+
+/// Stream a ZIP archive with bounded memory and the configured concurrency
+/// limit. The permit lives as long as the blocking writer task, so a client
+/// disconnect releases it when the duplex writer fails.
+pub(crate) fn zip_response(
+    state: &Arc<AppState>,
+    entries: Vec<fsops::ZipEntry>,
+    filename: &str,
+) -> Result<Response, AppError> {
+    let permit = state
+        .zip_semaphore()
+        .try_acquire_owned()
+        .map_err(|_| AppError::TooManyRequests)?;
+    let count = entries.len();
     let (reader, writer) = tokio::io::duplex(64 * 1024);
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let started = std::time::Instant::now();
         let sync_writer = SyncIoBridge::new(writer);
         let mut zip = ZipWriter::new_stream(sync_writer);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated)
-            .large_file(true);
-
         for entry in entries {
             let Ok(mut file) = std::fs::File::open(&entry.path) else {
                 continue;
             };
-            if zip.start_file(&entry.name, options).is_err() {
+            if zip
+                .start_file(&entry.name, zip_options(&entry.name))
+                .is_err()
+            {
                 return;
             }
             if std::io::copy(&mut file, &mut zip).is_err() {
@@ -414,6 +582,11 @@ pub async fn zip(
             }
         }
         let _ = zip.finish();
+        tracing::debug!(
+            files = count,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "zip stream finished"
+        );
     });
 
     Response::builder()
@@ -421,7 +594,10 @@ pub async fn zip(
         .header(header::CONTENT_TYPE, "application/zip")
         .header(
             header::CONTENT_DISPOSITION,
-            "attachment; filename=\"filehub.zip\"",
+            format!(
+                "attachment; filename*=UTF-8''{}",
+                percent_encoding::utf8_percent_encode(filename, percent_encoding::NON_ALPHANUMERIC)
+            ),
         )
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(ReaderStream::new(reader)))
@@ -448,6 +624,20 @@ pub async fn create_upload(
     let resolved = authz::resolve(&state, current.user.id, root.id, &path, true).await?;
     let filename = validate_filename(&request.filename)?;
     let size = validate_upload_size(&state, request.total_size)?;
+    let concurrency = state
+        .settings()
+        .settings
+        .uploads
+        .concurrency_per_user
+        .max(1);
+    let active = state
+        .db
+        .count_active_uploads(current.user.id, unix_now())
+        .await
+        .map_err(AppError::internal)?;
+    if active >= concurrency {
+        return Err(AppError::TooManyRequests);
+    }
 
     if let Some(quota_bytes) = current.user.quota_bytes
         && crate::platform::path_within(
@@ -532,6 +722,29 @@ pub async fn upload_status(
         "received_chunks": received_chunks,
         "expires_at": upload.expires_at,
     })))
+}
+
+pub async fn cancel_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    if let Some(upload) = state
+        .db
+        .find_upload(&id, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+    {
+        fsops::delete_temp(std::path::Path::new(&upload.temp_path));
+        state
+            .db
+            .delete_upload(&id, current.user.id)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn upload_chunk(
@@ -843,6 +1056,7 @@ async fn load_upload(
 
     if upload.expires_at <= unix_now() {
         let _ = state.db.delete_upload(id, user_id).await;
+        fsops::delete_temp(std::path::Path::new(&upload.temp_path));
         return Err(AppError::NotFound);
     }
 
@@ -887,7 +1101,7 @@ fn received_bytes(upload: &UploadSession) -> i64 {
     total
 }
 
-fn validate_filename(filename: &str) -> Result<String, AppError> {
+pub(crate) fn validate_filename(filename: &str) -> Result<String, AppError> {
     let filename = filename.trim();
     if filename.is_empty()
         || filename == "."
@@ -946,7 +1160,7 @@ fn validate_filename(filename: &str) -> Result<String, AppError> {
     Ok(filename.to_owned())
 }
 
-fn validate_upload_size(state: &Arc<AppState>, size: i64) -> Result<i64, AppError> {
+pub(crate) fn validate_upload_size(state: &Arc<AppState>, size: i64) -> Result<i64, AppError> {
     if size <= 0 {
         return Err(AppError::bad_request("total_size must be positive"));
     }

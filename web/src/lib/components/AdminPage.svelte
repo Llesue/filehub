@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { api, type AdminRoot, type ServerPath, type SettingsResponse, type User } from '../api';
+  import { branding, brandMark, loadBranding } from '../branding';
   import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
   import AssignPathDialog from './AssignPathDialog.svelte';
@@ -11,7 +12,11 @@
   import NewUserDialog from './NewUserDialog.svelte';
   import QuotaDialog from './QuotaDialog.svelte';
 
-  let { csrf, onAudit }: { csrf: string; onAudit: () => void } = $props();
+  let {
+    csrf,
+    onAudit,
+    onRootsChanged,
+  }: { csrf: string; onAudit: () => void; onRootsChanged?: () => void } = $props();
 
   let users = $state<User[]>([]);
   let paths = $state<ServerPath[]>([]);
@@ -184,11 +189,13 @@
       csrf,
     );
     await load();
+    onRootsChanged?.();
   }
 
   async function addPath(path: string, alias: string): Promise<void> {
     await api.addServerPath({ path, alias }, csrf);
     await load();
+    onRootsChanged?.();
   }
 
   function beginPathAlias(path: ServerPath): void {
@@ -220,6 +227,7 @@
     try {
       await api.deleteServerPath(path.id, csrf);
       await load();
+      onRootsChanged?.();
     } catch (error) {
       showNotice(error instanceof Error ? error.message : t($language, '删除外部路径失败'));
     }
@@ -234,6 +242,7 @@
         csrf,
       );
       await load();
+      onRootsChanged?.();
     } catch (error) {
       showNotice(error instanceof Error ? error.message : t($language, '权限修改失败'));
     }
@@ -243,6 +252,7 @@
     try {
       await api.deleteRoot(user.id, root.id, csrf);
       await load();
+      onRootsChanged?.();
     } catch (error) {
       showNotice(error instanceof Error ? error.message : t($language, '移除授权失败'));
     }
@@ -277,6 +287,77 @@
   async function saveDefaultQuota(): Promise<void> {
     await setSetting('default_quota_bytes', Math.round(defaultQuotaGb * 1024 ** 3));
   }
+
+  let brandNameInput = $state('FileHub');
+  let brandReady = $state(false);
+  let brandBusy = $state(false);
+  $effect(() => {
+    if (settings && !brandReady) {
+      brandNameInput = String(setting('ui.brand_name') ?? 'FileHub');
+      brandReady = true;
+    }
+  });
+
+  async function saveBrandName(): Promise<void> {
+    const value = brandNameInput.trim();
+    if (!value) return;
+    await setSetting('ui.brand_name', value);
+    await loadBranding();
+    showNotice(t($language, '已保存'), 'info', t($language, '品牌'));
+  }
+
+  async function uploadBrandIcon(event: Event): Promise<void> {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      showNotice(t($language, '图标不能超过 2MB'));
+      return;
+    }
+    brandBusy = true;
+    try {
+      await api.uploadBrandingIcon(file, csrf);
+      await loadBranding();
+      showNotice(t($language, '图标已更新'), 'info', t($language, '品牌'));
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '上传失败'));
+    } finally {
+      brandBusy = false;
+    }
+  }
+
+  async function resetBrandIcon(): Promise<void> {
+    brandBusy = true;
+    try {
+      await api.deleteBrandingIcon(csrf);
+      await loadBranding();
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '操作失败'));
+    } finally {
+      brandBusy = false;
+    }
+  }
+
+  let zipMaxGb = $state(2);
+  let zipMaxFiles = $state(1000);
+  let zipConcurrency = $state(1);
+  let zipSettingsReady = $state(false);
+  $effect(() => {
+    if (settings && !zipSettingsReady) {
+      zipMaxGb = Number(setting('downloads.zip_max_bytes') ?? 2 * 1024 ** 3) / 1024 ** 3;
+      zipMaxFiles = Number(setting('downloads.zip_max_files') ?? 1000);
+      zipConcurrency = Number(setting('downloads.zip_concurrency') ?? 1);
+      zipSettingsReady = true;
+    }
+  });
+
+  async function saveZipSettings(): Promise<void> {
+    await setSetting('downloads.zip_max_bytes', Math.round(zipMaxGb * 1024 ** 3));
+    await setSetting('downloads.zip_max_files', Math.round(zipMaxFiles));
+    await setSetting('downloads.zip_concurrency', Math.max(1, Math.round(zipConcurrency)));
+  }
+
 </script>
 
 <section class="admin-page">
@@ -441,6 +522,43 @@
     </section>
 
     <section class="admin-section">
+      <h2>{t($language, '品牌')}</h2>
+      <div class="setting-grid">
+        <label class="setting-row"
+          ><span>{t($language, '品牌名称')}</span>
+          <div class="quota-setting">
+            <input bind:value={brandNameInput} maxlength="64" />
+            <button type="button" class="small" onclick={() => void saveBrandName()}
+              >{t($language, '保存')}</button
+            >
+          </div></label
+        >
+        <div class="setting-row">
+          <span>{t($language, '品牌图标')}</span>
+          <div class="quota-setting">
+            {#if $branding.iconUrl}
+              <img class="brand-preview" src={$branding.iconUrl} alt="" />
+            {:else}
+              <span class="brand-preview fallback">{brandMark($branding.name)}</span>
+            {/if}
+            <label class="small upload-label"
+              >{t($language, '上传图标')}<input
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                disabled={brandBusy}
+                onchange={(event) => void uploadBrandIcon(event)}
+              /></label
+            >
+            <button type="button" class="small" disabled={brandBusy} onclick={() => void resetBrandIcon()}
+              >{t($language, '恢复默认图标')}</button
+            >
+          </div>
+        </div>
+      </div>
+      <p class="brand-hint">{t($language, '仅支持 PNG/JPEG/WebP，最大 2MB，建议正方形。')}</p>
+    </section>
+
+    <section class="admin-section">
       <h2>{t($language, '系统设置')}</h2>
       <div class="setting-grid">
         <label class="setting-row"
@@ -450,6 +568,26 @@
             onchange={(event) => void setSetting('thumbnails.enabled', event.currentTarget.checked)}
           /></label
         >
+        <div class="setting-row wide">
+          <span>{t($language, 'ZIP 下载限制')}</span>
+          <div class="zip-fields">
+            <label class="zip-field"
+              ><span>{t($language, '最大大小')}</span>
+              <input bind:value={zipMaxGb} type="number" min="0" step="1" /><span>GB</span></label
+            >
+            <label class="zip-field"
+              ><span>{t($language, '最大文件数')}</span>
+              <input bind:value={zipMaxFiles} type="number" min="0" step="1" /></label
+            >
+            <label class="zip-field"
+              ><span>{t($language, '并发数')}</span>
+              <input bind:value={zipConcurrency} type="number" min="1" step="1" /></label
+            >
+            <button type="button" class="small" onclick={() => void saveZipSettings()}
+              >{t($language, '保存')}</button
+            >
+          </div>
+        </div>
         <label class="setting-row"
           ><span>{t($language, '文本编辑器')}</span><input
             type="checkbox"
@@ -818,6 +956,38 @@
       border-top: 0;
     }
   }
+  .setting-row.wide {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+
+  .zip-fields {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .zip-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-2);
+    font-size: 13px;
+    white-space: nowrap;
+  }
+
+  .zip-field input {
+    width: 72px;
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
   .setting-row select {
     height: 32px;
     padding: 0 8px;
@@ -845,6 +1015,38 @@
     background: var(--surface-2);
     color: var(--text);
   }
+  .brand-hint {
+    margin: 10px 0 0;
+    color: var(--text-2);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .brand-preview {
+    display: grid;
+    width: 36px;
+    height: 36px;
+    place-items: center;
+    border-radius: 10px;
+    object-fit: cover;
+  }
+
+  .brand-preview.fallback {
+    background: var(--accent);
+    color: var(--on-accent);
+    font-weight: 600;
+  }
+
+  .upload-label {
+    display: inline-flex;
+    align-items: center;
+    cursor: pointer;
+  }
+
+  .upload-label input {
+    display: none;
+  }
+
   .small {
     height: 30px;
     padding: 0 10px;

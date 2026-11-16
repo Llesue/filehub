@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api, ApiError, type AuthResponse } from '../api';
   import { language, t } from '../i18n';
+  import { branding, brandMark } from '../branding';
 
   let {
     mode,
@@ -43,15 +44,17 @@
 <main class="auth-shell">
   <section class="auth-card" aria-labelledby="auth-title">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true">F</span>
-      <span>FileHub</span>
+      <span class="brand-mark" aria-hidden="true">
+        {#if $branding.iconUrl}<img src={$branding.iconUrl} alt="" />{:else}{brandMark($branding.name)}{/if}
+      </span>
+      <span>{$branding.name}</span>
     </div>
 
     <h1 id="auth-title">{mode === 'setup' ? t($language, '首次设置') : t($language, '登录')}</h1>
     <p class="lede">
       {mode === 'setup'
         ? t($language, '创建第一个管理员账号，完成后即可开始使用。')
-        : t($language, '使用你的账号访问 FileHub。')}
+        : t($language, '使用你的账号访问 {brand}。', { brand: $branding.name })}
     </p>
 
     <form
@@ -150,6 +153,13 @@
     margin-bottom: 28px;
     font-size: 17px;
     font-weight: 600;
+  }
+
+  .brand-mark img {
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    object-fit: cover;
   }
 
   .brand-mark {

@@ -29,6 +29,46 @@ fn program_data() -> PathBuf {
         .join("FileHub")
 }
 
+/// Delete daily service logs older than `retention_days`.
+///
+/// `0` disables cleanup. Only files created by `tracing_appender::rolling`
+/// (`filehub.log.<date>`) are considered.
+#[cfg(windows)]
+pub fn prune_service_logs(retention_days: u64) -> usize {
+    use std::time::{Duration, SystemTime};
+
+    if retention_days == 0 {
+        return 0;
+    }
+    let Some(cutoff) =
+        SystemTime::now().checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
+    else {
+        return 0;
+    };
+    let dir = default_data_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut removed = 0_usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("filehub.log.") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified < cutoff && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 pub fn set_private_mode(options: &mut OpenOptions) {
     #[cfg(unix)]
     {

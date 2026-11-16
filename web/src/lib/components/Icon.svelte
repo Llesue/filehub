@@ -6,6 +6,8 @@
     | 'list'
     | 'grid'
     | 'image'
+    | 'eye'
+    | 'play'
     | 'folder-plus'
     | 'folder-upload'
     | 'terminal'
@@ -57,6 +59,11 @@
     <rect x="14" y="4" width="6" height="6" rx="1" />
     <rect x="4" y="14" width="6" height="6" rx="1" />
     <rect x="14" y="14" width="6" height="6" rx="1" />
+  {:else if name === 'eye'}
+    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+    <circle cx="12" cy="12" r="3" />
+  {:else if name === 'play'}
+    <path d="M8 5v14l11-7z" fill="currentColor" stroke="none" />
   {:else if name === 'image'}
     <rect x="3" y="5" width="18" height="14" rx="2" />
     <circle cx="8.5" cy="10" r="1.5" />

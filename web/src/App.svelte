@@ -15,6 +15,7 @@
   import FileTypeIcon from './lib/components/FileTypeIcon.svelte';
   import NameDialog from './lib/components/NameDialog.svelte';
   import PreviewModal from './lib/components/PreviewModal.svelte';
+  import PropertiesDialog from './lib/components/PropertiesDialog.svelte';
   import PreferencesPage from './lib/components/PreferencesPage.svelte';
   import ShareDialog from './lib/components/ShareDialog.svelte';
   import TerminalPanel from './lib/components/TerminalPanel.svelte';
@@ -22,8 +23,14 @@
   import AuthScreen from './lib/components/AuthScreen.svelte';
   import SharePage from './lib/components/SharePage.svelte';
   import Icon from './lib/components/Icon.svelte';
+  import AudioPlayer from './lib/components/AudioPlayer.svelte';
   import { initLanguage, language, localeOf, rootAlias, setLanguage, t } from './lib/i18n';
   import { showNotice, showNoticeAction } from './lib/notices';
+  import { showToast } from './lib/toast';
+  import { branding, brandMark, loadBranding } from './lib/branding';
+  import { playAudio, type AudioTrack } from './lib/audio';
+  import { resolveViewPreference } from './lib/viewPref';
+  import { absoluteTime, relativeTimeParts } from './lib/time';
   import {
     failProgress,
     finishProgress,
@@ -63,6 +70,8 @@
   let roots = $state<Root[]>([]);
   let activeRootId = $state<number | null>(null);
   let currentPath = $state('');
+  let currentReadOnly = $state(false);
+  let clock = $state(Date.now());
   let entries = $state<Entry[]>([]);
   let selected = $state<string[]>([]);
   let dirSizes = $state<Record<string, number | null>>({});
@@ -125,7 +134,13 @@
   let settingsMounted = $state(false);
   let sharesMounted = $state(false);
   let contextMenu = $state<{ x: number; y: number; entry: Entry } | null>(null);
+  let contextMenuElement = $state<HTMLElement | null>(null);
+  let contextMenuLeft = $state(false);
+  let contextMenuUp = $state(false);
   let blankMenu = $state<{ x: number; y: number } | null>(null);
+  let blankMenuElement = $state<HTMLElement | null>(null);
+  let blankMenuLeft = $state(false);
+  let blankMenuUp = $state(false);
   let terminalOpen = $state(false);
   let transfer = $state<{ mode: 'copy' | 'move'; entries: Entry[] } | null>(null);
   let dragPayload = $state<{ rootId: number; path: string; name: string } | null>(null);
@@ -137,7 +152,12 @@
     initialValue: string;
   } | null>(null);
   let preview = $state<{ items: Entry[]; index: number } | null>(null);
-  let shareTarget = $state<Entry | null>(null);
+  let properties = $state<{
+    data: Awaited<ReturnType<typeof api.properties>> | null;
+    loading: boolean;
+    error: string;
+  } | null>(null);
+  let shareTargets = $state<Entry[] | null>(null);
   let confirmState = $state<{
     title: string;
     message: string;
@@ -167,14 +187,15 @@
       : '—',
   );
   let pageTitle = $derived.by(() => {
-    if (appView === 'shares') return t($language, 'FileHub - 分享管理');
-    if (appView === 'settings') return t($language, 'FileHub - 设置');
-    if (appView === 'admin') return t($language, 'FileHub - 系统管理');
-    if (appView === 'audit') return t($language, 'FileHub - 审计日志');
+    const brand = $branding.name;
+    if (appView === 'shares') return `${brand} - ${t($language, '分享管理')}`;
+    if (appView === 'settings') return `${brand} - ${t($language, '设置')}`;
+    if (appView === 'admin') return `${brand} - ${t($language, '系统管理')}`;
+    if (appView === 'audit') return `${brand} - ${t($language, '审计日志')}`;
     const current =
       pathSegments[pathSegments.length - 1] ||
       (activeRoot ? rootLabel(activeRoot.alias) : undefined);
-    return current ? `FileHub - ${current}` : 'FileHub';
+    return current ? `${brand} - ${current}` : brand;
   });
 
   const VIRTUAL_THRESHOLD = 300;
@@ -199,6 +220,7 @@
 
   onMount(() => {
     initLanguage();
+    void loadBranding();
     try {
       theme = resolveTheme(
         localStorage.getItem('filehub.theme'),
@@ -269,10 +291,12 @@
         void saveEditor(true);
       }
     }, 30_000);
+    const clockTimer = window.setInterval(() => (clock = Date.now()), 60_000);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('resize', updateVirtualRange);
       window.clearInterval(autoSaveTimer);
+      window.clearInterval(clockTimer);
       if (usagePollTimer) clearTimeout(usagePollTimer);
     };
   });
@@ -385,6 +409,7 @@
       roots = [];
       entries = [];
       currentPath = '';
+      currentReadOnly = false;
       selected = [];
       activeRootId = null;
       loggingOut = false;
@@ -398,11 +423,34 @@
       const next = roots.find((root) => root.id === activeRootId) ?? roots[0] ?? null;
       if (!next) {
         activeRootId = null;
+        currentPath = '';
+        currentReadOnly = false;
         entries = [];
         filesError = t($language, '当前账号还没有可访问的目录');
         return;
       }
       await loadList(next.id, '');
+    } catch (error) {
+      handleFilesError(error);
+    }
+  }
+
+  /// Refresh the sidebar roots after an admin change without resetting the
+  /// current browse position unless the root disappeared.
+  async function refreshRoots(): Promise<void> {
+    try {
+      const result = await api.roots();
+      roots = result.roots;
+      const next = roots.find((root) => root.id === activeRootId) ?? roots[0] ?? null;
+      if (!next) {
+        activeRootId = null;
+        currentPath = '';
+        currentReadOnly = false;
+        entries = [];
+        filesError = t($language, '当前账号还没有可访问的目录');
+        return;
+      }
+      await loadList(next.id, next.id === activeRootId ? currentPath : '');
     } catch (error) {
       handleFilesError(error);
     }
@@ -441,20 +489,17 @@
       if (generation !== listGeneration || controller.signal.aborted) return;
       activeRootId = result.root.id;
       currentPath = result.path;
+      currentReadOnly = result.read_only;
       entries = result.entries;
       nextCursor = result.next_cursor;
       loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration);
       selected = [];
       selectionAnchor = null;
-      const remembered = localStorage.getItem(`view:${result.root.id}:${result.path}`);
-      if (
-        remembered === 'list' ||
-        remembered === 'thumb' ||
-        remembered === 'tile' ||
-        remembered === 'grid'
-      ) {
-        view = remembered === 'grid' ? 'thumb' : remembered;
-      }
+      const remembered = resolveViewPreference(
+        localStorage.getItem('filehub.view'),
+        localStorage.getItem(`view:${result.root.id}:${result.path}`),
+      );
+      if (remembered) view = remembered;
       void loadUsage();
     } catch (error) {
       if (isAbortError(error)) return;
@@ -546,6 +591,7 @@
         dirSizes = { ...dirSizes, [key]: result.size };
         dirSizeErrors = { ...dirSizeErrors, [key]: result.error ?? null };
         dirSizeAttempts.delete(key);
+        resortEntriesBySize();
         return;
       }
       if (result.status === 'error') {
@@ -592,7 +638,35 @@
     if (!entry.is_dir) return formatSize(entry.size);
     if (activeRootId === null) return t($language, '计算中…');
     const size = dirSizes[`${activeRootId}:${joinPath(currentPath, entry.name)}`];
-    return size === undefined ? t($language, '计算中…') : size === null ? '—' : formatSize(size);
+    if (size === undefined) {
+      return entry.size > 0 ? formatSize(entry.size) : t($language, '计算中…');
+    }
+    return size === null ? '—' : formatSize(size);
+  }
+
+  function resortEntriesBySize(): void {
+    if (sortField !== 'size' || activeRootId === null) return;
+    const rootId = activeRootId;
+    const path = currentPath;
+    const sizeOf = (entry: Entry): number => {
+      if (!entry.is_dir) return entry.size;
+      const value = dirSizes[`${rootId}:${joinPath(path, entry.name)}`];
+      return typeof value === 'number' ? value : entry.size;
+    };
+    const known = (entry: Entry, value: number): boolean => !entry.is_dir || value > 0;
+    entries = [...entries].sort((left, right) => {
+      const dirs = Number(right.is_dir) - Number(left.is_dir);
+      if (dirs !== 0) return dirs;
+      const leftSize = sizeOf(left);
+      const rightSize = sizeOf(right);
+      const leftKnown = known(left, leftSize);
+      const rightKnown = known(right, rightSize);
+      if (leftKnown !== rightKnown) return leftKnown ? -1 : 1;
+      if (leftSize !== rightSize) {
+        return sortOrder === 'desc' ? rightSize - leftSize : leftSize - rightSize;
+      }
+      return left.name.localeCompare(right.name);
+    });
   }
 
   function entrySizeError(entry: Entry): string {
@@ -950,6 +1024,33 @@
     );
   }
 
+  async function openProperties(rootId: number, path: string): Promise<void> {
+    properties = { data: null, loading: true, error: '' };
+    try {
+      const data = await api.properties(rootId, path);
+      properties = { data, loading: false, error: '' };
+    } catch (error) {
+      properties = {
+        data: null,
+        loading: false,
+        error: error instanceof Error ? error.message : t($language, '操作失败'),
+      };
+    }
+  }
+
+  function startAudio(entry: Entry): void {
+    if (activeRootId === null) return;
+    const tracks: AudioTrack[] = entries
+      .filter((item) => !item.is_dir && isAudioName(item.name))
+      .map((item) => ({
+        name: item.name,
+        url: api.previewUrl(activeRootId ?? 0, joinPath(currentPath, item.name)),
+        key: `${activeRootId}:${joinPath(currentPath, item.name)}`,
+      }));
+    const index = tracks.findIndex((track) => track.name === entry.name);
+    if (index >= 0) playAudio(tracks, index);
+  }
+
   function isAudioName(name: string): boolean {
     return /\.(mp3|wav|ogg|m4a|flac|aac)$/i.test(name);
   }
@@ -991,13 +1092,96 @@
   }
 
   function menuPosition(x: number, y: number): { x: number; y: number } {
-    const width = 260;
-    const height = 380;
+    return { x, y };
+  }
+
+  function clampMenu(
+    element: HTMLElement | null,
+    state: { x: number; y: number },
+  ): { x: number; y: number; left: boolean; up: boolean } | null {
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    const x = Math.max(8, Math.min(state.x, window.innerWidth - rect.width - 8));
+    const y = Math.max(8, Math.min(state.y, window.innerHeight - rect.height - 8));
     return {
-      x: Math.max(8, Math.min(x, window.innerWidth - width)),
-      y: Math.max(8, Math.min(y, window.innerHeight - height)),
+      x,
+      y,
+      left: x + rect.width + 180 > window.innerWidth,
+      up: y + rect.height > window.innerHeight - 80,
     };
   }
+
+  $effect(() => {
+    const state = contextMenu;
+    if (!state) return;
+    const clamped = clampMenu(contextMenuElement, state);
+    if (!clamped) return;
+    contextMenuLeft = clamped.left;
+    contextMenuUp = clamped.up;
+    if (clamped.x !== state.x || clamped.y !== state.y) {
+      contextMenu = { ...state, x: clamped.x, y: clamped.y };
+    }
+  });
+
+  $effect(() => {
+    if (!contextMenu || !contextMenuElement) return;
+    const first = contextMenuElement.querySelector<HTMLElement>(
+      '[role="menuitem"]:not([disabled])',
+    );
+    first?.focus();
+  });
+
+  function menuKeydown(event: KeyboardEvent): void {
+    const menu = event.currentTarget as HTMLElement;
+    const items = Array.from(
+      menu.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'),
+    );
+    if (items.length === 0) return;
+    const index = items.findIndex((item) => item === document.activeElement);
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      items[(index + 1 + items.length) % items.length]?.focus();
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      items[(index - 1 + items.length) % items.length]?.focus();
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      items.at(0)?.focus();
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      items.at(-1)?.focus();
+    } else if (event.key === 'ArrowRight') {
+      const submenu = items.at(index)?.parentElement?.querySelector('.submenu');
+      const target = submenu?.querySelector<HTMLElement>('button');
+      if (target) {
+        event.preventDefault();
+        target.focus();
+      }
+    } else if (event.key === 'ArrowLeft') {
+      const current = document.activeElement as HTMLElement | null;
+      const submenu = current?.closest('.submenu');
+      if (submenu) {
+        event.preventDefault();
+        (submenu.parentElement?.querySelector(':scope > button') as HTMLElement | null)?.focus();
+      }
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      contextMenu = null;
+      blankMenu = null;
+    }
+  }
+
+  $effect(() => {
+    const state = blankMenu;
+    if (!state) return;
+    const clamped = clampMenu(blankMenuElement, state);
+    if (!clamped) return;
+    blankMenuLeft = clamped.left;
+    blankMenuUp = clamped.up;
+    if (clamped.x !== state.x || clamped.y !== state.y) {
+      blankMenu = { ...state, x: clamped.x, y: clamped.y };
+    }
+  });
 
   function openContextMenu(event: MouseEvent, entry: Entry): void {
     event.preventDefault();
@@ -1029,7 +1213,16 @@
   }
 
   function runContextAction(
-    action: 'preview' | 'download' | 'share' | 'rename' | 'copy-to' | 'move-to' | 'delete',
+    action:
+      | 'preview'
+      | 'download'
+      | 'share'
+      | 'rename'
+      | 'copy-to'
+      | 'move-to'
+      | 'delete'
+      | 'play'
+      | 'properties',
   ): void {
     const entry = contextMenu?.entry;
     contextMenu = null;
@@ -1040,7 +1233,13 @@
         : [entry];
     if (action === 'preview') previewEntry(entry);
     if (action === 'download') downloadEntry(entry);
-    if (action === 'share') shareTarget = entry;
+    if (action === 'share') {
+      if (targets.length > 1 && targets.some((item) => item.is_dir)) {
+        showToast(t($language, '目录请单独分享'));
+        return;
+      }
+      shareTargets = targets;
+    }
     if (action === 'rename') {
       nameDialog = {
         mode: 'rename',
@@ -1053,6 +1252,12 @@
     if (action === 'copy-to') transfer = { mode: 'copy', entries: targets };
     if (action === 'move-to') transfer = { mode: 'move', entries: targets };
     if (action === 'delete') void requestDelete(targets);
+    if (action === 'play' && activeRootId !== null) {
+      startAudio(entry);
+    }
+    if (action === 'properties' && activeRootId !== null) {
+      void openProperties(activeRootId, joinPath(currentPath, entry.name));
+    }
   }
 
   function openMkdir(): void {
@@ -1413,7 +1618,12 @@
   }
 
   function uploadClick(): void {
-    if (!activeRoot || activeRoot.read_only || uploading) return;
+    if (uploading) return;
+    if (!activeRoot) return;
+    if (currentReadOnly) {
+      showToast(t($language, '当前目录只读'));
+      return;
+    }
     fileInput?.click();
   }
 
@@ -1432,48 +1642,111 @@
   }
 
   function folderUploadClick(): void {
-    if (!activeRoot || activeRoot.read_only || uploading) return;
+    if (uploading) return;
+    if (!activeRoot) return;
+    if (currentReadOnly) {
+      showToast(t($language, '当前目录只读'));
+      return;
+    }
     folderInput?.click();
   }
 
   async function uploadFiles(files: File[], preservePaths = false): Promise<void> {
     if (activeRootId === null || files.length === 0) return;
+    if (currentReadOnly) {
+      showToast(t($language, '当前目录只读'));
+      return;
+    }
+
+    const rootId = activeRootId;
+    const controller = new AbortController();
+    let cancelled = false;
+    const failed: File[] = [];
+    let completed = 0;
 
     filesError = '';
     uploading = true;
     startProgress(t($language, '上传文件'), files.length);
+    setProgressCancel(() => {
+      cancelled = true;
+      controller.abort();
+    });
     try {
-      for (const [index, file] of files.entries()) {
-        updateProgress(index, file.name);
-        if (file.size === 0) {
-          throw new Error(t($language, '空文件暂不支持上传：{name}', { name: file.name }));
+      for (const file of files) {
+        if (cancelled) break;
+        updateProgress(completed, file.name);
+        try {
+          await uploadOne(rootId, file, preservePaths, controller.signal);
+          completed += 1;
+        } catch (error) {
+          if (cancelled || isAbortError(error)) break;
+          failed.push(file);
+          console.warn('upload failed', file.name, error);
         }
-        const relative = preservePaths ? file.webkitRelativePath || file.name : file.name;
-        const parts = relative.split('/').filter(Boolean);
-        const filename = parts.pop() ?? file.name;
-        const directory = parts.join('/');
-        const targetPath = joinPath(currentPath, directory);
-        if (directory) {
-          await api.mkdir(activeRootId, currentPath, directory, csrf, true);
-        }
-        const created = await api.createUpload(activeRootId, targetPath, filename, file.size, csrf);
-
-        for (let index = 0; index < created.chunks; index += 1) {
-          const start = index * created.chunk_size;
-          const end = Math.min(start + created.chunk_size, file.size);
-          await api.uploadChunk(created.upload_id, index, file.slice(start, end), csrf);
-        }
-        await api.completeUpload(created.upload_id, csrf);
       }
-      updateProgress(files.length, t($language, '{count} 个文件完成', { count: files.length }));
+      if (cancelled) {
+        failProgress(t($language, '上传已取消'));
+        return;
+      }
       clearDirSizeCache();
-      await loadList(activeRootId, currentPath);
-      finishProgress();
-    } catch (error) {
-      failProgress(error instanceof Error ? error.message : t($language, '上传失败'));
-      handleFilesError(error);
+      await loadList(rootId, currentPath);
+      if (failed.length > 0) {
+        failProgress(t($language, '{count} 个文件上传失败', { count: failed.length }));
+        showNoticeAction(
+          t($language, '{count} 个文件上传失败', { count: failed.length }),
+          t($language, '上传失败'),
+          t($language, '重试失败文件'),
+          () => void uploadFiles(failed, preservePaths),
+          'error',
+        );
+      } else {
+        updateProgress(files.length, t($language, '{count} 个文件完成', { count: files.length }));
+        finishProgress();
+      }
     } finally {
+      setProgressCancel(null);
       uploading = false;
+    }
+  }
+
+  async function uploadOne(
+    rootId: number,
+    file: File,
+    preservePaths: boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (file.size === 0) {
+      throw new Error(t($language, '空文件暂不支持上传：{name}', { name: file.name }));
+    }
+    const relative = preservePaths ? file.webkitRelativePath || file.name : file.name;
+    const parts = relative.split('/').filter(Boolean);
+    const filename = parts.pop() ?? file.name;
+    const directory = parts.join('/');
+    const targetPath = joinPath(currentPath, directory);
+    if (directory) {
+      await api.mkdir(rootId, currentPath, directory, csrf, true);
+    }
+    const created = await api.createUpload(rootId, targetPath, filename, file.size, csrf);
+    try {
+      for (let index = 0; index < created.chunks; index += 1) {
+        if (signal.aborted) {
+          await api.cancelUpload(created.upload_id, csrf).catch(() => undefined);
+          throw new DOMException('aborted', 'AbortError');
+        }
+        const start = index * created.chunk_size;
+        const end = Math.min(start + created.chunk_size, file.size);
+        await api.uploadChunk(
+          created.upload_id,
+          index,
+          file.slice(start, end),
+          csrf,
+          signal,
+        );
+      }
+      await api.completeUpload(created.upload_id, csrf);
+    } catch (error) {
+      await api.cancelUpload(created.upload_id, csrf).catch(() => undefined);
+      throw error;
     }
   }
 
@@ -1482,7 +1755,11 @@
   }
 
   async function requestDelete(items: Entry[]): Promise<void> {
-    if (activeRootId === null || !activeRoot || activeRoot.read_only || items.length === 0) {
+    if (activeRootId === null || !activeRoot || items.length === 0) {
+      return;
+    }
+    if (currentReadOnly) {
+      showToast(t($language, '当前目录只读'));
       return;
     }
 
@@ -1548,6 +1825,7 @@
 
   function setView(next: 'list' | 'thumb' | 'tile'): void {
     view = next;
+    localStorage.setItem('filehub.view', next);
     if (activeRootId !== null) {
       localStorage.setItem(`view:${activeRootId}:${currentPath}`, next);
     }
@@ -1642,24 +1920,29 @@
     image.style.display = 'none';
   }
 
-  function formatDate(seconds: number): string {
-    if (!seconds) return '—';
-    return new Intl.DateTimeFormat(localeOf($language), {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    }).format(new Date(seconds * 1000));
-  }
-
   function formatRelativeDate(seconds: number): string {
     if (!seconds) return '—';
-    const diff = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
-    if (diff < 60) return t($language, '刚刚');
-    if (diff < 3600) return t($language, '{count} 分钟前', { count: Math.floor(diff / 60) });
-    if (diff < 86400) return t($language, '{count} 小时前', { count: Math.floor(diff / 3600) });
-    if (diff < 7 * 86400) return t($language, '{count} 天前', { count: Math.floor(diff / 86400) });
-    return formatDate(seconds);
+    const parts = relativeTimeParts(seconds, clock);
+    switch (parts.unit) {
+      case 'just-now':
+        return t($language, '刚刚');
+      case 'minute':
+        return t($language, '{count} 分钟前', { count: parts.count });
+      case 'hour':
+        return t($language, '{count} 小时前', { count: parts.count });
+      case 'day':
+        return t($language, '{count} 天前', { count: parts.count });
+      case 'week':
+        return t($language, '{count} 周前', { count: parts.count });
+      case 'month':
+        return t($language, '{count} 个月前', { count: parts.count });
+      default:
+        return t($language, '{count} 年前', { count: parts.count });
+    }
+  }
+
+  function absoluteDate(seconds: number): string {
+    return absoluteTime(seconds, localeOf($language));
   }
 </script>
 
@@ -1711,8 +1994,14 @@
         <Icon name="menu" size={20} />
       </button>
       <div class="topbar-brand">
-        <span class="brand-mark" aria-hidden="true">F</span>
-        <span class="brand-name">FileHub</span>
+        <span class="brand-mark" aria-hidden="true">
+          {#if $branding.iconUrl}
+            <img src={$branding.iconUrl} alt="" />
+          {:else}
+            {brandMark($branding.name)}
+          {/if}
+        </span>
+        <span class="brand-name">{$branding.name}</span>
       </div>
 
       {#if appView === 'files'}
@@ -1782,8 +2071,11 @@
           <button
             type="button"
             class="upload-top"
-            disabled={!activeRoot || activeRoot.read_only || uploading}
-            title={activeRoot?.read_only ? t($language, '当前目录只读') : t($language, '上传文件')}
+            class:inactive={currentReadOnly}
+            aria-disabled={!activeRoot || currentReadOnly || uploading}
+            title={currentReadOnly
+              ? t($language, '当前目录只读')
+              : t($language, '上传文件')}
             aria-label={t($language, '上传')}
             onclick={uploadClick}
           >
@@ -1910,6 +2202,10 @@
         {#if appView === 'files'}
           <div class="pathbar">
             <div class="path">
+              <Icon name="folder" size={15} />
+              {#if currentReadOnly}
+                <span class="readonly-tag">{t($language, '只读')}</span>
+              {/if}
               <button type="button" class="path-link" onclick={() => navigate('')}>
                 {activeRoot ? rootLabel(activeRoot.alias) : t($language, '文件')}
               </button>
@@ -2020,7 +2316,11 @@
               <!-- kept mounted above so returning to settings does not reload -->
             {:else if appView === 'admin' || appView === 'audit'}
               <div class:view-hidden={appView === 'audit'}>
-                <AdminPage {csrf} onAudit={() => (appView = 'audit')} />
+                <AdminPage
+                  {csrf}
+                  onAudit={() => (appView = 'audit')}
+                  onRootsChanged={() => void refreshRoots()}
+                />
               </div>
               {#if appView === 'audit'}
                 <AuditPage onBack={() => (appView = 'admin')} />
@@ -2140,7 +2440,8 @@
                     <button
                       type="button"
                       class="upload-primary"
-                      disabled={!activeRoot || activeRoot.read_only || uploading}
+                      class:inactive={currentReadOnly}
+                      aria-disabled={!activeRoot || currentReadOnly || uploading}
                       onclick={uploadClick}
                     >
                       <Icon name="upload" size={18} />
@@ -2228,7 +2529,18 @@
                             data-entry-name={entry.name}
                             class:selected={isSelected(entry.name)}
                             class:marquee-selected={marqueePreview.includes(entry.name)}
+                            tabindex="0"
+                            aria-selected={isSelected(entry.name)}
                             draggable="true"
+                            onkeydown={(event) => {
+                              if (event.key === 'Enter') {
+                                event.preventDefault();
+                                enterEntry(entry);
+                              } else if (event.key === ' ') {
+                                event.preventDefault();
+                                toggleSelection(entry.name);
+                              }
+                            }}
                             onclick={(event) => handleEntryClick(event, entry)}
                             ondblclick={() => enterEntry(entry)}
                             oncontextmenu={(event) => openContextMenu(event, entry)}
@@ -2269,14 +2581,28 @@
                               {/if}
                             </td>
                             <td class="size" title={entrySizeError(entry)}>{entrySize(entry)}</td>
-                            <td class="modified">{formatRelativeDate(entry.modified)}</td>
+                            <td class="modified" title={absoluteDate(entry.modified)}>{formatRelativeDate(entry.modified)}</td>
                             <td class="actions">
+                              {#if isAudioName(entry.name)}
+                                <button
+                                  type="button"
+                                  class="row-action"
+                                  aria-label={t($language, '播放')}
+                                  title={t($language, '播放')}
+                                  onclick={(event) => {
+                                    event.stopPropagation();
+                                    startAudio(entry);
+                                  }}
+                                >
+                                  <Icon name="play" size={16} />
+                                </button>
+                              {/if}
                               <button
                                 type="button"
                                 class="row-action"
                                 aria-label={t($language, '删除 {name}', { name: entry.name })}
                                 title={t($language, '删除')}
-                                disabled={!activeRoot || activeRoot.read_only}
+                                disabled={!activeRoot || currentReadOnly}
                                 onclick={(event) => {
                                   event.stopPropagation();
                                   void deleteEntry(entry);
@@ -2370,7 +2696,7 @@
                             ></span
                           >
                           <span class="card-meta">
-                            {entrySize(entry)} · {formatRelativeDate(entry.modified)}
+                            <span title={absoluteDate(entry.modified)}>{entrySize(entry)} · {formatRelativeDate(entry.modified)}</span>
                           </span>
                         </div>
                       {/each}
@@ -2433,7 +2759,7 @@
                                 src={api.thumbUrl(
                                   activeRootId,
                                   joinPath(currentPath, entry.name),
-                                  240,
+                                  320,
                                 )}
                                 alt=""
                                 loading="lazy"
@@ -2449,7 +2775,7 @@
                               ></span
                             >
                             <span class="tile-meta">
-                              {entrySize(entry)} · {formatRelativeDate(entry.modified)}
+                              <span title={absoluteDate(entry.modified)}>{entrySize(entry)} · {formatRelativeDate(entry.modified)}</span>
                             </span>
                           </span>
                         </div>
@@ -2499,26 +2825,35 @@
   {#if contextMenu}
     <div
       class="context-menu"
+      class:open-left={contextMenuLeft}
+      class:open-up={contextMenuUp}
+      bind:this={contextMenuElement}
       role="menu"
       tabindex="-1"
       style={`left:${contextMenu.x}px;top:${contextMenu.y}px`}
       onclick={(event) => event.stopPropagation()}
-      onkeydown={(event) => {
-        if (event.key === 'Escape') contextMenu = null;
-      }}
+      onkeydown={menuKeydown}
     >
       {#if canPreviewEntry(contextMenu.entry)}
         <button type="button" role="menuitem" onclick={() => runContextAction('preview')}
           >{t($language, '预览')}</button
         >
       {/if}
+      {#if !contextMenu.entry.is_dir && isAudioName(contextMenu.entry.name)}
+        <button type="button" role="menuitem" onclick={() => runContextAction('play')}
+          >{t($language, '播放')}</button
+        >
+      {/if}
+      <button type="button" role="menuitem" onclick={() => runContextAction('properties')}
+        >{t($language, '详情')}</button
+      >
       <button type="button" role="menuitem" onclick={() => runContextAction('download')}
         >{t($language, '下载')}</button
       >
       <button type="button" role="menuitem" onclick={() => runContextAction('share')}
         >{t($language, '分享')}</button
       >
-      {#if !activeRoot?.read_only}
+      {#if !currentReadOnly}
         <button type="button" role="menuitem" onclick={() => runContextAction('rename')}
           >{t($language, '重命名')}</button
         >
@@ -2526,63 +2861,72 @@
       <button type="button" role="menuitem" onclick={() => runContextAction('copy-to')}
         >{t($language, '复制到…')}</button
       >
-      <button type="button" role="menuitem" onclick={() => runContextAction('move-to')}
-        >{t($language, '移动到…')}</button
-      >
+      {#if !currentReadOnly}
+        <button type="button" role="menuitem" onclick={() => runContextAction('move-to')}
+          >{t($language, '移动到…')}</button
+        >
+      {/if}
       <div class="menu-sep"></div>
-      <button
-        type="button"
-        role="menuitem"
-        class="danger"
-        onclick={() => runContextAction('delete')}>{t($language, '删除')}</button
-      >
+      {#if currentReadOnly}
+        <button type="button" role="menuitem" class="danger" disabled
+          >{t($language, '删除')}</button
+        >
+      {:else}
+        <button
+          type="button"
+          role="menuitem"
+          class="danger"
+          onclick={() => runContextAction('delete')}>{t($language, '删除')}</button
+        >
+      {/if}
     </div>
   {/if}
 
   {#if blankMenu}
     <div
       class="context-menu"
-      class:open-left={blankMenu.x > window.innerWidth / 2}
+      class:open-left={blankMenuLeft}
+      class:open-up={blankMenuUp}
+      bind:this={blankMenuElement}
       role="menu"
       tabindex="-1"
       style={`left:${blankMenu.x}px;top:${blankMenu.y}px`}
       onclick={(event) => event.stopPropagation()}
-      onkeydown={(event) => {
-        if (event.key === 'Escape') blankMenu = null;
-      }}
+      onkeydown={menuKeydown}
     >
-      {#if !activeRoot?.read_only}
-        <button
-          type="button"
-          role="menuitem"
-          onclick={() => {
-            blankMenu = null;
-            openMkdir();
-          }}>{t($language, '新建目录')}</button
-        >
-        <button
-          type="button"
-          role="menuitem"
-          onclick={() => {
-            blankMenu = null;
-            nameDialog = {
-              mode: 'touch',
-              entry: null,
-              title: t($language, '新建文件'),
-              label: t($language, '文件名称'),
-              initialValue: '',
-            };
-          }}>{t($language, '新建文件')}</button
-        >
-        <button
-          type="button"
-          role="menuitem"
-          onclick={() => {
-            blankMenu = null;
-            folderUploadClick();
-          }}>{t($language, '上传目录')}</button
-        >
-      {/if}
+      <button
+        type="button"
+        role="menuitem"
+        disabled={currentReadOnly}
+        onclick={() => {
+          blankMenu = null;
+          openMkdir();
+        }}>{t($language, '新建目录')}</button
+      >
+      <button
+        type="button"
+        role="menuitem"
+        disabled={currentReadOnly}
+        onclick={() => {
+          blankMenu = null;
+          nameDialog = {
+            mode: 'touch',
+            entry: null,
+            title: t($language, '新建文件'),
+            label: t($language, '文件名称'),
+            initialValue: '',
+          };
+        }}>{t($language, '新建文件')}</button
+      >
+      <button
+        type="button"
+        role="menuitem"
+        disabled={currentReadOnly}
+        onclick={() => {
+          blankMenu = null;
+          folderUploadClick();
+        }}>{t($language, '上传目录')}</button
+      >
       <button
         type="button"
         role="menuitem"
@@ -2725,14 +3069,16 @@
     />
   {/if}
 
-  {#if shareTarget && activeRootId !== null}
+  {#if shareTargets && shareTargets.length > 0 && activeRootId !== null}
     <ShareDialog
       root={activeRootId}
-      path={joinPath(currentPath, shareTarget.name)}
-      name={shareTarget.name}
-      isDir={shareTarget.is_dir}
+      paths={shareTargets.map((entry) => joinPath(currentPath, entry.name))}
+      name={shareTargets.length === 1
+        ? (shareTargets[0]?.name ?? '')
+        : t($language, '分享 {count} 个文件', { count: shareTargets.length })}
+      isDir={shareTargets.length === 1 ? (shareTargets[0]?.is_dir ?? false) : false}
       {csrf}
-      onClose={() => (shareTarget = null)}
+      onClose={() => (shareTargets = null)}
     />
   {/if}
 
@@ -2823,6 +3169,17 @@
   {/if}
 {/if}
 
+<AudioPlayer />
+
+{#if properties}
+  <PropertiesDialog
+    data={properties.data}
+    loading={properties.loading}
+    error={properties.error}
+    onClose={() => (properties = null)}
+  />
+{/if}
+
 <style>
   .boot-screen {
     display: grid;
@@ -2868,6 +3225,13 @@
     overflow-y: auto;
     padding: 12px;
     background: var(--surface);
+  }
+
+  .brand-mark img {
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    object-fit: cover;
   }
 
   .brand-mark {
@@ -2954,6 +3318,17 @@
   .upload-top:disabled,
   .upload-primary:disabled {
     opacity: 0.5;
+  }
+
+  .upload-top.inactive,
+  .upload-primary.inactive {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  .upload-top.inactive:hover,
+  .upload-primary.inactive:hover {
+    filter: none;
   }
 
   .nav {
@@ -3252,6 +3627,16 @@
 
   .path-link:hover {
     color: var(--text);
+  }
+
+  .readonly-tag {
+    flex: 0 0 auto;
+    padding: 1px 6px;
+    border-radius: 99px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-family: var(--font-ui);
+    font-size: 12px;
   }
 
   .content {
@@ -3726,6 +4111,8 @@
     position: fixed;
     z-index: 55;
     display: flex;
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
     min-width: 160px;
     flex-direction: column;
     padding: 5px;
@@ -3775,12 +4162,19 @@
     left: auto;
   }
 
+  .context-menu.open-up .submenu {
+    top: auto;
+    bottom: 0;
+  }
+
   .submenu {
     position: absolute;
     top: 0;
     left: calc(100% - 2px);
     z-index: 56;
     display: none;
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
     min-width: 150px;
     flex-direction: column;
     padding: 5px;

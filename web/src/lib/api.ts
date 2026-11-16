@@ -59,6 +59,7 @@ export interface Root {
 }
 
 export interface Entry {
+  item_id?: number;
   name: string;
   is_dir: boolean;
   is_symlink: boolean;
@@ -72,6 +73,7 @@ export interface Entry {
 export interface ListResponse {
   root: Root;
   path: string;
+  read_only: boolean;
   entries: Entry[];
   next_cursor: string | null;
 }
@@ -92,6 +94,8 @@ export interface ServerPath {
 
 export interface ShareInfo {
   id: number;
+  kind?: 'single' | 'collection';
+  item_count?: number;
   real_path: string;
   is_dir: boolean;
   has_password: boolean;
@@ -197,21 +201,50 @@ export interface FileContent {
 }
 
 export interface ShareEntry {
+  item_id?: number;
   name: string;
   is_dir: boolean;
   is_symlink: boolean;
   size: number;
   modified: number;
+  created_at?: number;
+  mime_type?: string;
+  has_preview?: boolean;
 }
 
 export interface ShareMeta {
+  collection?: boolean;
   name: string;
   path: string;
   is_dir: boolean;
   read_only: boolean;
   size?: number;
   modified?: number;
+  mime_type?: string;
+  has_preview?: boolean;
   entries?: ShareEntry[];
+  next_cursor?: string | null;
+}
+
+export interface FileProperties {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  is_symlink: boolean;
+  symlink_state?: 'ok' | 'broken' | 'denied';
+  symlink_target?: string | null;
+  mime_type: string;
+  size: number;
+  created?: number | null;
+  modified?: number | null;
+  accessed?: number | null;
+  mode?: string;
+  image?: {
+    width: number;
+    height: number;
+    format: string;
+    exif?: Record<string, string | number>;
+  } | null;
 }
 
 export interface SearchEntry {
@@ -376,6 +409,11 @@ export const api = {
     return request<ListResponse>(`/list?${query.toString()}`, { signal });
   },
 
+  properties(root: number, path: string): Promise<FileProperties> {
+    const query = new URLSearchParams({ root: String(root), path });
+    return request<FileProperties>(`/properties?${query.toString()}`);
+  },
+
   dirSize(root: number, path: string, signal?: AbortSignal): Promise<DirSizeInfo> {
     const query = new URLSearchParams({ root: String(root), path });
     return request<DirSizeInfo>(`/fs/dir-size?${query.toString()}`, { signal });
@@ -386,17 +424,46 @@ export const api = {
     return `${BASE}/download?${query.toString()}`;
   },
 
-  thumbUrl(root: number, path: string, width = 256): string {
+  thumbUrl(root: number, path: string, width = 256, version?: number): string {
     const query = new URLSearchParams({
       root: String(root),
       path,
       w: String(width),
     });
+    if (version !== undefined) query.set('v', String(version));
     return `${BASE}/thumb?${query.toString()}`;
   },
 
-  async publicShare(token: string, path: string, ticket?: string): Promise<ShareMeta> {
-    const query = new URLSearchParams({ path });
+  thumbStatus(
+    root: number,
+    path: string,
+    width = 320,
+  ): Promise<{
+    state: 'ready' | 'failed' | 'missing';
+    reason?: string | null;
+    message?: string | null;
+  }> {
+    const query = new URLSearchParams({ root: String(root), path, w: String(width) });
+    return request(`/thumb/status?${query.toString()}`);
+  },
+
+  retryThumb(root: number, path: string, width: number, csrf: string): Promise<{ cleared: number }> {
+    return request(
+      '/thumb/retry',
+      { method: 'POST', body: JSON.stringify({ root, path, w: width }) },
+      csrf,
+    );
+  },
+
+  async publicShare(
+    token: string,
+    path: string,
+    ticket?: string,
+    cursor?: string,
+    limit = 200,
+  ): Promise<ShareMeta> {
+    const query = new URLSearchParams({ path, limit: String(limit) });
+    if (cursor) query.set('cursor', cursor);
     const headers = new Headers({ Accept: 'application/json' });
     if (ticket) headers.set('X-Share-Ticket', ticket);
     const response = await fetch(`${BASE}/public/shares/${token}?${query.toString()}`, {
@@ -434,6 +501,131 @@ export const api = {
     });
     if (!response.ok) throw await apiErrorFromResponse(response);
     return response.json() as Promise<{ name: string }>;
+  },
+
+  publicZipFormUrl(token: string): string {
+    return `${BASE}/public/shares/${token}/zip/form`;
+  },
+
+  publicThumbUrl(
+    token: string,
+    path: string,
+    width = 320,
+    ticket?: string,
+    item?: number,
+  ): string {
+    const query = new URLSearchParams({ path, w: String(width) });
+    if (ticket) query.set('ticket', ticket);
+    if (item !== undefined) query.set('item', String(item));
+    return `${BASE}/public/shares/${token}/thumb?${query.toString()}`;
+  },
+
+  publicDownloadUrl(
+    token: string,
+    path: string,
+    ticket?: string,
+    inline = false,
+    item?: number,
+  ): string {
+    const query = new URLSearchParams({ path });
+    if (ticket) query.set('ticket', ticket);
+    if (inline) query.set('inline', 'true');
+    if (item !== undefined) query.set('item', String(item));
+    return `${BASE}/public/shares/${token}/download?${query.toString()}`;
+  },
+
+  publicZipPreflight(
+    token: string,
+    payload: { path?: string; paths?: string[]; item_ids?: number[]; ticket?: string },
+  ): Promise<{
+    allowed: boolean;
+    files?: number;
+    bytes?: number;
+    message?: string;
+    max_bytes: number;
+    max_files: number;
+  }> {
+    return request(`/public/shares/${token}/zip/preflight`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  createShareUpload(
+    token: string,
+    payload: {
+      path: string;
+      filename: string;
+      total_size: number;
+      chunk_size?: number;
+      ticket?: string;
+    },
+  ): Promise<{ upload_id: string; chunk_size: number; chunks: number; expires_at: number }> {
+    return request(`/public/shares/${token}/uploads`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  shareUploadStatus(
+    token: string,
+    id: string,
+    ticket?: string,
+  ): Promise<{
+    upload_id: string;
+    received: number;
+    total_size: number;
+    chunks: number;
+    received_chunks: number[];
+    expires_at: number;
+  }> {
+    const query = new URLSearchParams();
+    if (ticket) query.set('ticket', ticket);
+    return request(`/public/shares/${token}/uploads/${id}?${query.toString()}`);
+  },
+
+  async uploadShareChunk(
+    token: string,
+    id: string,
+    index: number,
+    chunk: Blob,
+    ticket?: string,
+  ): Promise<{ received: number; chunk: number }> {
+    const query = new URLSearchParams();
+    if (ticket) query.set('ticket', ticket);
+    const response = await fetch(
+      `${BASE}/public/shares/${token}/uploads/${id}/chunks/${index}?${query.toString()}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunk,
+      },
+    );
+    if (!response.ok) throw await apiErrorFromResponse(response);
+    return response.json() as Promise<{ received: number; chunk: number }>;
+  },
+
+  completeShareUpload(
+    token: string,
+    id: string,
+    ticket?: string,
+  ): Promise<{ name: string }> {
+    const query = new URLSearchParams();
+    if (ticket) query.set('ticket', ticket);
+    return request(`/public/shares/${token}/uploads/${id}/complete?${query.toString()}`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+  },
+
+  async cancelShareUpload(token: string, id: string, ticket?: string): Promise<void> {
+    const query = new URLSearchParams();
+    if (ticket) query.set('ticket', ticket);
+    const response = await fetch(
+      `${BASE}/public/shares/${token}/uploads/${id}?${query.toString()}`,
+      { method: 'DELETE' },
+    );
+    if (!response.ok) throw await apiErrorFromResponse(response);
   },
 
   async downloadShared(token: string, path: string, ticket?: string): Promise<Blob> {
@@ -758,7 +950,8 @@ export const api = {
   createShare(
     payload: {
       root: number;
-      path: string;
+      path?: string;
+      paths?: string[];
       password?: string;
       expires_at?: number | null;
       read_only?: boolean;
@@ -1003,7 +1196,13 @@ export const api = {
     );
   },
 
-  async uploadChunk(uploadId: string, index: number, chunk: Blob, csrf: string): Promise<void> {
+  async uploadChunk(
+    uploadId: string,
+    index: number,
+    chunk: Blob,
+    csrf: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const response = await fetch(`${BASE}/uploads/${uploadId}/chunks/${index}`, {
       method: 'PUT',
       credentials: 'include',
@@ -1012,11 +1211,42 @@ export const api = {
         'X-CSRF-Token': csrf,
       },
       body: chunk,
+      signal,
     });
 
     if (!response.ok) {
       throw await apiErrorFromResponse(response);
     }
+  },
+
+  async uploadBrandingIcon(
+    file: File,
+    csrf: string,
+  ): Promise<{ version: number; icon_url: string }> {
+    const response = await fetch(`${BASE}/admin/branding/icon`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': file.type || 'application/octet-stream',
+        'X-CSRF-Token': csrf,
+      },
+      body: file,
+    });
+    if (!response.ok) throw await apiErrorFromResponse(response);
+    return response.json() as Promise<{ version: number; icon_url: string }>;
+  },
+
+  deleteBrandingIcon(csrf: string): Promise<{ deleted: boolean }> {
+    return request('/admin/branding/icon', { method: 'DELETE' }, csrf);
+  },
+
+  async cancelUpload(uploadId: string, csrf: string): Promise<void> {
+    const response = await fetch(`${BASE}/uploads/${uploadId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+      headers: { 'X-CSRF-Token': csrf },
+    });
+    if (!response.ok) throw await apiErrorFromResponse(response);
   },
 
   completeUpload(uploadId: string, csrf: string): Promise<{ path: string; size: number }> {

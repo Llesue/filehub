@@ -1,9 +1,10 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderName, HeaderValue, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -33,6 +34,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(web::serve_static)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            resolve_client_ip,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), slow_request))
         .layer(CatchPanicLayer::new())
         .layer(SetResponseHeaderLayer::overriding(
@@ -70,6 +75,29 @@ async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+async fn resolve_client_ip(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let header = HeaderName::from_static(crate::auth::CLIENT_IP_HEADER);
+    // Never trust a client-supplied value for the internal header.
+    request.headers_mut().remove(&header);
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    if let Some(peer) = peer {
+        let trusted = &state.settings().settings.security.trusted_proxies;
+        if let Some(ip) = crate::auth::resolve_client_ip(peer, request.headers(), trusted)
+            && let Ok(value) = HeaderValue::from_str(&ip)
+        {
+            request.headers_mut().insert(header, value);
+        }
+    }
+    next.run(request).await
 }
 
 async fn slow_request(
@@ -141,11 +169,19 @@ pub async fn run_until(
     );
     state.start_background_tasks();
     let serve_state = Arc::clone(&state);
-    axum::serve(listener, router(serve_state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("http server failed")?;
+    axum::serve(
+        listener,
+        router(serve_state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("http server failed")?;
     state.flush_audit().await;
+    match state.db.checkpoint().await {
+        Ok(true) => tracing::warn!("shutdown WAL checkpoint was busy"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "shutdown WAL checkpoint failed"),
+    }
 
     Ok(())
 }

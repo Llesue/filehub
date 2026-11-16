@@ -10,6 +10,9 @@
     index,
     onClose,
     onIndexChange,
+    srcFor,
+    thumbSrcFor,
+    downloadHref,
   }: {
     root: number;
     currentPath: string;
@@ -17,6 +20,9 @@
     index: number;
     onClose: () => void;
     onIndexChange: (index: number) => void;
+    srcFor?: (entry: Entry) => string;
+    thumbSrcFor?: (entry: Entry) => string;
+    downloadHref?: (entry: Entry) => string;
   } = $props();
 
   let current = $derived(items[index]);
@@ -25,13 +31,15 @@
   let offsetY = $state(0);
   let showOriginal = $state(false);
   let imageFallback = $state(false);
+  let previewFailed = $state(false);
   let dragging = false;
   let dragged = false;
   let dragStart = { x: 0, y: 0, offsetX: 0, offsetY: 0 };
+  let entryPath = $derived(
+    current ? (currentPath ? `${currentPath}/${current.name}` : current.name) : '',
+  );
   let url = $derived(
-    current
-      ? api.previewUrl(root, currentPath ? `${currentPath}/${current.name}` : current.name)
-      : '',
+    current ? (srcFor ? srcFor(current) : api.previewUrl(root, entryPath)) : '',
   );
 
   function resetView(): void {
@@ -40,6 +48,7 @@
     offsetY = 0;
     showOriginal = false;
     imageFallback = false;
+    previewFailed = false;
   }
 
   function previous(): void {
@@ -150,15 +159,21 @@
         <audio src={url} controls autoplay onclick={(event) => event.stopPropagation()}></audio>
       {:else if isPdf(current.name)}
         <iframe class="lightbox-document" src={url} title={current.name}></iframe>
+      {:else if previewFailed}
+        <div class="preview-failure" role="alert" onclick={(event) => event.stopPropagation()}>
+          <p>{t($language, '图片过大，无法预览')}</p>
+          <a
+            href={downloadHref ? downloadHref(current) : api.downloadUrl(root, entryPath)}
+            download>{t($language, '下载原图')}</a
+          >
+        </div>
       {:else}
         <img
           src={showOriginal || imageFallback
             ? url
-            : api.previewThumbUrl(
-                root,
-                currentPath ? `${currentPath}/${current.name}` : current.name,
-                2048,
-              )}
+            : thumbSrcFor
+              ? thumbSrcFor(current)
+              : api.previewThumbUrl(root, entryPath, 2048)}
           alt={current.name}
           style={`transform:translate(${offsetX}px, ${offsetY}px) scale(${zoom})`}
           onclick={(event) => {
@@ -168,7 +183,10 @@
           onpointerdown={startDrag}
           onpointerup={endDrag}
           onpointercancel={endDrag}
-          onerror={() => (imageFallback = true)}
+          onerror={() => {
+            if (showOriginal || imageFallback) previewFailed = true;
+            else imageFallback = true;
+          }}
         />
       {/if}
     {/if}
@@ -249,6 +267,23 @@
     width: 36px;
     padding: 0;
     place-items: center;
+  }
+
+  .preview-failure {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 24px;
+    color: var(--lightbox-fg);
+    text-align: center;
+  }
+
+  .preview-failure a {
+    padding: 6px 14px;
+    border: 1px solid rgb(255 255 255 / 24%);
+    border-radius: var(--radius-sm);
+    color: inherit;
   }
 
   .lightbox-stage {

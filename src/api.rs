@@ -56,9 +56,14 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/audit", get(crate::admin_fs::list_audit))
         .route("/admin/settings", get(get_settings).put(put_setting))
         .route("/admin/settings/{key}", delete(delete_setting))
+        .route(
+            "/admin/branding/icon",
+            post(crate::branding::upload_icon).delete(crate::branding::delete_icon),
+        )
         .route("/roots", get(crate::files::roots))
         .route("/list", get(crate::files::list))
         .route("/fs/dir-size", get(crate::files::dir_size))
+        .route("/properties", get(crate::properties::properties))
         .route("/download", get(crate::files::download))
         .route("/download/zip", post(crate::files::zip))
         .route("/index", post(crate::search::index))
@@ -68,6 +73,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/file/probe", get(crate::editor::probe))
         .route("/file", get(crate::editor::read).put(crate::editor::save))
         .route("/thumb", get(crate::thumbs::thumb))
+        .route("/thumb/status", get(crate::thumbs::status))
+        .route("/thumb/retry", post(crate::thumbs::retry))
         .route("/cmd", post(crate::cmdrunner::run))
         .route("/terminal/ws", get(crate::terminal_ws::websocket))
         .route(
@@ -87,8 +94,37 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(crate::shares::download),
         )
         .route("/public/shares/{token}/upload", post(crate::shares::upload))
+        .route("/public/shares/{token}/thumb", get(crate::shares::thumb))
+        .route(
+            "/public/shares/{token}/uploads",
+            post(crate::shares::create_upload),
+        )
+        .route(
+            "/public/shares/{token}/uploads/{id}",
+            get(crate::shares::upload_status).delete(crate::shares::cancel_upload),
+        )
+        .route(
+            "/public/shares/{token}/uploads/{id}/chunks/{index}",
+            put(crate::shares::upload_chunk),
+        )
+        .route(
+            "/public/shares/{token}/uploads/{id}/complete",
+            post(crate::shares::complete_upload),
+        )
+        .route("/public/shares/{token}/zip", post(crate::shares::zip))
+        .route(
+            "/public/shares/{token}/zip/form",
+            post(crate::shares::zip_form),
+        )
+        .route(
+            "/public/shares/{token}/zip/preflight",
+            post(crate::shares::zip_preflight),
+        )
         .route("/uploads", post(crate::files::create_upload))
-        .route("/uploads/{id}", get(crate::files::upload_status))
+        .route(
+            "/uploads/{id}",
+            get(crate::files::upload_status).delete(crate::files::cancel_upload),
+        )
         .route(
             "/uploads/{id}/chunks/{index}",
             put(crate::files::upload_chunk),
@@ -138,6 +174,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
         ))
+        .merge(crate::branding::public_router())
 }
 
 async fn require_initialized(
@@ -810,6 +847,7 @@ async fn put_setting(
         .await
         .map_err(AppError::internal)?;
     state.reload_settings().await.map_err(AppError::internal)?;
+    clear_dir_size_cache_if_needed(&state, &request.key).await;
 
     audit(
         &state,
@@ -843,6 +881,7 @@ async fn delete_setting(
         .await
         .map_err(AppError::internal)?;
     state.reload_settings().await.map_err(AppError::internal)?;
+    clear_dir_size_cache_if_needed(&state, &key).await;
 
     audit(
         &state,
@@ -855,6 +894,14 @@ async fn delete_setting(
     .await;
 
     Ok(Json(settings_json(&state)))
+}
+
+async fn clear_dir_size_cache_if_needed(state: &Arc<AppState>, key: &str) {
+    if key == "jobs.dir_size_use_logical"
+        && let Err(error) = state.db.clear_directory_sizes().await
+    {
+        tracing::warn!(%error, "failed to clear directory size cache after mode change");
+    }
 }
 
 async fn session_response(

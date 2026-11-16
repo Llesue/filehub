@@ -1,5 +1,6 @@
 <script lang="ts">
   import { language, t } from '../i18n';
+  import { focusTrap } from '../focusTrap';
 
   let {
     open,
@@ -46,6 +47,10 @@
       class="confirm-panel"
       aria-labelledby="confirm-title"
       onclick={(event) => event.stopPropagation()}
+      use:focusTrap
+      onkeydown={(event) => {
+        if (event.key === 'Escape') onCancel();
+      }}
     >
       <form
         onsubmit={(event) => {

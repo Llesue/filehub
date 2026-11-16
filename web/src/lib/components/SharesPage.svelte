@@ -17,9 +17,17 @@
   let deleteTarget = $state<ShareInfo | null>(null);
   let passwordEditId = $state<number | null>(null);
   let passwordDraft = $state('');
+  let refreshing = $state(false);
+  let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
   function fileName(path: string): string {
     return path.split(/[\\/]/).pop() ?? path;
+  }
+
+  function shareLabel(share: ShareInfo): string {
+    return share.kind === 'collection'
+      ? t($language, '{count} 个文件', { count: share.item_count ?? 0 })
+      : fileName(share.real_path);
   }
 
   async function load(cursor?: string): Promise<void> {
@@ -37,14 +45,49 @@
     }
   }
 
+  async function refresh(): Promise<void> {
+    if (loading || loadingMore || refreshing || document.visibilityState === 'hidden') return;
+    refreshing = true;
+    try {
+      const limit = Math.min(Math.max(shares.length, 100), 200);
+      const result = await api.listShares(undefined, limit);
+      if (shares.length <= 200) {
+        shares = result.shares;
+        nextCursor = result.next_cursor;
+      } else {
+        // Keep already loaded pages; update the first page in place and add new shares.
+        const updates = new Map(result.shares.map((share) => [share.id, share]));
+        const known = new Set(shares.map((share) => share.id));
+        const added = result.shares.filter((share) => !known.has(share.id));
+        shares = [...added, ...shares.map((share) => updates.get(share.id) ?? share)];
+      }
+    } catch (error) {
+      console.warn('share list refresh failed', error);
+    } finally {
+      refreshing = false;
+    }
+  }
+
   onMount(() => {
     void load();
     const onScroll = (): void => {
       if (!sentinel || !nextCursor || loadingMore) return;
       if (sentinel.getBoundingClientRect().top < window.innerHeight + 160) void load(nextCursor);
     };
+    const onFocus = (): void => void refresh();
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
     window.addEventListener('scroll', onScroll, true);
-    return () => window.removeEventListener('scroll', onScroll, true);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    refreshTimer = setInterval(() => void refresh(), 15_000);
+    return () => {
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (refreshTimer) clearInterval(refreshTimer);
+    };
   });
 
   async function update(
@@ -108,7 +151,7 @@
         <article class="share-card" class:revoked={share.revoked}>
           <div class="share-head">
             <FileTypeIcon name={fileName(share.real_path)} isDir={share.is_dir} size={24} />
-            <strong>{fileName(share.real_path)}</strong>
+            <strong>{shareLabel(share)}</strong>
             <div class="share-actions">
               {#if passwordEditId === share.id}
                 <form
