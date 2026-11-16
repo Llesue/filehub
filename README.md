@@ -44,19 +44,19 @@ make build
 sudo install -m 0755 target/x86_64-unknown-linux-musl/release/filehub /usr/local/bin/filehub
 ```
 
-Create the service user and configuration (all state lives under `/home/filehub`):
+Create the service user, configuration, and data directories. The config stays in `/etc/filehub`, while FileHub state lives under `/home/filehub`:
 
 ```bash
 sudo useradd --system --create-home --home-dir /home/filehub --shell /usr/sbin/nologin filehub
-sudo mkdir -p /home/filehub/users /home/filehub/cache
-sudo cp config.example.json /home/filehub/config.json
+sudo mkdir -p /etc/filehub /home/filehub/users /home/filehub/cache
+sudo cp config.example.json /etc/filehub/config.json
 sudo chown -R filehub:filehub /home/filehub
 ```
 
 Run in the foreground:
 
 ```bash
-filehub --config /home/filehub/config.json
+filehub --config /etc/filehub/config.json
 ```
 
 Or use systemd:
@@ -70,7 +70,7 @@ After=network.target
 User=filehub
 Group=filehub
 WorkingDirectory=/home/filehub
-ExecStart=/usr/local/bin/filehub --config /home/filehub/config.json
+ExecStart=/usr/local/bin/filehub --config /etc/filehub/config.json
 Restart=on-failure
 RestartSec=3
 

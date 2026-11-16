@@ -8,7 +8,7 @@ pub fn default_config_path() -> PathBuf {
 
 #[cfg(not(windows))]
 pub fn default_config_path() -> PathBuf {
-    PathBuf::from("/home/filehub/config.json")
+    PathBuf::from("/etc/filehub/config.json")
 }
 
 #[cfg(windows)]
