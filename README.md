@@ -6,7 +6,7 @@ FileHub is a self-hosted file manager built around a single executable. It gives
 
 The web UI is a Svelte 5 SPA embedded into the Rust binary. Data lives in SQLite (compiled in with `rusqlite`) and the filesystem. A release build is one static Linux binary; Windows builds use the same codebase and produce a separate `filehub.exe`.
 
-![FileHub main interface](docs/assets/filehub-main.png)
+![FileHub main interface](docs/assets/filehub-main-v2.png)
 
 ## Features
 
