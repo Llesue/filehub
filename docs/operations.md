@@ -3,10 +3,13 @@
 ## 部署
 
 ```bash
-make build
-sudo install -m 0755 target/x86_64-unknown-linux-musl/release/filehub /usr/local/bin/filehub
-sudo mkdir -p /etc/filehub /var/lib/filehub /var/cache/filehub /srv/filehub/users
-sudo cp config.example.json /etc/filehub/config.json
+# 推荐从 GitHub Releases 下载对应架构的静态二进制；也可在源码目录执行 make build。
+chmod +x filehub-*-x86_64-unknown-linux-musl
+sudo install -m 0755 filehub-*-x86_64-unknown-linux-musl /usr/local/bin/filehub
+sudo useradd --system --create-home --home-dir /home/filehub --shell /usr/sbin/nologin filehub
+sudo mkdir -p /home/filehub/users /home/filehub/cache
+sudo cp config.example.json /home/filehub/config.json
+sudo chown -R filehub:filehub /home/filehub
 ```
 
 使用专用非 root 用户运行，确保 `users_root`、`db_path` 父目录、`cache_dir` 可写。
@@ -21,7 +24,8 @@ After=network.target
 [Service]
 User=filehub
 Group=filehub
-ExecStart=/usr/local/bin/filehub --config /etc/filehub/config.json
+WorkingDirectory=/home/filehub
+ExecStart=/usr/local/bin/filehub --config /home/filehub/config.json
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
@@ -51,13 +55,13 @@ FileHub 默认监听 HTTP，建议由 Caddy/Nginx 终止 TLS。反向代理需�
 SQLite 使用 WAL，不能只复制 `.db` 文件。推荐：
 
 ```bash
-sqlite3 /var/lib/filehub/filehub.db ".backup '/backup/filehub-$(date +%F).db'"
+sqlite3 /home/filehub/filehub.db ".backup '/backup/filehub-$(date +%F).db'"
 ```
 
 或：
 
 ```bash
-sqlite3 /var/lib/filehub/filehub.db "VACUUM INTO '/backup/filehub-$(date +%F).db'"
+sqlite3 /home/filehub/filehub.db "VACUUM INTO '/backup/filehub-$(date +%F).db'"
 ```
 
 恢复：停止服务 → 用备份替换 `db_path` → 删除旧 `-wal`/`-shm` → 启动。用户文件不在 DB 中，需单独用文件系统快照/rsync 备份 `users_root`。

@@ -29,7 +29,14 @@ FileHub 是一个单可执行文件的自托管文件管理器。它在浏览器
 
 ### Linux
 
-需要 Rust stable、Node.js 22+、pnpm 和用于 `rusqlite` 的 C 工具链。
+推荐直接从 [GitHub Releases](https://github.com/Llesue/filehub/releases) 下载静态发布版。按架构选择 `x86_64` 或 `aarch64` 的 musl 文件，先用对应的 `.sha256` 校验，再安装：
+
+```bash
+chmod +x filehub-*-x86_64-unknown-linux-musl
+sudo install -m 0755 filehub-*-x86_64-unknown-linux-musl /usr/local/bin/filehub
+```
+
+如果要从源码构建：
 
 ```bash
 make setup
@@ -37,17 +44,19 @@ make build
 sudo install -m 0755 target/x86_64-unknown-linux-musl/release/filehub /usr/local/bin/filehub
 ```
 
-准备配置：
+创建服务用户和配置（数据统一放在 `/home/filehub`）：
 
 ```bash
-sudo mkdir -p /etc/filehub /var/lib/filehub /var/cache/filehub /srv/filehub/users
-sudo cp config.example.json /etc/filehub/config.json
+sudo useradd --system --create-home --home-dir /home/filehub --shell /usr/sbin/nologin filehub
+sudo mkdir -p /home/filehub/users /home/filehub/cache
+sudo cp config.example.json /home/filehub/config.json
+sudo chown -R filehub:filehub /home/filehub
 ```
 
 前台运行：
 
 ```bash
-filehub --config /etc/filehub/config.json
+filehub --config /home/filehub/config.json
 ```
 
 systemd 示例：
@@ -60,8 +69,8 @@ After=network.target
 [Service]
 User=filehub
 Group=filehub
-WorkingDirectory=/var/lib/filehub
-ExecStart=/usr/local/bin/filehub --config /etc/filehub/config.json
+WorkingDirectory=/home/filehub
+ExecStart=/usr/local/bin/filehub --config /home/filehub/config.json
 Restart=on-failure
 RestartSec=3
 
@@ -73,7 +82,9 @@ WantedBy=multi-user.target
 
 ### Windows
 
-在 Linux 上交叉编译：
+推荐从 [GitHub Releases](https://github.com/Llesue/filehub/releases) 下载 Windows 可执行文件（`filehub-<version>-x86_64-pc-windows-msvc.exe`），校验对应的 `.sha256` 后复制到 `C:\Program Files\FileHub\filehub.exe`。
+
+如需在 Linux 上交叉编译：
 
 ```bash
 cargo install cargo-xwin --locked
@@ -116,9 +127,9 @@ Windows 索引优先使用 NTFS MFT，之后通过 USN Journal 做增量更新�
 ```json
 {
   "listen": "0.0.0.0:8080",
-  "db_path": "/var/lib/filehub/filehub.db",
-  "users_root": "/srv/filehub/users",
-  "cache_dir": "/var/cache/filehub"
+  "db_path": "/home/filehub/filehub.db",
+  "users_root": "/home/filehub/users",
+  "cache_dir": "/home/filehub/cache"
 }
 ```
 

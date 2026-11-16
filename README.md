@@ -29,7 +29,14 @@ Many years ago, on a WD My Cloud, I used FileBrowser for the first time and was 
 
 ### Linux
 
-Requirements: Rust stable, Node.js 22+, pnpm, and a C toolchain for `rusqlite`.
+The recommended way is to download a static release binary from [GitHub Releases](https://github.com/Llesue/filehub/releases). Choose the `x86_64` or `aarch64` musl build, verify it with the matching `.sha256`, then install it:
+
+```bash
+chmod +x filehub-*-x86_64-unknown-linux-musl
+sudo install -m 0755 filehub-*-x86_64-unknown-linux-musl /usr/local/bin/filehub
+```
+
+To build from source instead:
 
 ```bash
 make setup
@@ -37,17 +44,19 @@ make build
 sudo install -m 0755 target/x86_64-unknown-linux-musl/release/filehub /usr/local/bin/filehub
 ```
 
-Create a configuration:
+Create the service user and configuration (all state lives under `/home/filehub`):
 
 ```bash
-sudo mkdir -p /etc/filehub /var/lib/filehub /var/cache/filehub /srv/filehub/users
-sudo cp config.example.json /etc/filehub/config.json
+sudo useradd --system --create-home --home-dir /home/filehub --shell /usr/sbin/nologin filehub
+sudo mkdir -p /home/filehub/users /home/filehub/cache
+sudo cp config.example.json /home/filehub/config.json
+sudo chown -R filehub:filehub /home/filehub
 ```
 
 Run in the foreground:
 
 ```bash
-filehub --config /etc/filehub/config.json
+filehub --config /home/filehub/config.json
 ```
 
 Or use systemd:
@@ -60,8 +69,8 @@ After=network.target
 [Service]
 User=filehub
 Group=filehub
-WorkingDirectory=/var/lib/filehub
-ExecStart=/usr/local/bin/filehub --config /etc/filehub/config.json
+WorkingDirectory=/home/filehub
+ExecStart=/usr/local/bin/filehub --config /home/filehub/config.json
 Restart=on-failure
 RestartSec=3
 
@@ -73,7 +82,9 @@ The default address is `http://<host>:8080/`. On first start, FileHub prints a s
 
 ### Windows
 
-Cross-compile from Linux:
+Download the Windows executable from [GitHub Releases](https://github.com/Llesue/filehub/releases) (`filehub-<version>-x86_64-pc-windows-msvc.exe`), verify it with the matching `.sha256`, and copy it to `C:\Program Files\FileHub\filehub.exe`.
+
+To cross-compile from Linux instead:
 
 ```bash
 cargo install cargo-xwin --locked
@@ -116,9 +127,9 @@ The most important fields are:
 ```json
 {
   "listen": "0.0.0.0:8080",
-  "db_path": "/var/lib/filehub/filehub.db",
-  "users_root": "/srv/filehub/users",
-  "cache_dir": "/var/cache/filehub"
+  "db_path": "/home/filehub/filehub.db",
+  "users_root": "/home/filehub/users",
+  "cache_dir": "/home/filehub/cache"
 }
 ```
 

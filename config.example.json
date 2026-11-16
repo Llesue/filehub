@@ -1,8 +1,8 @@
 {
   "listen": "0.0.0.0:8080",
-  "db_path": "/var/lib/filehub/filehub.db",
-  "users_root": "/srv/filehub/users",
-  "cache_dir": "/var/cache/filehub",
+  "db_path": "/home/filehub/filehub.db",
+  "users_root": "/home/filehub/users",
+  "cache_dir": "/home/filehub/cache",
   "thumbnails": {
     "enabled": true,
     "workers": 2,
