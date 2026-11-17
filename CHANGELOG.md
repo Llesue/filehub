@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased (v0.1.4)
+## v0.1.4 - 2026-11-17
 
 ### Added
 
+- Directory sizes use stale-while-revalidate: the last known value is returned immediately and shown dimmed while a background refresh runs; failed refreshes keep the previous value.
+- A high-latency hint appears when startup or directory loading takes unusually long.
 - Persisted quick-scan overflow candidates (`pending_index_dirs`, migration `0016`) so a burst of new directories is indexed across subsequent scans instead of being dropped after 500 entries.
 - Read-only state for the current directory in list responses and public directory shares; the web UI greys out upload/write actions and shows a read-only breadcrumb label.
 - Public share grid/list with thumbnails, selection, download, double-click preview, ZIP download and chunked uploads with cancel/retry.
@@ -20,7 +22,8 @@
 
 ### Changed
 
-- View mode is now a global preference (`filehub.view`); switching directories keeps the selected list/thumbnail/tile layout, with old per-path values as fallback.
+- View mode is now a global preference (`filehub.view`); switching directories keeps the selected list/thumbnail/tile layout, with old per-path values as fallback. The saved mode is applied before the first directory request instead of after it returns.
+- Symlink state is shown as a chain icon before the file name (broken chain for broken or unreadable targets) instead of a badge on the file icon.
 - The first screen falls back to the browser language instead of always English; signed-in user preferences still win.
 - Share management refreshes on focus/visibility and every 15 seconds without reloading the page.
 - Admin root changes (assign/remove/permission/external path) refresh the sidebar immediately without resetting the current browse position.
@@ -35,6 +38,7 @@
 ### Fixed
 
 - Large JPEGs no longer return 404 because of the 50 MB/50 MP limits; damaged images report a reason instead of a broken tile.
+- The quota card no longer stays at “统计中…” on first load; usage is polled until the background calculation finishes.
 - Public directory shares no longer expose dotfiles or accept hidden paths for download/thumbnail/ZIP.
 - Read-only directory shares no longer show an upload button.
 - Short videos whose configured seek offset has no frame now fall back to the first frame instead of returning 404.

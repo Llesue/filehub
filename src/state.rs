@@ -177,6 +177,7 @@ impl AppState {
             db.clone(),
             snapshot.settings.jobs.io_workers,
             snapshot.settings.jobs.queue_max,
+            snapshot.settings.jobs.thumbnail_queue_max,
         );
         jobs.recover().await?;
         let (audit_tx, audit_rx) = tokio::sync::mpsc::channel::<AuditMessage>(1024);

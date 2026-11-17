@@ -229,6 +229,7 @@ impl Default for SecuritySettings {
 pub struct JobsSettings {
     pub io_workers: usize,
     pub queue_max: usize,
+    pub thumbnail_queue_max: usize,
     pub dir_size_ttl_seconds: u64,
     pub dir_size_error_retry_seconds: u64,
     pub usage_cache_seconds: u64,
@@ -243,6 +244,7 @@ impl Default for JobsSettings {
         Self {
             io_workers: 1,
             queue_max: 256,
+            thumbnail_queue_max: 64,
             dir_size_ttl_seconds: 300,
             dir_size_error_retry_seconds: 60,
             usage_cache_seconds: 45,
@@ -309,6 +311,9 @@ impl Settings {
         }
         if self.jobs.queue_max == 0 {
             bail!("jobs.queue_max must be greater than zero");
+        }
+        if self.jobs.thumbnail_queue_max == 0 {
+            bail!("jobs.thumbnail_queue_max must be greater than zero");
         }
         if self.index.scheduled_scans {
             if self.index.quick_scan_minutes == 0 {

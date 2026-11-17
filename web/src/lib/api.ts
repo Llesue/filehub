@@ -68,6 +68,8 @@ export interface Entry {
   created_at: number;
   mime_type: string;
   has_preview: boolean;
+  symlink_state?: 'ok' | 'broken' | 'denied';
+  symlink_target?: string | null;
 }
 
 export interface ListResponse {
@@ -189,6 +191,7 @@ export interface DirSizeInfo {
   indexed: boolean;
   partial?: boolean;
   stale?: boolean;
+  refreshing?: boolean;
   error?: string | null;
   job_id?: string | null;
 }
@@ -447,7 +450,12 @@ export const api = {
     return request(`/thumb/status?${query.toString()}`);
   },
 
-  retryThumb(root: number, path: string, width: number, csrf: string): Promise<{ cleared: number }> {
+  retryThumb(
+    root: number,
+    path: string,
+    width: number,
+    csrf: string,
+  ): Promise<{ cleared: number }> {
     return request(
       '/thumb/retry',
       { method: 'POST', body: JSON.stringify({ root, path, w: width }) },
@@ -507,13 +515,7 @@ export const api = {
     return `${BASE}/public/shares/${token}/zip/form`;
   },
 
-  publicThumbUrl(
-    token: string,
-    path: string,
-    width = 320,
-    ticket?: string,
-    item?: number,
-  ): string {
+  publicThumbUrl(token: string, path: string, width = 320, ticket?: string, item?: number): string {
     const query = new URLSearchParams({ path, w: String(width) });
     if (ticket) query.set('ticket', ticket);
     if (item !== undefined) query.set('item', String(item));
@@ -605,11 +607,7 @@ export const api = {
     return response.json() as Promise<{ received: number; chunk: number }>;
   },
 
-  completeShareUpload(
-    token: string,
-    id: string,
-    ticket?: string,
-  ): Promise<{ name: string }> {
+  completeShareUpload(token: string, id: string, ticket?: string): Promise<{ name: string }> {
     const query = new URLSearchParams();
     if (ticket) query.set('ticket', ticket);
     return request(`/public/shares/${token}/uploads/${id}/complete?${query.toString()}`, {

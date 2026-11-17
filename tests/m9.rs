@@ -725,3 +725,93 @@ async fn async_audit_writer_flushes_batches() {
     let entries = app.state.db.list_audit(20, None).await.unwrap();
     assert!(entries.iter().any(|entry| entry.action == "mkdir"));
 }
+
+#[tokio::test]
+async fn dir_size_serves_stale_value_while_refreshing() {
+    let app = setup_app().await;
+    let first = wait_dir_size(&app, "d1").await;
+    assert_eq!(first["status"], "ready");
+    assert_eq!(first["size"].as_u64().unwrap(), 12);
+
+    // Force the cached row to look outdated. The endpoint must keep returning
+    // the old value while the refresh job runs.
+    let real_path = app.home.join("d1").to_string_lossy().to_string();
+    app.state
+        .db
+        .set_directory_size(&real_path, "ready", 12, 1, None)
+        .await
+        .unwrap();
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/fs/dir-size?root={}&path=d1", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let stale = json_body(response).await;
+    assert_eq!(stale["status"], "ready");
+    assert_eq!(stale["stale"], true);
+    assert_eq!(stale["refreshing"], true);
+    assert_eq!(stale["size"].as_u64().unwrap(), 12);
+
+    for _ in 0..200 {
+        let response = send(
+            &app.router,
+            Method::GET,
+            &format!("/api/v1/fs/dir-size?root={}&path=d1", app.root_id),
+            Some(&app.cookie),
+            None,
+        )
+        .await;
+        let value = json_body(response).await;
+        if value["status"] == "ready" && value["stale"] == false {
+            assert_eq!(value["size"].as_u64().unwrap(), 12);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("refreshed directory size did not become fresh");
+}
+
+#[tokio::test]
+async fn directory_size_failures_keep_the_last_value() {
+    let app = setup_app().await;
+    let path = "/tmp/filehub-size-stale-fixture";
+    app.state
+        .db
+        .set_directory_size(path, "ready", 42, 1, None)
+        .await
+        .unwrap();
+
+    app.state.db.begin_directory_size(path, 2).await.unwrap();
+    let state = app
+        .state
+        .db
+        .directory_size_state(path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.0, "running");
+    assert_eq!(state.1, 42);
+    assert_eq!(state.2, 2);
+    assert!(state.5, "running refresh must keep has_value");
+
+    app.state
+        .db
+        .fail_directory_size(path, "error", 2, Some("boom"))
+        .await
+        .unwrap();
+    let state = app
+        .state
+        .db
+        .directory_size_state(path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.0, "error");
+    assert_eq!(state.1, 42);
+    assert!(state.5, "failed refresh must keep has_value");
+}

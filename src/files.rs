@@ -86,7 +86,9 @@ pub async fn list(
         .transpose()?
         .unwrap_or(0);
 
+    let has_symlinks = fsops::has_symlinks(&resolved.absolute);
     if !sort_by_size
+        && !has_symlinks
         && let Some((indexed_mtime, indexed_entries, has_more)) = state
             .db
             .indexed_children_page(&real_path, &sort, &order, show_hidden, offset, limit)
@@ -111,6 +113,8 @@ pub async fn list(
                         created_at: entry.created_at,
                         mime_type: entry.mime_type,
                         has_preview,
+                        symlink_state: None,
+                        symlink_target: None,
                     }
                 })
                 .collect();
@@ -1254,19 +1258,26 @@ pub async fn dir_size(
     let retry = settings.settings.jobs.dir_size_error_retry_seconds as i64;
     let now = unix_now();
 
-    if let Some((indexed_mtime, size, partial, status)) = state
+    let indexed_state = state
         .db
         .indexed_directory_state(&real_path)
         .await
-        .map_err(AppError::internal)?
-    {
-        if status == "ready" && !partial && indexed_mtime == mtime {
+        .map_err(AppError::internal)?;
+    let cached_state = state
+        .db
+        .directory_size_state(&real_path)
+        .await
+        .map_err(AppError::internal)?;
+
+    if let Some((indexed_mtime, size, partial, status)) = &indexed_state {
+        if status == "ready" && !partial && *indexed_mtime == mtime {
             return Ok(Json(json!({
                 "status": "ready",
                 "size": size,
                 "indexed": true,
                 "partial": false,
                 "stale": false,
+                "refreshing": false,
                 "error": null,
             })));
         }
@@ -1275,43 +1286,71 @@ pub async fn dir_size(
         }
     }
 
-    if let Some((status, size, cached_mtime, error, updated_at)) = state
-        .db
-        .directory_size_state(&real_path)
-        .await
-        .map_err(AppError::internal)?
-    {
-        if status == "ready" && cached_mtime == mtime {
-            let stale = now.saturating_sub(updated_at) > ttl;
-            if stale {
-                let _ = enqueue_dir_size(
-                    &state,
-                    current.user.id,
-                    real_path.clone(),
-                    path.clone(),
-                    mtime,
-                )
-                .await;
-            }
+    if let Some((status, size, cached_mtime, error, updated_at, has_value)) = cached_state {
+        let mtime_matches = cached_mtime == mtime;
+        let fresh = status == "ready" && mtime_matches;
+        let ttl_expired = now.saturating_sub(updated_at) > ttl;
+        if fresh && !ttl_expired {
             return Ok(Json(json!({
                 "status": "ready",
                 "size": size.max(0) as u64,
                 "indexed": false,
                 "partial": error.is_some(),
-                "stale": stale,
+                "stale": false,
+                "refreshing": false,
                 "error": error,
             })));
         }
-        if status == "error" && now.saturating_sub(updated_at) <= retry {
+        if has_value {
+            // Serve the last known value while a refresh runs. The value is
+            // marked stale so the UI can render it differently.
+            let retry_blocked =
+                status == "error" && mtime_matches && now.saturating_sub(updated_at) <= retry;
+            let refreshing = if retry_blocked {
+                false
+            } else {
+                try_enqueue_dir_size(&state, current.user.id, &real_path, &path, mtime).await
+            };
+            return Ok(Json(json!({
+                "status": "ready",
+                "size": size.max(0) as u64,
+                "indexed": false,
+                "partial": error.is_some(),
+                "stale": true,
+                "refreshing": refreshing,
+                "error": error,
+            })));
+        }
+        if status == "error" && mtime_matches && now.saturating_sub(updated_at) <= retry {
             return Ok(Json(json!({
                 "status": "error",
                 "size": null,
                 "indexed": false,
                 "partial": false,
                 "stale": false,
+                "refreshing": false,
                 "error": error,
             })));
         }
+    }
+
+    // No usable cache row: fall back to a previous index aggregate when the
+    // directory changed since the index was built.
+    if let Some((indexed_mtime, size, partial, status)) = indexed_state
+        && indexed_mtime != mtime
+        && matches!(status.as_str(), "ready" | "stale")
+    {
+        let refreshing =
+            try_enqueue_dir_size(&state, current.user.id, &real_path, &path, mtime).await;
+        return Ok(Json(json!({
+            "status": "ready",
+            "size": size,
+            "indexed": true,
+            "partial": partial,
+            "stale": true,
+            "refreshing": refreshing,
+            "error": null,
+        })));
     }
 
     let outcome = enqueue_dir_size(&state, current.user.id, real_path, path, mtime).await?;
@@ -1326,9 +1365,35 @@ pub async fn dir_size(
         "indexed": false,
         "partial": false,
         "stale": false,
+        "refreshing": true,
         "error": null,
         "job_id": (outcome.job.user_id == current.user.id).then_some(outcome.job.id),
     })))
+}
+
+async fn try_enqueue_dir_size(
+    state: &Arc<AppState>,
+    user_id: i64,
+    real_path: &str,
+    path: &std::path::Path,
+    mtime: i64,
+) -> bool {
+    match enqueue_dir_size(
+        state,
+        user_id,
+        real_path.to_owned(),
+        path.to_path_buf(),
+        mtime,
+    )
+    .await
+    {
+        Ok(outcome) => !outcome.job.is_finished(),
+        Err(AppError::QueueFull) => false,
+        Err(error) => {
+            tracing::warn!(%error, path = %real_path, "failed to enqueue directory size refresh");
+            false
+        }
+    }
 }
 
 async fn enqueue_dir_size(
@@ -1367,7 +1432,7 @@ async fn enqueue_dir_size(
             move |ctx| async move {
                 let _ = job_state
                     .db
-                    .set_directory_size(&job_real_path, "running", 0, mtime_ns, None)
+                    .begin_directory_size(&job_real_path, mtime_ns)
                     .await;
                 let cancel = ctx.token();
                 let (sender, mut receiver) =
@@ -1439,13 +1504,7 @@ async fn enqueue_dir_size(
                     Err(AppError::Cancelled) => {
                         let _ = job_state
                             .db
-                            .set_directory_size(
-                                &job_real_path,
-                                "stale",
-                                0,
-                                mtime_ns,
-                                None,
-                            )
+                            .fail_directory_size(&job_real_path, "stale", mtime_ns, None)
                             .await;
                         Err(AppError::Cancelled)
                     }
@@ -1453,10 +1512,9 @@ async fn enqueue_dir_size(
                         let message = error.to_string();
                         let _ = job_state
                             .db
-                            .set_directory_size(
+                            .fail_directory_size(
                                 &job_real_path,
                                 "error",
-                                0,
                                 mtime_ns,
                                 Some(&message),
                             )

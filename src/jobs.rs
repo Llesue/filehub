@@ -159,10 +159,16 @@ pub struct JobManager {
     inner: Mutex<Inner>,
     io: Arc<Semaphore>,
     queue_limit: usize,
+    thumbnail_queue_limit: usize,
 }
 
 impl JobManager {
-    pub fn new(db: Db, io_workers: usize, queue_limit: usize) -> Arc<Self> {
+    pub fn new(
+        db: Db,
+        io_workers: usize,
+        queue_limit: usize,
+        thumbnail_queue_limit: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             db,
             inner: Mutex::new(Inner {
@@ -174,6 +180,7 @@ impl JobManager {
             }),
             io: Arc::new(Semaphore::new(io_workers.max(1))),
             queue_limit: queue_limit.max(1),
+            thumbnail_queue_limit: thumbnail_queue_limit.max(1),
         })
     }
 
@@ -207,6 +214,19 @@ impl JobManager {
                 .count();
             if active >= self.queue_limit {
                 return Err(AppError::QueueFull);
+            }
+            if kind == JobKind::Thumbnail {
+                let queued_thumbnails = inner
+                    .jobs
+                    .values()
+                    .filter(|job| {
+                        job.kind == JobKind::Thumbnail.as_str()
+                            && matches!(job.status.as_str(), "queued" | "running")
+                    })
+                    .count();
+                if queued_thumbnails >= self.thumbnail_queue_limit {
+                    return Err(AppError::QueueFull);
+                }
             }
         }
 

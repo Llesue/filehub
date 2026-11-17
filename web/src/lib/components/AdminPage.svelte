@@ -357,7 +357,6 @@
     await setSetting('downloads.zip_max_files', Math.round(zipMaxFiles));
     await setSetting('downloads.zip_concurrency', Math.max(1, Math.round(zipConcurrency)));
   }
-
 </script>
 
 <section class="admin-page">
@@ -408,6 +407,7 @@
         {#if status.slow_requests.length > 0}
           <details class="slow-requests">
             <summary>{t($language, '最近慢请求')}（{status.slow_requests.length}）</summary>
+            <p class="slow-hint">{t($language, '仅记录耗时 ≥1 秒的请求，最多保留 100 条。')}</p>
             {#each status.slow_requests.slice(0, 10) as request, index (index)}
               <div class="status-row">
                 <span>{request.method} {request.path}</span>
@@ -549,8 +549,11 @@
                 onchange={(event) => void uploadBrandIcon(event)}
               /></label
             >
-            <button type="button" class="small" disabled={brandBusy} onclick={() => void resetBrandIcon()}
-              >{t($language, '恢复默认图标')}</button
+            <button
+              type="button"
+              class="small"
+              disabled={brandBusy}
+              onclick={() => void resetBrandIcon()}>{t($language, '恢复默认图标')}</button
             >
           </div>
         </div>
@@ -922,7 +925,7 @@
   }
   .setting-grid {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
     padding: 0;
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -930,36 +933,23 @@
   }
   .setting-row {
     display: flex;
-    min-height: 54px;
+    min-height: 52px;
     align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 10px;
-    padding: 8px 16px;
-    border-left: 1px solid var(--border);
+    gap: 12px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
     color: var(--text);
     font-size: 13.5px;
   }
-  .setting-row:nth-child(3n + 1) {
-    border-left: 0;
+  .setting-row:first-child {
+    border-top: 0;
   }
-  @media (max-width: 800px) {
-    .setting-grid {
-      grid-template-columns: 1fr;
-    }
-    .setting-row,
-    .setting-row:nth-child(3n + 1) {
-      border-top: 1px solid var(--border);
-      border-left: 0;
-    }
-    .setting-row:first-child {
-      border-top: 0;
-    }
-  }
-  .setting-row.wide {
-    grid-column: 1 / -1;
-    border-top: 1px solid var(--border);
-    border-left: 0;
+  .slow-hint {
+    margin: 6px 0 2px;
+    color: var(--text-2);
+    font-size: 12.5px;
   }
 
   .zip-fields {

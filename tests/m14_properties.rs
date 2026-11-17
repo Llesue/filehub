@@ -168,3 +168,35 @@ async fn properties_handle_damaged_images_and_symlinks() {
         assert_eq!(body["symlink_state"], "ok");
     }
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn list_reports_symlink_state() {
+    let app = setup_app().await;
+    std::os::unix::fs::symlink("img.png", app.home.join("good-link.png")).unwrap();
+    std::os::unix::fs::symlink("missing-target", app.home.join("bad-link")).unwrap();
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/list?root={}&path=", app.root_id),
+        Some(&app.cookie),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let entries = body["entries"].as_array().unwrap();
+    let good = entries
+        .iter()
+        .find(|entry| entry["name"] == "good-link.png")
+        .unwrap();
+    assert_eq!(good["is_symlink"], true);
+    assert_eq!(good["symlink_state"], "ok");
+    assert_eq!(good["symlink_target"], "img.png");
+    assert_eq!(good["is_dir"], false);
+    let bad = entries
+        .iter()
+        .find(|entry| entry["name"] == "bad-link")
+        .unwrap();
+    assert_eq!(bad["is_symlink"], true);
+    assert_eq!(bad["symlink_state"], "broken");
+}

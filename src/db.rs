@@ -40,6 +40,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (17, include_str!("../migrations/0017_share_uploads.sql")),
     (18, include_str!("../migrations/0018_branding.sql")),
     (19, include_str!("../migrations/0019_collection_shares.sql")),
+    (
+        20,
+        include_str!("../migrations/0020_directory_size_has_value.sql"),
+    ),
 ];
 
 pub fn unix_now() -> i64 {
@@ -1554,12 +1558,12 @@ impl Db {
     pub async fn directory_size_state(
         &self,
         real_path: &str,
-    ) -> anyhow::Result<Option<(String, i64, i64, Option<String>, i64)>> {
+    ) -> anyhow::Result<Option<(String, i64, i64, Option<String>, i64, bool)>> {
         let real_path = real_path.to_owned();
         self.call(move |connection| {
             connection
                 .query_row(
-                    "SELECT status, size_bytes, mtime_ns, error, updated_at \
+                    "SELECT status, size_bytes, mtime_ns, error, updated_at, has_value \
                      FROM directory_sizes WHERE real_path = ?1",
                     params![real_path],
                     |row| {
@@ -1569,6 +1573,7 @@ impl Db {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get::<_, i64>(5)? != 0,
                         ))
                     },
                 )
@@ -1587,23 +1592,75 @@ impl Db {
     ) -> anyhow::Result<()> {
         let real_path = real_path.to_owned();
         let status = status.to_owned();
+        let has_value = i64::from(status == "ready");
         let error = error.map(str::to_owned);
         self.call(move |connection| {
             connection.execute(
                 "INSERT INTO directory_sizes \
-                 (real_path, size_bytes, mtime_ns, status, error, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 (real_path, size_bytes, mtime_ns, status, error, updated_at, has_value) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(real_path) DO UPDATE SET \
                    size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns, \
-                   status = excluded.status, error = excluded.error, updated_at = excluded.updated_at",
+                   status = excluded.status, error = excluded.error, \
+                   updated_at = excluded.updated_at, \
+                   has_value = CASE WHEN excluded.has_value = 1 \
+                                    THEN 1 ELSE directory_sizes.has_value END",
                 params![
                     real_path,
                     size_bytes,
                     mtime_ns,
                     status,
                     error,
-                    unix_now()
+                    unix_now(),
+                    has_value,
                 ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Marks a directory size calculation as running while keeping the last
+    /// successfully calculated value available for stale-while-revalidate
+    /// responses.
+    pub async fn begin_directory_size(&self, real_path: &str, mtime_ns: i64) -> anyhow::Result<()> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO directory_sizes \
+                 (real_path, size_bytes, mtime_ns, status, error, updated_at, has_value) \
+                 VALUES (?1, 0, ?2, 'running', NULL, ?3, 0) \
+                 ON CONFLICT(real_path) DO UPDATE SET \
+                   mtime_ns = excluded.mtime_ns, status = 'running', \
+                   error = NULL, updated_at = excluded.updated_at",
+                params![real_path, mtime_ns, unix_now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records a failed or cancelled calculation without discarding the last
+    /// known size.
+    pub async fn fail_directory_size(
+        &self,
+        real_path: &str,
+        status: &str,
+        mtime_ns: i64,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let real_path = real_path.to_owned();
+        let status = status.to_owned();
+        let error = error.map(str::to_owned);
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO directory_sizes \
+                 (real_path, size_bytes, mtime_ns, status, error, updated_at, has_value) \
+                 VALUES (?1, 0, ?2, ?3, ?4, ?5, 0) \
+                 ON CONFLICT(real_path) DO UPDATE SET \
+                   mtime_ns = excluded.mtime_ns, status = excluded.status, \
+                   error = excluded.error, updated_at = excluded.updated_at",
+                params![real_path, mtime_ns, status, error, unix_now()],
             )?;
             Ok(())
         })
@@ -1635,11 +1692,12 @@ impl Db {
             {
                 let mut statement = transaction.prepare(
                     "INSERT INTO directory_sizes \
-                     (real_path, size_bytes, mtime_ns, status, error, updated_at) \
-                     VALUES (?1, ?2, ?3, 'ready', ?4, ?5) \
+                     (real_path, size_bytes, mtime_ns, status, error, updated_at, has_value) \
+                     VALUES (?1, ?2, ?3, 'ready', ?4, ?5, 1) \
                      ON CONFLICT(real_path) DO UPDATE SET \
                        size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns, \
-                       status = 'ready', error = excluded.error, updated_at = excluded.updated_at",
+                       status = 'ready', error = excluded.error, \
+                       updated_at = excluded.updated_at, has_value = 1",
                 )?;
                 for (real_path, size_bytes, mtime_ns, error) in &rows {
                     statement.execute(params![real_path, size_bytes, mtime_ns, error, now])?;

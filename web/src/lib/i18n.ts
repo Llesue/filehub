@@ -50,6 +50,7 @@ const en: Record<string, string> = {
   清除: 'Clear',
   没有找到匹配的文件: 'No matching files',
   '加载中…': 'Loading…',
+  '疑似网络延迟较高，仍在加载…': 'High network latency suspected, still loading…',
   重试: 'Retry',
   已选: 'Selected',
   项: 'items',
@@ -100,6 +101,8 @@ const en: Record<string, string> = {
   部分失败: 'Partially failed',
   '有 {count} 项操作失败。': '{count} items failed.',
   统计超时: 'Size calculation timed out',
+  '显示的是上次统计结果，正在后台更新…':
+    'Showing the last known size while it is refreshed in the background…',
   无法统计目录大小: 'Could not calculate directory size',
   '已被父根 {name} 覆盖': 'Covered by parent root {name}',
   系统状态: 'System status',
@@ -107,6 +110,8 @@ const en: Record<string, string> = {
   目录大小缓存: 'Directory size cache',
   数据库: 'Database',
   最近慢请求: 'Recent slow requests',
+  '仅记录耗时 ≥1 秒的请求，最多保留 100 条。':
+    'Only requests taking 1s or longer are recorded, up to 100 entries.',
   创建管理员: 'Create admin',
   '设置令牌见服务启动日志，或由 FILEHUB_SETUP_TOKEN 指定。':
     'The setup token is printed in the startup log, or set via FILEHUB_SETUP_TOKEN.',
@@ -490,6 +495,8 @@ const en: Record<string, string> = {
   链接状态: 'Link status',
   可用: 'Available',
   断链: 'Broken',
+  软链接目标不存在: 'Symlink target does not exist',
+  软链接目标无权限: 'Symlink target is not accessible',
   无权限: 'No permission',
   目标: 'Target',
   图片尺寸: 'Image size',
@@ -580,8 +587,11 @@ export function initLanguage(): void {
   const languages =
     typeof navigator === 'undefined'
       ? []
-      : (navigator.languages?.length ? navigator.languages : [navigator.language]);
-  const lang: Lang = stored === 'en' || stored === 'zh-CN' ? stored : detectBrowserLanguage(languages);
+      : navigator.languages?.length
+        ? navigator.languages
+        : [navigator.language];
+  const lang: Lang =
+    stored === 'en' || stored === 'zh-CN' ? stored : detectBrowserLanguage(languages);
   language.set(lang);
   document.documentElement.lang = lang;
 }

@@ -55,7 +55,15 @@
   import { applyTheme, resolveTheme, type Theme } from './lib/theme';
 
   let theme = $state<Theme>('light');
-  let view = $state<'list' | 'thumb' | 'tile'>('list');
+  function storedView(): 'list' | 'thumb' | 'tile' {
+    try {
+      return resolveViewPreference(localStorage.getItem('filehub.view'), null) ?? 'list';
+    } catch {
+      return 'list';
+    }
+  }
+
+  let view = $state<'list' | 'thumb' | 'tile'>(storedView());
   let sortField = $state<'name' | 'size' | 'modified'>('name');
   let sortOrder = $state<'asc' | 'desc'>('asc');
   let sidebarOpen = $state(false);
@@ -74,7 +82,7 @@
   let clock = $state(Date.now());
   let entries = $state<Entry[]>([]);
   let selected = $state<string[]>([]);
-  let dirSizes = $state<Record<string, number | null>>({});
+  let dirSizes = $state<Record<string, { size: number; stale: boolean } | null>>({});
   let dirSizeErrors = $state<Record<string, string | null>>({});
   let selectionAnchor = $state<string | null>(null);
   let filesLoading = $state(false);
@@ -84,6 +92,11 @@
   let loadMoreAbort: AbortController | null = null;
   let usageAbort: AbortController | null = null;
   let usagePollTimer: ReturnType<typeof setTimeout> | null = null;
+  let usagePollAttempts = 0;
+  let bootSlow = $state(false);
+  let bootSlowTimer: ReturnType<typeof setTimeout> | null = null;
+  let filesSlow = $state(false);
+  let filesSlowTimer: ReturnType<typeof setTimeout> | null = null;
   let searchAbort: AbortController | null = null;
   let dirSizeGeneration = 0;
   let contentElement = $state<HTMLElement | null>(null);
@@ -298,6 +311,8 @@
       window.clearInterval(autoSaveTimer);
       window.clearInterval(clockTimer);
       if (usagePollTimer) clearTimeout(usagePollTimer);
+      if (bootSlowTimer) clearTimeout(bootSlowTimer);
+      if (filesSlowTimer) clearTimeout(filesSlowTimer);
     };
   });
 
@@ -320,8 +335,39 @@
     setThemePreference(theme === 'dark' ? 'light' : 'dark');
   }
 
+  function startBootSlowHint(): void {
+    if (bootSlowTimer) clearTimeout(bootSlowTimer);
+    bootSlow = false;
+    bootSlowTimer = setTimeout(() => {
+      bootSlow = true;
+      bootSlowTimer = null;
+    }, 6000);
+  }
+
+  function stopBootSlowHint(): void {
+    if (bootSlowTimer) clearTimeout(bootSlowTimer);
+    bootSlowTimer = null;
+    bootSlow = false;
+  }
+
+  function startFilesSlowHint(): void {
+    if (filesSlowTimer) clearTimeout(filesSlowTimer);
+    filesSlow = false;
+    filesSlowTimer = setTimeout(() => {
+      filesSlow = true;
+      filesSlowTimer = null;
+    }, 4000);
+  }
+
+  function stopFilesSlowHint(): void {
+    if (filesSlowTimer) clearTimeout(filesSlowTimer);
+    filesSlowTimer = null;
+    filesSlow = false;
+  }
+
   async function bootstrap(): Promise<void> {
     loading = true;
+    startBootSlowHint();
 
     try {
       const status = await api.setupStatus();
@@ -347,6 +393,7 @@
       initialized = true;
     } finally {
       loading = false;
+      stopBootSlowHint();
     }
   }
 
@@ -355,6 +402,7 @@
     csrf = auth.csrf_token;
     initialized = true;
     loading = false;
+    stopBootSlowHint();
     void loadPreferences();
     void loadRoots();
   }
@@ -412,6 +460,9 @@
       currentReadOnly = false;
       selected = [];
       activeRootId = null;
+      usagePollAttempts = 0;
+      if (usagePollTimer) clearTimeout(usagePollTimer);
+      usagePollTimer = null;
       loggingOut = false;
     }
   }
@@ -467,7 +518,13 @@
     filesLoading = true;
     filesError = '';
     nextCursor = null;
+    startFilesSlowHint();
     try {
+      const storedView = resolveViewPreference(
+        localStorage.getItem('filehub.view'),
+        localStorage.getItem(`view:${rootId}:${path}`),
+      );
+      if (storedView) view = storedView;
       const savedSort = localStorage.getItem(`sort:${rootId}:${path}`);
       if (savedSort) {
         const [field, order] = savedSort.split(':');
@@ -492,20 +549,32 @@
       currentReadOnly = result.read_only;
       entries = result.entries;
       nextCursor = result.next_cursor;
-      loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration);
+      loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration, true);
       selected = [];
       selectionAnchor = null;
       const remembered = resolveViewPreference(
         localStorage.getItem('filehub.view'),
         localStorage.getItem(`view:${result.root.id}:${result.path}`),
       );
-      if (remembered) view = remembered;
+      if (remembered) {
+        view = remembered;
+        try {
+          if (!localStorage.getItem('filehub.view')) {
+            localStorage.setItem('filehub.view', remembered);
+          }
+        } catch (error) {
+          console.warn('could not persist view preference', error);
+        }
+      }
       void loadUsage();
     } catch (error) {
       if (isAbortError(error)) return;
       handleFilesError(error);
     } finally {
-      if (generation === listGeneration) filesLoading = false;
+      if (generation === listGeneration) {
+        filesLoading = false;
+        stopFilesSlowHint();
+      }
     }
   }
 
@@ -541,7 +610,7 @@
       if (rootId !== activeRootId || path !== currentPath) return;
       entries = [...entries, ...result.entries];
       nextCursor = result.next_cursor;
-      loadDirectorySizes(result.entries, result.root.id, result.path, dirSizeGeneration);
+      loadDirectorySizes(result.entries, result.root.id, result.path, dirSizeGeneration, false);
     } catch (error) {
       if (!isAbortError(error)) handleFilesError(error);
     } finally {
@@ -566,12 +635,23 @@
     rootId: number,
     path: string,
     generation: number,
+    revalidate: boolean,
   ): void {
     for (const entry of items) {
       if (!entry.is_dir) continue;
       const key = `${rootId}:${joinPath(path, entry.name)}`;
-      if (dirSizes[key] !== undefined || dirSizeTimers.has(key)) continue;
+      if (dirSizeTimers.has(key)) continue;
+      if (!revalidate && dirSizes[key] !== undefined) continue;
       void requestDirectorySize(key, rootId, joinPath(path, entry.name), generation);
+    }
+  }
+
+  function keepDirSizeValue(key: string): void {
+    const current = dirSizes[key];
+    if (current) {
+      dirSizes = { ...dirSizes, [key]: { size: current.size, stale: true } };
+    } else {
+      dirSizes = { ...dirSizes, [key]: null };
     }
   }
 
@@ -588,14 +668,16 @@
       const result = await api.dirSize(rootId, path, controller.signal);
       if (generation !== dirSizeGeneration) return;
       if (result.status === 'ready' && result.size !== null) {
-        dirSizes = { ...dirSizes, [key]: result.size };
+        const stale = Boolean(result.stale);
+        dirSizes = { ...dirSizes, [key]: { size: result.size, stale } };
         dirSizeErrors = { ...dirSizeErrors, [key]: result.error ?? null };
-        dirSizeAttempts.delete(key);
         resortEntriesBySize();
-        return;
-      }
-      if (result.status === 'error') {
-        dirSizes = { ...dirSizes, [key]: null };
+        if (!stale || !result.refreshing) {
+          dirSizeAttempts.delete(key);
+          return;
+        }
+      } else if (result.status === 'error') {
+        keepDirSizeValue(key);
         dirSizeErrors = {
           ...dirSizeErrors,
           [key]: result.error ?? t($language, '无法统计目录大小'),
@@ -605,7 +687,7 @@
       }
       const attempts = (dirSizeAttempts.get(key) ?? 0) + 1;
       if (attempts > 150) {
-        dirSizes = { ...dirSizes, [key]: null };
+        keepDirSizeValue(key);
         dirSizeErrors = { ...dirSizeErrors, [key]: t($language, '统计超时') };
         dirSizeAttempts.delete(key);
         return;
@@ -618,7 +700,7 @@
       dirSizeTimers.set(key, timer);
     } catch (error) {
       if (isAbortError(error) || generation !== dirSizeGeneration) return;
-      dirSizes = { ...dirSizes, [key]: null };
+      keepDirSizeValue(key);
       dirSizeErrors = {
         ...dirSizeErrors,
         [key]: error instanceof Error ? error.message : t($language, '无法统计目录大小'),
@@ -641,7 +723,12 @@
     if (size === undefined) {
       return entry.size > 0 ? formatSize(entry.size) : t($language, '计算中…');
     }
-    return size === null ? '—' : formatSize(size);
+    return size === null ? '—' : formatSize(size.size);
+  }
+
+  function entrySizeStale(entry: Entry): boolean {
+    if (!entry.is_dir || activeRootId === null) return false;
+    return dirSizes[`${activeRootId}:${joinPath(currentPath, entry.name)}`]?.stale === true;
   }
 
   function resortEntriesBySize(): void {
@@ -651,7 +738,7 @@
     const sizeOf = (entry: Entry): number => {
       if (!entry.is_dir) return entry.size;
       const value = dirSizes[`${rootId}:${joinPath(path, entry.name)}`];
-      return typeof value === 'number' ? value : entry.size;
+      return value ? value.size : entry.size;
     };
     const known = (entry: Entry, value: number): boolean => !entry.is_dir || value > 0;
     entries = [...entries].sort((left, right) => {
@@ -671,7 +758,9 @@
 
   function entrySizeError(entry: Entry): string {
     if (!entry.is_dir || activeRootId === null) return '';
-    return dirSizeErrors[`${activeRootId}:${joinPath(currentPath, entry.name)}`] ?? '';
+    const error = dirSizeErrors[`${activeRootId}:${joinPath(currentPath, entry.name)}`];
+    if (error) return error;
+    return entrySizeStale(entry) ? t($language, '显示的是上次统计结果，正在后台更新…') : '';
   }
 
   function handleContentScroll(event: Event): void {
@@ -776,11 +865,27 @@
   }
 
   async function loadUsage(): Promise<void> {
+    if (usagePollTimer) {
+      clearTimeout(usagePollTimer);
+      usagePollTimer = null;
+    }
     usageAbort?.abort();
     const controller = new AbortController();
     usageAbort = controller;
     try {
       usage = await api.usage(controller.signal);
+      if (usage.computing || usage.used_bytes === null) {
+        usagePollAttempts += 1;
+        if (usagePollAttempts <= 150) {
+          if (usagePollTimer) clearTimeout(usagePollTimer);
+          usagePollTimer = setTimeout(() => {
+            usagePollTimer = null;
+            void loadUsage();
+          }, 2000);
+        }
+      } else {
+        usagePollAttempts = 0;
+      }
     } catch (error) {
       if (!isAbortError(error) && !(error instanceof ApiError && error.status === 401)) {
         console.warn('could not load usage', error);
@@ -978,7 +1083,23 @@
     return rootAlias($language, alias);
   }
 
+  function symlinkBlocked(entry: Entry): boolean {
+    return entry.is_symlink && entry.symlink_state !== undefined && entry.symlink_state !== 'ok';
+  }
+
+  function symlinkTitle(entry: Entry): string {
+    if (entry.symlink_state === 'denied') return t($language, '软链接目标无权限');
+    if (entry.symlink_state === 'broken') return t($language, '软链接目标不存在');
+    return entry.symlink_target
+      ? `${t($language, '链接')} → ${entry.symlink_target}`
+      : t($language, '链接');
+  }
+
   function enterEntry(entry: Entry): void {
+    if (symlinkBlocked(entry)) {
+      showToast(symlinkTitle(entry));
+      return;
+    }
     if (entry.is_dir) {
       navigate(joinPath(currentPath, entry.name));
     } else if (isTextFile(entry.name)) {
@@ -1227,6 +1348,10 @@
     const entry = contextMenu?.entry;
     contextMenu = null;
     if (!entry) return;
+    if ((action === 'preview' || action === 'download') && symlinkBlocked(entry)) {
+      showToast(symlinkTitle(entry));
+      return;
+    }
     const targets =
       selected.includes(entry.name) && selected.length > 1
         ? entries.filter((item) => selected.includes(item.name))
@@ -1735,13 +1860,7 @@
         }
         const start = index * created.chunk_size;
         const end = Math.min(start + created.chunk_size, file.size);
-        await api.uploadChunk(
-          created.upload_id,
-          index,
-          file.slice(start, end),
-          csrf,
-          signal,
-        );
+        await api.uploadChunk(created.upload_id, index, file.slice(start, end), csrf, signal);
       }
       await api.completeUpload(created.upload_id, csrf);
     } catch (error) {
@@ -1969,6 +2088,10 @@
 {:else if loading}
   <div class="boot-screen" aria-label={t($language, '正在加载')}>
     <div class="boot-mark" aria-hidden="true">F</div>
+    <p class="boot-label">{t($language, '加载中…')}</p>
+    {#if bootSlow}
+      <p class="boot-hint">{t($language, '疑似网络延迟较高，仍在加载…')}</p>
+    {/if}
   </div>
 {:else if !initialized}
   <AuthScreen mode="setup" onSuccess={handleAuth} />
@@ -2073,9 +2196,7 @@
             class="upload-top"
             class:inactive={currentReadOnly}
             aria-disabled={!activeRoot || currentReadOnly || uploading}
-            title={currentReadOnly
-              ? t($language, '当前目录只读')
-              : t($language, '上传文件')}
+            title={currentReadOnly ? t($language, '当前目录只读') : t($language, '上传文件')}
             aria-label={t($language, '上传')}
             onclick={uploadClick}
           >
@@ -2415,7 +2536,14 @@
                   </div>
                 {/if}
               {:else if filesLoading}
-                <div class="files-state">{t($language, '加载中…')}</div>
+                <div class="files-state">
+                  <span>{t($language, '加载中…')}</span>
+                  {#if filesSlow}
+                    <span class="slow-network-hint"
+                      >{t($language, '疑似网络延迟较高，仍在加载…')}</span
+                    >
+                  {/if}
+                </div>
               {:else if filesError}
                 <div class="files-state">
                   <p>{filesError}</p>
@@ -2571,17 +2699,32 @@
                               <span class="file-icon">
                                 <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={22} />
                               </span>
-                              <span class="file-name"
-                                ><span class="name-stem">{nameParts.stem}</span><span
+                              <span class="file-name">
+                                {#if entry.is_symlink}
+                                  <span
+                                    class="symlink-mark"
+                                    class:bad={entry.symlink_state !== 'ok'}
+                                    title={symlinkTitle(entry)}
+                                  >
+                                    <Icon
+                                      name={entry.symlink_state === 'ok' ? 'link' : 'unlink'}
+                                      size={14}
+                                    />
+                                  </span>
+                                {/if}
+                                <span class="name-stem">{nameParts.stem}</span><span
                                   class="name-ext">{nameParts.ext}</span
-                                ></span
-                              >
-                              {#if entry.is_symlink}
-                                <span class="tag">{t($language, '链接')}</span>
-                              {/if}
+                                >
+                              </span>
                             </td>
-                            <td class="size" title={entrySizeError(entry)}>{entrySize(entry)}</td>
-                            <td class="modified" title={absoluteDate(entry.modified)}>{formatRelativeDate(entry.modified)}</td>
+                            <td
+                              class="size"
+                              class:size-stale={entrySizeStale(entry)}
+                              title={entrySizeError(entry)}>{entrySize(entry)}</td
+                            >
+                            <td class="modified" title={absoluteDate(entry.modified)}
+                              >{formatRelativeDate(entry.modified)}</td
+                            >
                             <td class="actions">
                               {#if isAudioName(entry.name)}
                                 <button
@@ -2690,13 +2833,30 @@
                               />
                             {/if}
                           </div>
-                          <span class="card-name"
-                            ><span class="name-stem">{nameParts.stem}</span><span class="name-ext"
+                          <span class="card-name">
+                            {#if entry.is_symlink}
+                              <span
+                                class="symlink-mark"
+                                class:bad={entry.symlink_state !== 'ok'}
+                                title={symlinkTitle(entry)}
+                              >
+                                <Icon
+                                  name={entry.symlink_state === 'ok' ? 'link' : 'unlink'}
+                                  size={13}
+                                />
+                              </span>
+                            {/if}
+                            <span class="name-stem">{nameParts.stem}</span><span class="name-ext"
                               >{nameParts.ext}</span
-                            ></span
-                          >
+                            >
+                          </span>
                           <span class="card-meta">
-                            <span title={absoluteDate(entry.modified)}>{entrySize(entry)} · {formatRelativeDate(entry.modified)}</span>
+                            <span title={absoluteDate(entry.modified)}
+                              ><span class:size-stale={entrySizeStale(entry)}
+                                >{entrySize(entry)}</span
+                              >
+                              · {formatRelativeDate(entry.modified)}</span
+                            >
                           </span>
                         </div>
                       {/each}
@@ -2769,13 +2929,30 @@
                             {/if}
                           </div>
                           <span class="tile-info">
-                            <span class="tile-name"
-                              ><span class="name-stem">{nameParts.stem}</span><span class="name-ext"
+                            <span class="tile-name">
+                              {#if entry.is_symlink}
+                                <span
+                                  class="symlink-mark"
+                                  class:bad={entry.symlink_state !== 'ok'}
+                                  title={symlinkTitle(entry)}
+                                >
+                                  <Icon
+                                    name={entry.symlink_state === 'ok' ? 'link' : 'unlink'}
+                                    size={13}
+                                  />
+                                </span>
+                              {/if}
+                              <span class="name-stem">{nameParts.stem}</span><span class="name-ext"
                                 >{nameParts.ext}</span
-                              ></span
-                            >
+                              >
+                            </span>
                             <span class="tile-meta">
-                              <span title={absoluteDate(entry.modified)}>{entrySize(entry)} · {formatRelativeDate(entry.modified)}</span>
+                              <span title={absoluteDate(entry.modified)}
+                                ><span class:size-stale={entrySizeStale(entry)}
+                                  >{entrySize(entry)}</span
+                                >
+                                · {formatRelativeDate(entry.modified)}</span
+                              >
                             </span>
                           </span>
                         </div>
@@ -2868,8 +3045,7 @@
       {/if}
       <div class="menu-sep"></div>
       {#if currentReadOnly}
-        <button type="button" role="menuitem" class="danger" disabled
-          >{t($language, '删除')}</button
+        <button type="button" role="menuitem" class="danger" disabled>{t($language, '删除')}</button
         >
       {:else}
         <button
@@ -3182,10 +3358,26 @@
 
 <style>
   .boot-screen {
-    display: grid;
+    display: flex;
     min-height: 100dvh;
-    place-items: center;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
     background: var(--bg);
+  }
+
+  .boot-label {
+    margin: 0;
+    color: var(--text-2);
+    font-size: 13.5px;
+  }
+
+  .boot-hint {
+    margin: 0;
+    color: var(--text-2);
+    font-size: 12.5px;
+    opacity: 0.8;
   }
 
   .boot-mark {
@@ -3747,6 +3939,18 @@
     text-overflow: ellipsis;
   }
 
+  .symlink-mark {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    margin-right: 4px;
+    color: var(--text-2);
+  }
+
+  .symlink-mark.bad {
+    color: var(--danger);
+  }
+
   .name-ext {
     flex: 0 0 auto;
   }
@@ -3755,21 +3959,17 @@
     stroke-width: 2;
   }
 
-  .tag {
-    flex: 0 0 auto;
-    padding: 1px 6px;
-    border-radius: 99px;
-    background: var(--surface-2);
-    color: var(--text-2);
-    font-size: 12px;
-  }
-
   .file-table .size {
     width: 96px;
     color: var(--text-2);
     font-variant-numeric: tabular-nums;
     font-weight: 500;
     text-align: right;
+  }
+
+  .size-stale {
+    opacity: 0.55;
+    transition: opacity 0.2s ease;
   }
 
   .file-table .modified {
@@ -3926,6 +4126,12 @@
     color: var(--text-2);
     font-size: 14.5px;
     text-align: center;
+  }
+
+  .slow-network-hint {
+    color: var(--text-2);
+    font-size: 12.5px;
+    opacity: 0.8;
   }
 
   .retry-button {

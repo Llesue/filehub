@@ -23,6 +23,8 @@ pub struct Entry {
     pub created_at: i64,
     pub mime_type: String,
     pub has_preview: bool,
+    pub symlink_state: Option<String>,
+    pub symlink_target: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,41 @@ pub fn list_dir(resolved: &ResolvedPath, sort: &str, order: &str) -> Result<Vec<
 
         let file_type = entry.file_type().map_err(io_error)?;
         let metadata = std::fs::symlink_metadata(entry.path()).map_err(io_error)?;
+        let is_symlink = file_type.is_symlink();
+        let (is_dir, size, symlink_state, symlink_target) = if is_symlink {
+            let target = std::fs::read_link(entry.path()).ok().and_then(|target| {
+                target
+                    .is_relative()
+                    .then(|| target.to_string_lossy().into_owned())
+            });
+            match std::fs::metadata(entry.path()) {
+                Ok(target_meta) => (
+                    target_meta.is_dir(),
+                    if target_meta.is_file() {
+                        target_meta.len() as i64
+                    } else {
+                        0
+                    },
+                    Some("ok".to_owned()),
+                    target,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    (false, 0, Some("denied".to_owned()), None)
+                }
+                Err(_) => (false, 0, Some("broken".to_owned()), None),
+            }
+        } else {
+            (
+                file_type.is_dir(),
+                if file_type.is_file() {
+                    metadata.len() as i64
+                } else {
+                    0
+                },
+                None,
+                None,
+            )
+        };
         let modified = metadata
             .modified()
             .ok()
@@ -73,17 +110,15 @@ pub fn list_dir(resolved: &ResolvedPath, sort: &str, order: &str) -> Result<Vec<
 
         entries.push(Entry {
             name,
-            is_dir: file_type.is_dir(),
-            is_symlink: file_type.is_symlink(),
-            size: if file_type.is_file() {
-                metadata.len() as i64
-            } else {
-                0
-            },
+            is_dir,
+            is_symlink,
+            size,
             modified,
             created_at,
             mime_type,
             has_preview: false,
+            symlink_state,
+            symlink_target,
         });
     }
 
@@ -103,6 +138,19 @@ pub fn list_dir(resolved: &ResolvedPath, sort: &str, order: &str) -> Result<Vec<
     });
 
     Ok(entries)
+}
+
+pub fn has_symlinks(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_type()
+                    .map(|file_type| file_type.is_symlink())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 pub fn dir_mtime_ns(path: &Path) -> Result<i64, AppError> {
