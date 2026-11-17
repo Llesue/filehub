@@ -3060,7 +3060,7 @@
 
   {#if blankMenu}
     <div
-      class="context-menu"
+      class="context-menu has-submenu"
       class:open-left={blankMenuLeft}
       class:open-up={blankMenuUp}
       bind:this={blankMenuElement}
@@ -4326,6 +4326,11 @@
     border-radius: var(--radius);
     background: var(--surface);
     box-shadow: var(--shadow-2);
+  }
+
+  .context-menu.has-submenu {
+    overflow: visible;
+    max-height: none;
   }
 
   .context-menu button {
