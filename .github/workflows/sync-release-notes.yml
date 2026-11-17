@@ -19,5 +19,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          version="${tag#v}"
           echo "Updating release notes for $tag"
-          gh release edit "$tag" --notes-file CHANGELOG.md
+          python3 - "$version" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          changelog = Path("CHANGELOG.md").read_text()
+          match = re.search(
+              rf"^## v{re.escape(version)}\b.*?(?=^## |\Z)",
+              changelog,
+              re.MULTILINE | re.DOTALL,
+          )
+          if not match:
+              raise SystemExit(f"CHANGELOG entry for v{version} not found")
+          body = match.group(0).split("\n", 1)[1].strip()
+          notes = (
+              f"# FileHub v{version}\n\n{body}\n\n"
+              f"**Full Changelog**: https://github.com/Llesue/filehub/compare/"
+              f"v{version.rsplit('.', 1)[0]}.{int(version.rsplit('.', 1)[1]) - 1}"
+              f"...v{version}\n"
+          )
+          Path("/tmp/release-notes.md").write_text(notes)
+          PY
+          gh release edit "$tag" --notes-file /tmp/release-notes.md
