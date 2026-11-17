@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.1.5 - 2026-11-17
+
+### Fixed
+
+- Context submenus for sort and view now open outside the first-level menu instead of being laid out inside its scroll container, which produced scrollbars and clipped or misplaced submenus.
+
+### Changed
+
+- Release publishing now builds bilingual release notes from `CHANGELOG.md` and `CHANGELOG.zh-CN.md`.
+
+### Verification
+
+- Playwright covers wide and narrow submenu placement, confirms the blank-area menu is no longer a scroll container, and checks that the file menu still scrolls.
+
 ## v0.1.4 - 2026-11-17
 
 ### Added

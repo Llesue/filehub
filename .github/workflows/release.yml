@@ -176,7 +176,47 @@ jobs:
           cd dist
           sha256sum $(find . -maxdepth 1 -type f -name 'filehub-*' ! -name '*.sha256' -printf '%f\n' | sort) > SHA256SUMS
 
+      - name: Release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 - "$VERSION" > release-notes.md <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          entries = []
+          for path, heading in (
+              ("CHANGELOG.md", f"# FileHub v{version}"),
+              ("CHANGELOG.zh-CN.md", f"# FileHub v{version}（中文）"),
+          ):
+              changelog = Path(path)
+              if not changelog.exists():
+                  continue
+              text = changelog.read_text()
+              match = re.search(
+                  rf"^## v{re.escape(version)}\b.*?(?=^## |\Z)",
+                  text,
+                  re.MULTILINE | re.DOTALL,
+              )
+              if not match:
+                  continue
+              body = match.group(0).split("\n", 1)[1].strip()
+              entries.append(f"{heading}\n\n{body}")
+          if not entries:
+              raise SystemExit(f"CHANGELOG entry for v{version} not found")
+          notes = "\n\n---\n\n".join(entries)
+          previous = (
+              f"v{version.rsplit('.', 1)[0]}."
+              f"{int(version.rsplit('.', 1)[1]) - 1}"
+          )
+          print(
+              f"{notes}\n\n**Full Changelog**: "
+              f"https://github.com/Llesue/filehub/compare/{previous}...v{version}"
+          )
+          PY
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: release-notes.md
