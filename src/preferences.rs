@@ -11,7 +11,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth;
-use crate::authz;
 use crate::db::UserPreferences;
 use crate::error::AppError;
 use crate::state::AppState;
@@ -34,9 +33,6 @@ fn preferences_json(preferences: &UserPreferences) -> Value {
         "upload_conflict": preferences.upload_conflict,
         "terminal_enabled": preferences.terminal_enabled,
         "editor_enabled": preferences.editor_enabled,
-        "custom_css_root_id": preferences.custom_css_root_id,
-        "custom_css_path": preferences.custom_css_path,
-        "custom_css_version": preferences.custom_css_version,
         "avatar_version": preferences.avatar_version,
     })
 }
@@ -66,9 +62,6 @@ pub struct UpdatePreferencesRequest {
     upload_conflict: Option<String>,
     terminal_enabled: Option<bool>,
     editor_enabled: Option<bool>,
-    clear_custom_css: Option<bool>,
-    custom_css_root_id: Option<i64>,
-    custom_css_path: Option<String>,
 }
 
 pub async fn update_preferences(
@@ -85,8 +78,8 @@ pub async fn update_preferences(
         .map_err(AppError::internal)?;
 
     if let Some(theme) = request.theme {
-        if !matches!(theme.as_str(), "light" | "dark") {
-            return Err(AppError::bad_request("theme must be light or dark"));
+        if !matches!(theme.as_str(), "light" | "dark" | "system") {
+            return Err(AppError::bad_request("theme must be light, dark or system"));
         }
         preferences.theme = theme;
     }
@@ -115,37 +108,6 @@ pub async fn update_preferences(
         preferences.upload_conflict = conflict;
     }
 
-    if request.clear_custom_css.unwrap_or(false) {
-        preferences.custom_css_root_id = None;
-        preferences.custom_css_path = None;
-        preferences.custom_css_version += 1;
-    } else if let (Some(root_id), Some(path)) =
-        (request.custom_css_root_id, request.custom_css_path)
-    {
-        let resolved = authz::resolve(&state, current.user.id, root_id, &path, false).await?;
-        if resolved.relative.is_empty()
-            || !resolved.absolute.is_file()
-            || !path.to_ascii_lowercase().ends_with(".css")
-        {
-            return Err(AppError::bad_request("custom CSS must be a .css file"));
-        }
-        let metadata = tokio::fs::metadata(&resolved.absolute)
-            .await
-            .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
-        if metadata.len() > 1024 * 1024 {
-            return Err(AppError::too_large("custom CSS file is too large"));
-        }
-        let bytes = tokio::fs::read(&resolved.absolute)
-            .await
-            .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
-        if std::str::from_utf8(&bytes).is_err() {
-            return Err(AppError::invalid_path("custom CSS must be UTF-8"));
-        }
-        preferences.custom_css_root_id = Some(root_id);
-        preferences.custom_css_path = Some(resolved.relative);
-        preferences.custom_css_version += 1;
-    }
-
     state
         .db
         .save_user_preferences(current.user.id, &preferences)
@@ -155,31 +117,6 @@ pub async fn update_preferences(
         "preferences": preferences_json(&preferences),
         "system": system_json(&state),
     })))
-}
-
-pub async fn get_custom_css(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let current = auth::current_user(&state, &headers).await?;
-    let preferences = state
-        .db
-        .get_user_preferences(current.user.id)
-        .await
-        .map_err(AppError::internal)?;
-    let (Some(root_id), Some(path)) = (preferences.custom_css_root_id, preferences.custom_css_path)
-    else {
-        return Err(AppError::NotFound);
-    };
-    let resolved = authz::resolve(&state, current.user.id, root_id, &path, false).await?;
-    let bytes = tokio::fs::read(&resolved.absolute)
-        .await
-        .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/css; charset=utf-8")
-        .header(header::CACHE_CONTROL, "private, max-age=0, must-revalidate")
-        .body(axum::body::Body::from(bytes))
-        .map_err(|err| AppError::internal(anyhow::Error::from(err)))
 }
 
 pub async fn get_avatar(

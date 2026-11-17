@@ -2,12 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { resolveViewPreference } from './viewPref';
 
 describe('resolveViewPreference', () => {
-  it('prefers the global view so directories share one layout', () => {
-    expect(resolveViewPreference('thumb', 'list')).toBe('thumb');
+  it('prefers the per-directory view', () => {
+    expect(resolveViewPreference('thumb', 'list')).toBe('list');
   });
 
-  it('falls back to the per-path value from older versions', () => {
-    expect(resolveViewPreference(null, 'list')).toBe('list');
+  it('falls back to the global default', () => {
+    expect(resolveViewPreference('thumb', null)).toBe('thumb');
     expect(resolveViewPreference(null, 'grid')).toBe('thumb');
   });
 

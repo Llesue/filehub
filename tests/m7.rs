@@ -163,7 +163,7 @@ async fn share_crud_password_and_download() {
     .await;
     assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
     let revoked = send(&app.router, Method::GET, &meta_uri, None, None, None).await;
-    assert_eq!(revoked.status(), StatusCode::NOT_FOUND);
+    assert_eq!(revoked.status(), StatusCode::GONE);
 
     let protected = send_json(
         &app.router,

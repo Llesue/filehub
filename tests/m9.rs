@@ -815,3 +815,122 @@ async fn directory_size_failures_keep_the_last_value() {
     assert_eq!(state.1, 42);
     assert!(state.5, "failed refresh must keep has_value");
 }
+
+#[tokio::test]
+async fn soft_deleted_user_disappears_and_cannot_login() {
+    let app = setup_app().await;
+    let created = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/users",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"username":"qa-soft-delete","password":"correct horse 9","role":"user"}),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let id = json_body(created).await["user"]["id"].as_i64().unwrap();
+
+    let deleted = send_json(
+        &app.router,
+        Method::DELETE,
+        &format!("/api/v1/admin/users/{id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({}),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    let users = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/admin/users",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    let users = json_body(users).await;
+    assert!(
+        !users["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|user| user["username"] == "qa-soft-delete"),
+        "soft-deleted user is still listed"
+    );
+
+    let login = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username":"qa-soft-delete","password":"correct horse 9"}),
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn custom_css_is_admin_controlled_and_public() {
+    let app = setup_app().await;
+    let css = ".demo { color: red; }";
+    let saved = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/admin/custom-css",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"content": css}),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body = json_body(saved).await;
+    let version = body["version"].as_i64().unwrap();
+    assert!(version > 0);
+
+    let response = send(&app.router, Method::GET, "/api/v1/custom.css", None, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        &to_bytes(response.into_body(), 1024).await.unwrap()[..],
+        css.as_bytes()
+    );
+
+    let branding = send(&app.router, Method::GET, "/api/v1/branding", None, None).await;
+    assert_eq!(json_body(branding).await["custom_css_version"], version);
+
+    let cleared = send_json(
+        &app.router,
+        Method::DELETE,
+        "/api/v1/admin/custom-css",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({}),
+    )
+    .await;
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let response = send(&app.router, Method::GET, "/api/v1/custom.css", None, None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn usage_delta_updates_cached_snapshot() {
+    let app = setup_app().await;
+    app.state.usage_cache.lock().insert(
+        1,
+        filehub::state::UsageSnapshot {
+            used_bytes: 100,
+            quota_bytes: None,
+            disks: Vec::new(),
+            computed_at: 42,
+        },
+    );
+    app.state.adjust_usage(1, 25);
+    app.state.adjust_usage(1, -10);
+    let snapshot = app.state.usage_cache.lock().get(&1).cloned().unwrap();
+    assert_eq!(snapshot.used_bytes, 115);
+    assert_eq!(snapshot.computed_at, 42);
+    app.state.adjust_usage(1, -1000);
+    assert_eq!(app.state.usage_cache.lock().get(&1).unwrap().used_bytes, 0);
+}

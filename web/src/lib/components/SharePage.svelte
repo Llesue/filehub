@@ -81,6 +81,15 @@
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         needsPassword = true;
+      } else if (err instanceof ApiError && err.code === 'SHARE_REVOKED') {
+        data = null;
+        error = t($language, '共享已停止');
+      } else if (err instanceof ApiError && err.code === 'SHARE_EXPIRED') {
+        data = null;
+        error = t($language, '共享已过期');
+      } else if (err instanceof ApiError && err.status === 404) {
+        data = null;
+        error = t($language, '分享不存在或链接无效');
       } else {
         error = err instanceof Error ? err.message : t($language, '无法打开分享');
       }
@@ -398,9 +407,7 @@
   }
 
   function clearFinishedUploads(): void {
-    uploads = uploads.filter(
-      (task) => task.status === 'uploading' || task.status === 'queued',
-    );
+    uploads = uploads.filter((task) => task.status === 'uploading' || task.status === 'queued');
   }
 </script>
 
@@ -413,7 +420,9 @@
     <header class="share-header">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">
-          {#if $branding.iconUrl}<img src={$branding.iconUrl} alt="" />{:else}{brandMark($branding.name)}{/if}
+          {#if $branding.iconUrl}<img src={$branding.iconUrl} alt="" />{:else}{brandMark(
+              $branding.name,
+            )}{/if}
         </span>
         <span>{$branding.name} · {t($language, '分享')}</span>
       </div>
@@ -450,9 +459,7 @@
             <button type="button" onclick={() => navigate('')}>{t($language, '根目录')}</button>
             {#each crumbs as segment, index (index)}
               <span>/</span>
-              <button
-                type="button"
-                onclick={() => navigate(crumbs.slice(0, index + 1).join('/'))}
+              <button type="button" onclick={() => navigate(crumbs.slice(0, index + 1).join('/'))}
                 >{segment}</button
               >
             {/each}
@@ -465,8 +472,7 @@
                 aria-pressed={view === 'grid'}
                 aria-label={t($language, '网格视图')}
                 title={t($language, '网格视图')}
-                onclick={() => setView('grid')}
-                ><Icon name="grid" size={17} /></button
+                onclick={() => setView('grid')}><Icon name="grid" size={17} /></button
               >
               <button
                 type="button"
@@ -474,8 +480,7 @@
                 aria-pressed={view === 'list'}
                 aria-label={t($language, '列表视图')}
                 title={t($language, '列表视图')}
-                onclick={() => setView('list')}
-                ><Icon name="list" size={17} /></button
+                onclick={() => setView('list')}><Icon name="list" size={17} /></button
               >
             </div>
             {#if !data.read_only}
@@ -559,8 +564,7 @@
                       onclick={(event) => {
                         event.stopPropagation();
                         openPreview(entry);
-                      }}
-                      ><Icon name="eye" size={16} /></button
+                      }}><Icon name="eye" size={16} /></button
                     >
                   {:else if !entry.is_dir && isAudio(entry.name)}
                     <button
@@ -654,8 +658,10 @@
               alt={data.name}
             />
           {:else if data.has_preview && isVideo(data.name)}
-            <video class="share-preview" src={api.publicDownloadUrl(token, '', ticket, true)} controls
-              ><track kind="captions" /></video
+            <video
+              class="share-preview"
+              src={api.publicDownloadUrl(token, '', ticket, true)}
+              controls><track kind="captions" /></video
             >
           {:else}
             <FileTypeIcon name={data.name} size={42} />

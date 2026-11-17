@@ -29,6 +29,13 @@ pub struct DeletePreview {
     pub confirm_code: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum UsageInvalidation {
+    Full,
+    Delta(i64),
+    None,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UsageSnapshot {
     pub used_bytes: u64,
@@ -259,6 +266,17 @@ impl AppState {
     }
 
     pub async fn invalidate_path_caches(&self, target: &Path, user_id: Option<i64>, subtree: bool) {
+        self.invalidate_path_caches_with_usage(target, user_id, subtree, UsageInvalidation::Full)
+            .await;
+    }
+
+    pub async fn invalidate_path_caches_with_usage(
+        &self,
+        target: &Path,
+        user_id: Option<i64>,
+        subtree: bool,
+        usage: UsageInvalidation,
+    ) {
         let mut current = Some(target.to_path_buf());
         let mut first = true;
         while let Some(path) = current {
@@ -274,7 +292,22 @@ impl AppState {
             current = path.parent().map(Path::to_path_buf);
         }
         if let Some(user_id) = user_id {
-            self.invalidate_usage(user_id);
+            match usage {
+                UsageInvalidation::Full => self.invalidate_usage(user_id),
+                UsageInvalidation::Delta(delta) => self.adjust_usage(user_id, delta),
+                UsageInvalidation::None => {}
+            }
+        }
+    }
+
+    pub fn adjust_usage(&self, user_id: i64, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mut cache = self.usage_cache.lock();
+        if let Some(snapshot) = cache.get_mut(&user_id) {
+            let adjusted = (snapshot.used_bytes as i64).saturating_add(delta).max(0);
+            snapshot.used_bytes = adjusted as u64;
         }
     }
 

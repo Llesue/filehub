@@ -1,30 +1,26 @@
 <script lang="ts">
-  import { api, type Root, type User, type UserPreferences } from '../api';
+  import { api, type User, type UserPreferences } from '../api';
   import { language, t, type Lang } from '../i18n';
   import { showNotice } from '../notices';
   import AvatarCropper from './AvatarCropper.svelte';
-  import CssPickerDialog from './CssPickerDialog.svelte';
   import Icon from './Icon.svelte';
   import PasswordDialog from './PasswordDialog.svelte';
 
   let {
     user,
     csrf,
-    roots,
     preferences,
     system,
     onPreferences,
   }: {
     user: User;
     csrf: string;
-    roots: Root[];
     preferences: UserPreferences;
     system: { thumbnails: boolean; editor: boolean; terminal: boolean };
     onPreferences: (preferences: UserPreferences) => void;
   } = $props();
 
   let passwordOpen = $state(false);
-  let cssOpen = $state(false);
   let avatarInput = $state<HTMLInputElement | null>(null);
   let avatarCropSrc = $state('');
   let saving = $state(false);
@@ -110,9 +106,10 @@
         value={preferences.theme}
         onchange={(event) =>
           void persist({
-            theme: (event.currentTarget as HTMLSelectElement).value as 'light' | 'dark',
+            theme: (event.currentTarget as HTMLSelectElement).value as 'light' | 'dark' | 'system',
           })}
       >
+        <option value="system">{t($language, '跟随系统')}</option>
         <option value="light">{t($language, '浅色')}</option>
         <option value="dark">{t($language, '深色')}</option>
       </select>
@@ -128,44 +125,26 @@
         <option value="en">English</option>
       </select>
     </label>
-    <div class="pref-row">
-      <span>{t($language, '启用文本文件编辑')}</span>
-      <input
-        type="checkbox"
-        checked={preferences.editor_enabled}
-        disabled={!system.editor}
-        onchange={(event) => void persist({ editor_enabled: event.currentTarget.checked })}
-      />
-    </div>
-    {#if !system.editor}<p class="system-off">
-        {t($language, '系统设置已关闭文本编辑功能。')}
-      </p>{/if}
-    <div class="pref-row">
-      <span>{t($language, '启用终端')}</span>
-      <input
-        type="checkbox"
-        checked={preferences.terminal_enabled}
-        disabled={!system.terminal}
-        onchange={(event) => void persist({ terminal_enabled: event.currentTarget.checked })}
-      />
-    </div>
-    {#if !system.terminal}<p class="system-off">{t($language, '系统设置已关闭终端功能。')}</p>{/if}
-    <div class="pref-row">
-      <span>{t($language, '自定义 CSS')}</span>
-      <div class="inline-actions">
-        <span class="path">{preferences.custom_css_path ?? t($language, '未选择')}</span>
-        <button type="button" class="small" onclick={() => (cssOpen = true)}>
-          {preferences.custom_css_path ? t($language, '更换') : t($language, '选择文件')}
-        </button>
-        {#if preferences.custom_css_path}
-          <button
-            type="button"
-            class="small ghost"
-            onclick={() => void persist({ clear_custom_css: true })}>{t($language, '清除')}</button
-          >
-        {/if}
+    {#if system.editor}
+      <div class="pref-row">
+        <span>{t($language, '启用文本文件编辑')}</span>
+        <input
+          type="checkbox"
+          checked={preferences.editor_enabled}
+          onchange={(event) => void persist({ editor_enabled: event.currentTarget.checked })}
+        />
       </div>
-    </div>
+    {/if}
+    {#if system.terminal}
+      <div class="pref-row">
+        <span>{t($language, '启用终端')}</span>
+        <input
+          type="checkbox"
+          checked={preferences.terminal_enabled}
+          onchange={(event) => void persist({ terminal_enabled: event.currentTarget.checked })}
+        />
+      </div>
+    {/if}
   </section>
 
   <section class="pref-card">
@@ -178,18 +157,16 @@
         onchange={(event) => void persist({ show_hidden: event.currentTarget.checked })}
       />
     </label>
-    <div class="pref-row">
-      <span>{t($language, '显示缩略图')}</span>
-      <input
-        type="checkbox"
-        checked={preferences.show_thumbnails}
-        disabled={!system.thumbnails}
-        onchange={(event) => void persist({ show_thumbnails: event.currentTarget.checked })}
-      />
-    </div>
-    {#if !system.thumbnails}<p class="system-off">
-        {t($language, '系统设置已关闭缩略图功能。')}
-      </p>{/if}
+    {#if system.thumbnails}
+      <div class="pref-row">
+        <span>{t($language, '显示缩略图')}</span>
+        <input
+          type="checkbox"
+          checked={preferences.show_thumbnails}
+          onchange={(event) => void persist({ show_thumbnails: event.currentTarget.checked })}
+        />
+      </div>
+    {/if}
     <label class="pref-row">
       <span>{t($language, '上传同名文件')}</span>
       <select
@@ -221,19 +198,6 @@
     src={avatarCropSrc}
     onConfirm={(blob) => void saveCroppedAvatar(blob)}
     onClose={() => (avatarCropSrc = '')}
-  />
-{/if}
-
-{#if cssOpen}
-  <CssPickerDialog
-    {roots}
-    initialRoot={preferences.custom_css_root_id}
-    initialPath={preferences.custom_css_path ?? ''}
-    onSelect={(rootId, path) => {
-      cssOpen = false;
-      void persist({ custom_css_root_id: rootId, custom_css_path: path });
-    }}
-    onClose={() => (cssOpen = false)}
   />
 {/if}
 
@@ -357,33 +321,6 @@
     width: 18px;
     height: 18px;
     accent-color: var(--accent);
-  }
-  .inline-actions {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    gap: 8px;
-  }
-  .path {
-    overflow: hidden;
-    max-width: 360px;
-    color: var(--text-2);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .small {
-    height: 30px;
-    padding: 0 10px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 12.5px;
-  }
-  .small.ghost {
-    background: transparent;
   }
   .saving {
     color: var(--text-2);

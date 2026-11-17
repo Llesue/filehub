@@ -52,7 +52,7 @@
     type Usage,
     type User,
   } from './lib/api';
-  import { applyTheme, resolveTheme, type Theme } from './lib/theme';
+  import { applyTheme, resolveTheme, type Theme, type ThemePreference } from './lib/theme';
 
   let theme = $state<Theme>('light');
   function storedView(): 'list' | 'thumb' | 'tile' {
@@ -157,6 +157,8 @@
   let terminalOpen = $state(false);
   let transfer = $state<{ mode: 'copy' | 'move'; entries: Entry[] } | null>(null);
   let dragPayload = $state<{ rootId: number; path: string; name: string } | null>(null);
+  let dragOverKey = $state<string | null>(null);
+  let dragOverValid = $state(true);
   let nameDialog = $state<{
     mode: 'mkdir' | 'touch' | 'rename';
     entry: Entry | null;
@@ -316,17 +318,19 @@
     };
   });
 
-  function setTheme(next: Theme): void {
-    theme = next;
+  function setTheme(next: ThemePreference): void {
+    const prefersDark =
+      typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    theme = next === 'system' ? (prefersDark ? 'dark' : 'light') : next;
     applyTheme(theme);
     try {
-      localStorage.setItem('filehub.theme', theme);
+      localStorage.setItem('filehub.theme', next);
     } catch (error) {
       console.warn('could not persist theme preference', error);
     }
   }
 
-  function setThemePreference(next: Theme): void {
+  function setThemePreference(next: ThemePreference): void {
     setTheme(next);
     void savePreference({ theme: next });
   }
@@ -518,6 +522,7 @@
     filesLoading = true;
     filesError = '';
     nextCursor = null;
+    clearDrag();
     startFilesSlowHint();
     try {
       const storedView = resolveViewPreference(
@@ -525,13 +530,17 @@
         localStorage.getItem(`view:${rootId}:${path}`),
       );
       if (storedView) view = storedView;
-      const savedSort = localStorage.getItem(`sort:${rootId}:${path}`);
+      const savedSort =
+        localStorage.getItem(`sort:${rootId}:${path}`) ?? localStorage.getItem('filehub.sort');
       if (savedSort) {
         const [field, order] = savedSort.split(':');
         if (field === 'name' || field === 'size' || field === 'modified') {
           sortField = field;
           sortOrder = order === 'desc' ? 'desc' : 'asc';
         }
+      } else {
+        sortField = 'name';
+        sortOrder = 'asc';
       }
       const result = await api.list(
         rootId,
@@ -1425,10 +1434,41 @@
     }
   }
 
-  function allowDrop(event: DragEvent): void {
+  function entryDragKey(entry: Entry): string {
+    return activeRootId === null ? '' : `${activeRootId}:${joinPath(currentPath, entry.name)}`;
+  }
+
+  function handleDragOver(event: DragEvent, entry: Entry): void {
+    if (!entry.is_dir || !dragPayload || activeRootId === null) return;
     event.preventDefault();
     event.stopPropagation();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    const destPath = joinPath(currentPath, entry.name);
+    const key = `${activeRootId}:${destPath}`;
+    const sameRoot = dragPayload.rootId === activeRootId;
+    const invalid =
+      currentReadOnly ||
+      (sameRoot && (dragPayload.path === destPath || destPath.startsWith(`${dragPayload.path}/`)));
+    dragOverKey = key;
+    dragOverValid = !invalid;
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = invalid ? 'none' : 'move';
+    }
+  }
+
+  function handleDragLeave(event: DragEvent, entry: Entry): void {
+    const target = event.currentTarget as HTMLElement;
+    const related = event.relatedTarget as Node | null;
+    if (related && target.contains(related)) return;
+    if (dragOverKey === entryDragKey(entry)) {
+      dragOverKey = null;
+      dragOverValid = true;
+    }
+  }
+
+  function clearDrag(): void {
+    dragPayload = null;
+    dragOverKey = null;
+    dragOverValid = true;
   }
 
   async function waitForTransferJob(jobId: string): Promise<TransferJobResult | null> {
@@ -1475,7 +1515,7 @@
     event.preventDefault();
     event.stopPropagation();
     const payload = dragPayload;
-    dragPayload = null;
+    clearDrag();
     if (!payload) return;
     if (payload.rootId === destRoot && payload.path === destPath) return;
     if (payload.rootId === destRoot && destPath.startsWith(`${payload.path}/`)) {
@@ -1495,6 +1535,7 @@
       await waitForTransferJob(job.job_id);
       updateProgress(1, t($language, '完成'));
       finishProgress();
+      showToast(t($language, '已移动到 {name}', { name: destPath.split('/').pop() ?? destPath }));
       clearDirSizeCache();
       if (activeRootId !== null) await loadList(activeRootId, currentPath);
     } catch (error) {
@@ -1938,6 +1979,7 @@
     }
     if (activeRootId !== null) {
       localStorage.setItem(`sort:${activeRootId}:${currentPath}`, `${sortField}:${sortOrder}`);
+      localStorage.setItem('filehub.sort', `${sortField}:${sortOrder}`);
       void loadList(activeRootId, currentPath);
     }
   }
@@ -2067,8 +2109,8 @@
 
 <svelte:head>
   <title>{pageTitle}</title>
-  {#if preferences?.custom_css_path && preferences.custom_css_version > 0}
-    <link rel="stylesheet" href={api.customCssUrl(preferences.custom_css_version)} />
+  {#if $branding.customCssVersion > 0}
+    <link rel="stylesheet" href={api.customCssUrl($branding.customCssVersion)} />
   {/if}
 </svelte:head>
 
@@ -2420,7 +2462,6 @@
                   <PreferencesPage
                     {user}
                     {csrf}
-                    {roots}
                     {preferences}
                     system={systemFeatures}
                     onPreferences={applyPreferences}
@@ -2656,6 +2697,12 @@
                           <tr
                             data-entry-name={entry.name}
                             class:selected={isSelected(entry.name)}
+                            class:drag-source={dragPayload?.rootId === activeRootId &&
+                              dragPayload?.path === joinPath(currentPath, entry.name)}
+                            class:drop-target={entry.is_dir && dragOverKey === entryDragKey(entry)}
+                            class:drop-invalid={entry.is_dir &&
+                              dragOverKey === entryDragKey(entry) &&
+                              !dragOverValid}
                             class:marquee-selected={marqueePreview.includes(entry.name)}
                             tabindex="0"
                             aria-selected={isSelected(entry.name)}
@@ -2673,10 +2720,9 @@
                             ondblclick={() => enterEntry(entry)}
                             oncontextmenu={(event) => openContextMenu(event, entry)}
                             ondragstart={(event) => startDrag(event, entry)}
-                            ondragend={() => (dragPayload = null)}
-                            ondragover={(event) => {
-                              if (entry.is_dir) allowDrop(event);
-                            }}
+                            ondragend={clearDrag}
+                            ondragover={(event) => handleDragOver(event, entry)}
+                            ondragleave={(event) => handleDragLeave(event, entry)}
                             ondrop={(event) => {
                               if (entry.is_dir) {
                                 void dropInto(
@@ -2780,6 +2826,12 @@
                           class="file-card"
                           data-entry-name={entry.name}
                           class:selected={isSelected(entry.name)}
+                          class:drag-source={dragPayload?.rootId === activeRootId &&
+                            dragPayload?.path === joinPath(currentPath, entry.name)}
+                          class:drop-target={entry.is_dir && dragOverKey === entryDragKey(entry)}
+                          class:drop-invalid={entry.is_dir &&
+                            dragOverKey === entryDragKey(entry) &&
+                            !dragOverValid}
                           class:marquee-selected={marqueePreview.includes(entry.name)}
                           role="button"
                           tabindex="0"
@@ -2788,10 +2840,9 @@
                           ondblclick={() => enterEntry(entry)}
                           oncontextmenu={(event) => openContextMenu(event, entry)}
                           ondragstart={(event) => startDrag(event, entry)}
-                          ondragend={() => (dragPayload = null)}
-                          ondragover={(event) => {
-                            if (entry.is_dir) allowDrop(event);
-                          }}
+                          ondragend={clearDrag}
+                          ondragover={(event) => handleDragOver(event, entry)}
+                          ondragleave={(event) => handleDragLeave(event, entry)}
                           ondrop={(event) => {
                             if (entry.is_dir) {
                               void dropInto(
@@ -2875,6 +2926,12 @@
                           class="file-tile"
                           data-entry-name={entry.name}
                           class:selected={isSelected(entry.name)}
+                          class:drag-source={dragPayload?.rootId === activeRootId &&
+                            dragPayload?.path === joinPath(currentPath, entry.name)}
+                          class:drop-target={entry.is_dir && dragOverKey === entryDragKey(entry)}
+                          class:drop-invalid={entry.is_dir &&
+                            dragOverKey === entryDragKey(entry) &&
+                            !dragOverValid}
                           class:marquee-selected={marqueePreview.includes(entry.name)}
                           role="button"
                           tabindex="0"
@@ -2883,10 +2940,9 @@
                           ondblclick={() => enterEntry(entry)}
                           oncontextmenu={(event) => openContextMenu(event, entry)}
                           ondragstart={(event) => startDrag(event, entry)}
-                          ondragend={() => (dragPayload = null)}
-                          ondragover={(event) => {
-                            if (entry.is_dir) allowDrop(event);
-                          }}
+                          ondragend={clearDrag}
+                          ondragover={(event) => handleDragOver(event, entry)}
+                          ondragleave={(event) => handleDragLeave(event, entry)}
                           ondrop={(event) => {
                             if (entry.is_dir) {
                               void dropInto(
@@ -3043,11 +3099,8 @@
           >{t($language, '移动到…')}</button
         >
       {/if}
-      <div class="menu-sep"></div>
-      {#if currentReadOnly}
-        <button type="button" role="menuitem" class="danger" disabled>{t($language, '删除')}</button
-        >
-      {:else}
+      {#if !currentReadOnly}
+        <div class="menu-sep"></div>
         <button
           type="button"
           role="menuitem"
@@ -3070,39 +3123,38 @@
       onclick={(event) => event.stopPropagation()}
       onkeydown={menuKeydown}
     >
-      <button
-        type="button"
-        role="menuitem"
-        disabled={currentReadOnly}
-        onclick={() => {
-          blankMenu = null;
-          openMkdir();
-        }}>{t($language, '新建目录')}</button
-      >
-      <button
-        type="button"
-        role="menuitem"
-        disabled={currentReadOnly}
-        onclick={() => {
-          blankMenu = null;
-          nameDialog = {
-            mode: 'touch',
-            entry: null,
-            title: t($language, '新建文件'),
-            label: t($language, '文件名称'),
-            initialValue: '',
-          };
-        }}>{t($language, '新建文件')}</button
-      >
-      <button
-        type="button"
-        role="menuitem"
-        disabled={currentReadOnly}
-        onclick={() => {
-          blankMenu = null;
-          folderUploadClick();
-        }}>{t($language, '上传目录')}</button
-      >
+      {#if !currentReadOnly}
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            blankMenu = null;
+            openMkdir();
+          }}>{t($language, '新建目录')}</button
+        >
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            blankMenu = null;
+            nameDialog = {
+              mode: 'touch',
+              entry: null,
+              title: t($language, '新建文件'),
+              label: t($language, '文件名称'),
+              initialValue: '',
+            };
+          }}>{t($language, '新建文件')}</button
+        >
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            blankMenu = null;
+            folderUploadClick();
+          }}>{t($language, '上传目录')}</button
+        >
+      {/if}
       <button
         type="button"
         role="menuitem"
@@ -3894,6 +3946,28 @@
 
   .file-table tbody tr.selected {
     background: var(--accent-soft);
+  }
+
+  .file-table tbody tr.drag-source,
+  .file-card.drag-source,
+  .file-tile.drag-source {
+    opacity: 0.45;
+  }
+
+  .file-table tbody tr.drop-target,
+  .file-card.drop-target,
+  .file-tile.drop-target {
+    background: var(--accent-soft);
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .file-table tbody tr.drop-invalid,
+  .file-card.drop-invalid,
+  .file-tile.drop-invalid {
+    outline: 2px dashed var(--danger);
+    outline-offset: -2px;
+    cursor: not-allowed;
   }
 
   .file-table tbody tr.marquee-selected,

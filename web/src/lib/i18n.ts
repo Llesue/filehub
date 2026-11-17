@@ -240,6 +240,26 @@ const en: Record<string, string> = {
   '选择 CSS 文件': 'Select a CSS file',
   '选择自定义 CSS': 'Choose custom CSS',
   '自定义 CSS': 'Custom CSS',
+  共享已停止: 'Sharing has been stopped',
+  共享已过期: 'This share has expired',
+  分享不存在或链接无效: 'Share does not exist or the link is invalid',
+  功能开关: 'Feature switches',
+  '关闭后，用户偏好设置中的对应选项会隐藏。后端仍会强制关闭该功能。':
+    'The matching option is hidden from user preferences when disabled. The backend still enforces it.',
+  下载与配额: 'Downloads and quotas',
+  新用户默认值: 'New user defaults',
+  '只影响新建用户；已有用户继续使用自己的偏好。':
+    'These defaults only apply to new users. Existing users keep their own preferences.',
+  移除外部路径: 'Remove external path',
+  '从用户「{username}」移除「{alias}」？': 'Remove "{alias}" from user "{username}"?',
+  删除外部路径: 'Delete external path',
+  '删除外部路径「{alias}」？': 'Delete external path "{alias}"?',
+  移除: 'Remove',
+  '已移动到 {name}': 'Moved to {name}',
+  '全局生效，所有页面和分享页都会加载。最多 256 KiB。':
+    'Applies globally to every page and share page. Maximum 256 KiB.',
+  '在此粘贴 CSS': 'Paste CSS here',
+  已清除: 'Cleared',
 
   // Share dialog / edit
   创建分享失败: 'Failed to create share',

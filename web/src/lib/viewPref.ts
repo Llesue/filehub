@@ -1,15 +1,14 @@
 export type FileView = 'list' | 'thumb' | 'tile';
 
 /**
- * Resolve the view for a directory. The global preference wins so switching
- * directories keeps the user's chosen layout; old per-path values still work
- * as a fallback for users upgrading from 0.1.3.
+ * Resolve the view for a directory. A per-directory value wins; the global
+ * value is only a default for directories that do not have one yet.
  */
 export function resolveViewPreference(
   globalValue: string | null,
   pathValue: string | null,
 ): FileView | null {
-  const value = globalValue ?? pathValue;
+  const value = pathValue ?? globalValue;
   if (value === 'list' || value === 'thumb' || value === 'tile') return value;
   if (value === 'grid') return 'thumb';
   return null;

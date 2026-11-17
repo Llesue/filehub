@@ -10,6 +10,7 @@
     toggleAudio,
   } from '../audio';
   import { language, t } from '../i18n';
+  import Icon from './Icon.svelte';
 
   let audio = $state<HTMLAudioElement | null>(null);
   let currentKey = '';
@@ -78,6 +79,9 @@
   }
 
   function startDrag(event: PointerEvent): void {
+    if ((event.target as HTMLElement | null)?.closest('button')) {
+      return;
+    }
     dragging = true;
     dragStart = {
       x: event.clientX,
@@ -105,6 +109,15 @@
       // ignore storage failures
     }
   }
+
+  function stopPlayback(): void {
+    stopAudio();
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+    }
+    currentTime = 0;
+  }
 </script>
 
 {#if current && $audioState}
@@ -122,25 +135,41 @@
       title={t($language, '拖动播放器')}
     >
       <span class="audio-title" title={current.name}>{current.name}</span>
-      <button type="button" class="icon" aria-label={t($language, '关闭播放器')} onclick={closeAudio}
-        >×</button
+      <button
+        type="button"
+        class="icon close"
+        aria-label={t($language, '关闭播放器')}
+        title={t($language, '关闭播放器')}
+        onpointerdown={(event) => event.stopPropagation()}
+        onclick={closeAudio}><Icon name="close" size={16} /></button
       >
     </header>
     <div class="audio-controls">
-      <button type="button" onclick={previousAudio} aria-label={t($language, '上一首')}
-        >|‹</button
+      <button
+        type="button"
+        onclick={previousAudio}
+        aria-label={t($language, '上一首')}
+        title={t($language, '上一首')}><Icon name="previous" size={16} /></button
       >
       <button
         type="button"
+        class="primary"
         onclick={toggleAudio}
         aria-label={$audioState.playing ? t($language, '暂停') : t($language, '播放')}
-        >{$audioState.playing ? t($language, '暂停') : t($language, '播放')}</button
+        title={$audioState.playing ? t($language, '暂停') : t($language, '播放')}
+        ><Icon name={$audioState.playing ? 'pause' : 'play'} size={16} /></button
       >
-      <button type="button" onclick={stopAudio} aria-label={t($language, '停止')}
-        >{t($language, '停止')}</button
+      <button
+        type="button"
+        onclick={stopPlayback}
+        aria-label={t($language, '停止')}
+        title={t($language, '停止')}><Icon name="stop" size={16} /></button
       >
-      <button type="button" onclick={nextAudio} aria-label={t($language, '下一首')}
-        >›|</button
+      <button
+        type="button"
+        onclick={nextAudio}
+        aria-label={t($language, '下一首')}
+        title={t($language, '下一首')}><Icon name="next" size={16} /></button
       >
     </div>
     <div class="audio-progress">
@@ -175,6 +204,7 @@
     bottom: 20px;
     z-index: 90;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     width: min(320px, calc(100vw - 32px));
     gap: 8px;
     padding: 10px 12px 12px;
@@ -186,6 +216,7 @@
 
   header {
     display: flex;
+    min-width: 0;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
@@ -194,6 +225,9 @@
   }
 
   .audio-title {
+    flex: 1 1 0;
+    width: 0;
+    min-width: 0;
     overflow: hidden;
     color: var(--text);
     font-size: 13px;
@@ -203,6 +237,7 @@
   }
 
   .icon {
+    flex: 0 0 auto;
     width: 24px;
     height: 24px;
     border: 0;
@@ -218,8 +253,11 @@
   }
 
   .audio-controls button {
-    height: 28px;
-    padding: 0 8px;
+    display: grid;
+    width: 32px;
+    height: 30px;
+    place-items: center;
+    padding: 0;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface-2);
@@ -227,7 +265,7 @@
     font-size: 12.5px;
   }
 
-  .audio-controls button:nth-child(2) {
+  .audio-controls button.primary {
     border-color: var(--accent);
     background: var(--accent);
     color: var(--on-accent);

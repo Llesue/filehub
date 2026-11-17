@@ -711,3 +711,47 @@ async fn collection_share_lists_downloads_and_zips_selected_files() {
         .unwrap();
     assert_eq!(share["item_count"], 3);
 }
+
+#[tokio::test]
+async fn revoked_share_reports_gone_instead_of_not_found() {
+    let app = setup_app().await;
+    let token = create_share(&app, "pub", true, None).await;
+    let list = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/shares?limit=10",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    let shares = json_body(list).await;
+    let id = shares["shares"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|share| share["real_path"].as_str().unwrap().ends_with("/pub"))
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let revoke = send_json(
+        &app.router,
+        Method::DELETE,
+        &format!("/api/v1/shares/{id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({}),
+    )
+    .await;
+    assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::GONE);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "SHARE_REVOKED");
+}

@@ -27,12 +27,15 @@
   let status = $state<Awaited<ReturnType<typeof api.adminStatus>> | null>(null);
   let roots = $state<Record<number, AdminRoot[]>>({});
   let loading = $state(true);
+  let loadedOnce = false;
   let createOpen = $state(false);
   let pathOpen = $state(false);
   let quotaUser = $state<User | null>(null);
   let passwordUser = $state<User | null>(null);
   let assignUser = $state<User | null>(null);
   let deleteUser = $state<User | null>(null);
+  let removeRootTarget = $state<{ user: User; root: AdminRoot } | null>(null);
+  let deletePathTarget = $state<ServerPath | null>(null);
   let editingPathId = $state<number | null>(null);
   let editingPathAlias = $state('');
   let editingPathOriginal = $state('');
@@ -46,7 +49,7 @@
   }
 
   async function load(): Promise<void> {
-    loading = true;
+    if (!loadedOnce) loading = true;
     try {
       const [userResult, pathResult, settingsResult] = await Promise.all([
         api.listUsers(),
@@ -70,6 +73,7 @@
       showNotice(error instanceof Error ? error.message : t($language, '管理数据加载失败'));
     } finally {
       loading = false;
+      loadedOnce = true;
       scheduleUsagePoll();
     }
   }
@@ -223,7 +227,10 @@
     }
   }
 
-  async function deletePath(path: ServerPath): Promise<void> {
+  async function confirmDeletePath(): Promise<void> {
+    const path = deletePathTarget;
+    deletePathTarget = null;
+    if (!path) return;
     try {
       await api.deleteServerPath(path.id, csrf);
       await load();
@@ -248,9 +255,12 @@
     }
   }
 
-  async function removeRoot(user: User, root: AdminRoot): Promise<void> {
+  async function confirmRemoveRoot(): Promise<void> {
+    const target = removeRootTarget;
+    removeRootTarget = null;
+    if (!target) return;
     try {
-      await api.deleteRoot(user.id, root.id, csrf);
+      await api.deleteRoot(target.user.id, target.root.id, csrf);
       await load();
       onRootsChanged?.();
     } catch (error) {
@@ -297,6 +307,51 @@
       brandReady = true;
     }
   });
+
+  let customCssInput = $state('');
+  let customCssBusy = $state(false);
+  let loadedCssVersion = -1;
+
+  $effect(() => {
+    const version = $branding.customCssVersion;
+    if (version === loadedCssVersion) return;
+    loadedCssVersion = version;
+    if (version <= 0) {
+      customCssInput = '';
+      return;
+    }
+    void fetch(api.customCssUrl(version), { credentials: 'include' })
+      .then((response) => (response.ok ? response.text() : ''))
+      .then((text) => (customCssInput = text))
+      .catch((error) => console.warn('could not load custom CSS', error));
+  });
+
+  async function saveCustomCss(): Promise<void> {
+    customCssBusy = true;
+    try {
+      await api.saveCustomCss(customCssInput, csrf);
+      await loadBranding();
+      showNotice(t($language, '已保存'), 'info', t($language, '自定义 CSS'));
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '保存失败'));
+    } finally {
+      customCssBusy = false;
+    }
+  }
+
+  async function clearCustomCss(): Promise<void> {
+    customCssBusy = true;
+    try {
+      await api.clearCustomCss(csrf);
+      customCssInput = '';
+      await loadBranding();
+      showNotice(t($language, '已清除'), 'info', t($language, '自定义 CSS'));
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '操作失败'));
+    } finally {
+      customCssBusy = false;
+    }
+  }
 
   async function saveBrandName(): Promise<void> {
     const value = brandNameInput.trim();
@@ -467,7 +522,7 @@
                 <button
                   type="button"
                   class="text-button danger"
-                  onclick={() => void removeRoot(user, root)}>{t($language, '删除')}</button
+                  onclick={() => (removeRootTarget = { user, root })}>{t($language, '删除')}</button
                 >
               </div>
             {/each}
@@ -512,7 +567,7 @@
             >
           {/if}
           <span class="root-path">{path.real_path}</span>
-          <button type="button" class="text-button danger" onclick={() => void deletePath(path)}
+          <button type="button" class="text-button danger" onclick={() => (deletePathTarget = path)}
             >{t($language, '删除')}</button
           >
         </div>
@@ -559,96 +614,145 @@
         </div>
       </div>
       <p class="brand-hint">{t($language, '仅支持 PNG/JPEG/WebP，最大 2MB，建议正方形。')}</p>
+      <div class="settings-group">
+        <h3>{t($language, '自定义 CSS')}</h3>
+        <p class="settings-hint">
+          {t($language, '全局生效，所有页面和分享页都会加载。最多 256 KiB。')}
+        </p>
+        <textarea
+          bind:value={customCssInput}
+          rows="8"
+          spellcheck="false"
+          placeholder={t($language, '在此粘贴 CSS')}></textarea>
+        <div class="css-actions">
+          <button
+            type="button"
+            class="small"
+            disabled={customCssBusy}
+            onclick={() => void saveCustomCss()}>{t($language, '保存')}</button
+          >
+          <button
+            type="button"
+            class="small ghost"
+            disabled={customCssBusy}
+            onclick={() => void clearCustomCss()}>{t($language, '清除')}</button
+          >
+        </div>
+      </div>
     </section>
 
     <section class="admin-section">
       <h2>{t($language, '系统设置')}</h2>
-      <div class="setting-grid">
-        <label class="setting-row"
-          ><span>{t($language, '缩略图')}</span><input
-            type="checkbox"
-            checked={Boolean(setting('thumbnails.enabled'))}
-            onchange={(event) => void setSetting('thumbnails.enabled', event.currentTarget.checked)}
-          /></label
-        >
-        <div class="setting-row wide">
-          <span>{t($language, 'ZIP 下载限制')}</span>
-          <div class="zip-fields">
-            <label class="zip-field"
-              ><span>{t($language, '最大大小')}</span>
-              <input bind:value={zipMaxGb} type="number" min="0" step="1" /><span>GB</span></label
-            >
-            <label class="zip-field"
-              ><span>{t($language, '最大文件数')}</span>
-              <input bind:value={zipMaxFiles} type="number" min="0" step="1" /></label
-            >
-            <label class="zip-field"
-              ><span>{t($language, '并发数')}</span>
-              <input bind:value={zipConcurrency} type="number" min="1" step="1" /></label
-            >
-            <button type="button" class="small" onclick={() => void saveZipSettings()}
-              >{t($language, '保存')}</button
-            >
-          </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '功能开关')}</h3>
+        <p class="settings-hint">
+          {t($language, '关闭后，用户偏好设置中的对应选项会隐藏。后端仍会强制关闭该功能。')}
+        </p>
+        <div class="setting-grid">
+          <label class="setting-row"
+            ><span>{t($language, '缩略图')}</span><input
+              type="checkbox"
+              checked={Boolean(setting('thumbnails.enabled'))}
+              onchange={(event) =>
+                void setSetting('thumbnails.enabled', event.currentTarget.checked)}
+            /></label
+          >
+          <label class="setting-row"
+            ><span>{t($language, '文本编辑器')}</span><input
+              type="checkbox"
+              checked={Boolean(setting('editor.enabled'))}
+              onchange={(event) => void setSetting('editor.enabled', event.currentTarget.checked)}
+            /></label
+          >
+          <label class="setting-row"
+            ><span>{t($language, '终端')}</span><input
+              type="checkbox"
+              checked={Boolean(setting('terminal_enabled'))}
+              onchange={(event) => void setSetting('terminal_enabled', event.currentTarget.checked)}
+            /></label
+          >
         </div>
-        <label class="setting-row"
-          ><span>{t($language, '文本编辑器')}</span><input
-            type="checkbox"
-            checked={Boolean(setting('editor.enabled'))}
-            onchange={(event) => void setSetting('editor.enabled', event.currentTarget.checked)}
-          /></label
-        >
-        <label class="setting-row"
-          ><span>{t($language, '终端')}</span><input
-            type="checkbox"
-            checked={Boolean(setting('terminal_enabled'))}
-            onchange={(event) => void setSetting('terminal_enabled', event.currentTarget.checked)}
-          /></label
-        >
-        <label class="setting-row"
-          ><span>{t($language, '默认显示隐藏文件')}</span><input
-            type="checkbox"
-            checked={Boolean(setting('show_hidden_default'))}
-            onchange={(event) =>
-              void setSetting('show_hidden_default', event.currentTarget.checked)}
-          /></label
-        >
-        <label class="setting-row"
-          ><span>{t($language, '默认主题')}</span><select
-            value={String(setting('ui.default_theme') ?? 'system')}
-            onchange={(event) => void setSetting('ui.default_theme', event.currentTarget.value)}
-            ><option value="system">{t($language, '跟随系统')}</option><option value="light"
-              >{t($language, '浅色')}</option
-            ><option value="dark">{t($language, '深色')}</option></select
-          ></label
-        >
-        <label class="setting-row"
-          ><span>{t($language, '默认语言')}</span><select
-            value={String(setting('ui.default_locale') ?? 'zh-CN')}
-            onchange={(event) => void setSetting('ui.default_locale', event.currentTarget.value)}
-            ><option value="zh-CN">{t($language, '中文')}</option><option value="en">English</option
-            ></select
-          ></label
-        >
-        <label class="setting-row"
-          ><span>{t($language, '上传同名文件')}</span><select
-            value={String(setting('upload_conflict_default') ?? 'rename')}
-            onchange={(event) =>
-              void setSetting('upload_conflict_default', event.currentTarget.value)}
-            ><option value="rename">{t($language, '自动重命名')}</option><option value="overwrite"
-              >{t($language, '覆盖')}</option
-            ><option value="skip">{t($language, '跳过')}</option></select
-          ></label
-        >
-        <label class="setting-row"
-          ><span>{t($language, '默认配额')}</span>
-          <div class="quota-setting">
-            <input bind:value={defaultQuotaGb} type="number" min="0" step="1" /><span>GB</span
-            ><button type="button" class="small" onclick={() => void saveDefaultQuota()}
-              >{t($language, '保存')}</button
-            >
-          </div></label
-        >
+      </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '下载与配额')}</h3>
+        <div class="setting-grid">
+          <div class="setting-row wide">
+            <span>{t($language, 'ZIP 下载限制')}</span>
+            <div class="zip-fields">
+              <label class="zip-field"
+                ><span>{t($language, '最大大小')}</span>
+                <input bind:value={zipMaxGb} type="number" min="0" step="1" /><span>GB</span></label
+              >
+              <label class="zip-field"
+                ><span>{t($language, '最大文件数')}</span>
+                <input bind:value={zipMaxFiles} type="number" min="0" step="1" /></label
+              >
+              <label class="zip-field"
+                ><span>{t($language, '并发数')}</span>
+                <input bind:value={zipConcurrency} type="number" min="1" step="1" /></label
+              >
+              <button type="button" class="small" onclick={() => void saveZipSettings()}
+                >{t($language, '保存')}</button
+              >
+            </div>
+          </div>
+          <label class="setting-row"
+            ><span>{t($language, '默认配额')}</span>
+            <div class="quota-setting">
+              <input bind:value={defaultQuotaGb} type="number" min="0" step="1" /><span>GB</span
+              ><button type="button" class="small" onclick={() => void saveDefaultQuota()}
+                >{t($language, '保存')}</button
+              >
+            </div></label
+          >
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '新用户默认值')}</h3>
+        <p class="settings-hint">
+          {t($language, '只影响新建用户；已有用户继续使用自己的偏好。')}
+        </p>
+        <div class="setting-grid">
+          <label class="setting-row"
+            ><span>{t($language, '默认显示隐藏文件')}</span><input
+              type="checkbox"
+              checked={Boolean(setting('show_hidden_default'))}
+              onchange={(event) =>
+                void setSetting('show_hidden_default', event.currentTarget.checked)}
+            /></label
+          >
+          <label class="setting-row"
+            ><span>{t($language, '默认主题')}</span><select
+              value={String(setting('ui.default_theme') ?? 'system')}
+              onchange={(event) => void setSetting('ui.default_theme', event.currentTarget.value)}
+              ><option value="system">{t($language, '跟随系统')}</option><option value="light"
+                >{t($language, '浅色')}</option
+              ><option value="dark">{t($language, '深色')}</option></select
+            ></label
+          >
+          <label class="setting-row"
+            ><span>{t($language, '默认语言')}</span><select
+              value={String(setting('ui.default_locale') ?? 'zh-CN')}
+              onchange={(event) => void setSetting('ui.default_locale', event.currentTarget.value)}
+              ><option value="zh-CN">{t($language, '中文')}</option><option value="en"
+                >English</option
+              ></select
+            ></label
+          >
+          <label class="setting-row"
+            ><span>{t($language, '上传同名文件')}</span><select
+              value={String(setting('upload_conflict_default') ?? 'rename')}
+              onchange={(event) =>
+                void setSetting('upload_conflict_default', event.currentTarget.value)}
+              ><option value="rename">{t($language, '自动重命名')}</option><option value="overwrite"
+                >{t($language, '覆盖')}</option
+              ><option value="skip">{t($language, '跳过')}</option></select
+            ></label
+          >
+        </div>
       </div>
     </section>
   {/if}
@@ -681,6 +785,27 @@
     onClose={() => (assignUser = null)}
     onAssign={assignPath}
   />{/if}
+{#if removeRootTarget}<ConfirmDialog
+    open
+    title={t($language, '移除外部路径')}
+    message={t($language, '从用户「{username}」移除「{alias}」？', {
+      username: removeRootTarget.user.username,
+      alias: removeRootTarget.root.alias,
+    })}
+    confirmLabel={t($language, '移除')}
+    danger
+    onConfirm={() => void confirmRemoveRoot()}
+    onCancel={() => (removeRootTarget = null)}
+  />{/if}
+{#if deletePathTarget}<ConfirmDialog
+    open
+    title={t($language, '删除外部路径')}
+    message={t($language, '删除外部路径「{alias}」？', { alias: deletePathTarget.alias })}
+    confirmLabel={t($language, '删除')}
+    danger
+    onConfirm={() => void confirmDeletePath()}
+    onCancel={() => (deletePathTarget = null)}
+  />{/if}
 {#if deleteUser}<ConfirmDialog
     open
     title={t($language, '删除用户')}
@@ -688,6 +813,7 @@
       username: deleteUser.username,
     })}
     confirmLabel={t($language, '删除')}
+    requireText={deleteUser.username}
     danger
     onConfirm={() => void confirmDelete()}
     onCancel={() => (deleteUser = null)}
@@ -734,6 +860,41 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+  }
+  .settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .settings-group h3 {
+    margin: 8px 0 0;
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .settings-hint {
+    margin: 0;
+    color: var(--text-2);
+    font-size: 12.5px;
+  }
+  .settings-group textarea {
+    width: 100%;
+    min-height: 140px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    resize: vertical;
+  }
+  .css-actions {
+    display: flex;
+    gap: 8px;
+  }
+  .small.ghost {
+    background: transparent;
   }
   .section-heading {
     display: flex;

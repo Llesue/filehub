@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.1.6 - 2026-11-17
+
+### Added
+
+- Video thumbnails seek to one third of the duration using ffmpeg metadata only; no ffprobe dependency. Probe failures fall back to the configured second offset.
+- Per-directory view and sort preferences, with global defaults for directories that have no saved choice yet.
+- Admin-controlled global custom CSS, served from a public immutable endpoint and applied to the app, login and share pages.
+- Expanded file type icons: Windows executables/libraries/installers/shortcuts, fonts, disk images, ebooks, design files, databases, Office/WPS/iWork/OFD and more media formats.
+- Drag-and-drop feedback: source dimming, valid/invalid target highlighting and move completion toast.
+- Audio player uses play/pause/stop/previous/next icons; stop resets playback to 0:00.
+
+### Changed
+
+- System settings are grouped into feature switches, downloads/quotas, and new-user defaults. Disabling thumbnails, editor or terminal now hides the matching user preference row.
+- New users inherit the current system defaults for hidden files, theme (including follow-system), language, upload conflict policy, quota and feature switches.
+- Editor saves update usage by file-size delta instead of invalidating and rescanning the whole home directory.
+- Deleting a user is now a soft delete: the row is retained, the user disappears from the admin list, sessions/API tokens are removed, shares are revoked, and the home directory is preserved.
+- Soft-deleted and disabled users cannot authenticate; last-admin and self-delete checks remain.
+- Stopped shares return 410 `SHARE_REVOKED`; expired shares return 410 `SHARE_EXPIRED`; unknown links remain 404. The share page shows the matching message.
+- Admin refreshes keep the page mounted and preserve scroll position; external path and root removals require confirmation.
+- Removed two duplicate indexes from `index_entries` (migration `0021`); new installs and upgrades stop maintaining redundant B-trees.
+
+### Fixed
+
+- Read-only context menus hide rename, move, delete, new file/folder and upload actions instead of leaving disabled entries.
+- Audio player close button no longer loses clicks to the drag handler; long titles truncate without pushing the close button out.
+- Admin user deletion requires typing the username before confirming.
+- Admin pages no longer unmount the whole panel during background refreshes.
+
+### Verification
+
+- `cargo test --all-targets`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`.
+- `pnpm lint`, `pnpm check`, `pnpm test`, `vite build`.
+- Playwright coverage for admin grouping/preferences hiding, scroll preservation, soft delete, revoked shares, read-only menus, drag/drop, audio controls and file icons.
+
 ## v0.1.5 - 2026-11-17
 
 ### Fixed

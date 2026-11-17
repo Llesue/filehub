@@ -11,6 +11,7 @@
     "jpeg_max_pixels": 250000000,
     "video": true,
     "video_seek_seconds": 1,
+    "video_seek_percent": 33,
     "video_timeout_secs": 15,
     "cache_max_bytes": 2147483648
   },

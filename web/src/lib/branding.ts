@@ -4,6 +4,7 @@ export interface Branding {
   name: string;
   iconUrl: string | null;
   version: number;
+  customCssVersion: number;
   loaded: boolean;
 }
 
@@ -11,6 +12,7 @@ const initial: Branding = {
   name: 'FileHub',
   iconUrl: null,
   version: 0,
+  customCssVersion: 0,
   loaded: false,
 };
 
@@ -32,11 +34,13 @@ export async function loadBranding(): Promise<void> {
       name?: string;
       version?: number;
       icon_url?: string | null;
+      custom_css_version?: number;
     };
     const next: Branding = {
       name: data.name?.trim() || 'FileHub',
       iconUrl: data.icon_url ?? null,
       version: data.version ?? 0,
+      customCssVersion: data.custom_css_version ?? 0,
       loaded: true,
     };
     branding.set(next);

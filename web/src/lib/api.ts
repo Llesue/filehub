@@ -1,16 +1,13 @@
 export type Role = 'admin' | 'user';
 
 export interface UserPreferences {
-  theme: 'light' | 'dark';
+  theme: 'light' | 'dark' | 'system';
   language: 'zh-CN' | 'en';
   show_hidden: boolean;
   show_thumbnails: boolean;
   upload_conflict: 'rename' | 'overwrite' | 'skip';
   terminal_enabled: boolean;
   editor_enabled: boolean;
-  custom_css_root_id: number | null;
-  custom_css_path: string | null;
-  custom_css_version: number;
   avatar_version: number;
 }
 
@@ -1013,16 +1010,13 @@ export const api = {
 
   updatePreferences(
     patch: Partial<{
-      theme: 'light' | 'dark';
+      theme: 'light' | 'dark' | 'system';
       language: 'zh-CN' | 'en';
       show_hidden: boolean;
       show_thumbnails: boolean;
       upload_conflict: 'rename' | 'overwrite' | 'skip';
       terminal_enabled: boolean;
       editor_enabled: boolean;
-      clear_custom_css: boolean;
-      custom_css_root_id: number;
-      custom_css_path: string;
     }>,
     csrf: string,
   ): Promise<PreferencesResponse> {
@@ -1038,7 +1032,15 @@ export const api = {
   },
 
   customCssUrl(version: number): string {
-    return `${BASE}/me/custom-css?v=${version}`;
+    return `${BASE}/custom.css?v=${version}`;
+  },
+
+  saveCustomCss(content: string, csrf: string): Promise<{ version: number }> {
+    return request('/admin/custom-css', { method: 'PUT', body: JSON.stringify({ content }) }, csrf);
+  },
+
+  clearCustomCss(csrf: string): Promise<{ version: number }> {
+    return request('/admin/custom-css', { method: 'DELETE' }, csrf);
   },
 
   async uploadAvatar(file: Blob, csrf: string): Promise<PreferencesResponse> {

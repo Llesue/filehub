@@ -8,6 +8,10 @@
     | 'image'
     | 'eye'
     | 'play'
+    | 'pause'
+    | 'stop'
+    | 'previous'
+    | 'next'
     | 'folder-plus'
     | 'folder-upload'
     | 'terminal'
@@ -66,6 +70,16 @@
     <circle cx="12" cy="12" r="3" />
   {:else if name === 'play'}
     <path d="M8 5v14l11-7z" fill="currentColor" stroke="none" />
+  {:else if name === 'pause'}
+    <path d="M8 5h3v14H8zM13 5h3v14h-3z" fill="currentColor" stroke="none" />
+  {:else if name === 'stop'}
+    <rect x="6" y="6" width="12" height="12" rx="1" fill="currentColor" stroke="none" />
+  {:else if name === 'previous'}
+    <path d="M6 5v14" />
+    <path d="M19 5 9 12l10 7z" fill="currentColor" stroke="none" />
+  {:else if name === 'next'}
+    <path d="M18 5v14" />
+    <path d="M5 5l10 7-10 7z" fill="currentColor" stroke="none" />
   {:else if name === 'image'}
     <rect x="3" y="5" width="18" height="14" rx="2" />
     <circle cx="8.5" cy="10" r="1.5" />

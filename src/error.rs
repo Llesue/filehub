@@ -35,6 +35,10 @@ pub enum AppError {
     Cancelled,
     #[error("not found")]
     NotFound,
+    #[error("share has been stopped")]
+    ShareRevoked,
+    #[error("share has expired")]
+    ShareExpired,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -119,6 +123,16 @@ impl IntoResponse for AppError {
                 "The operation was cancelled".to_owned(),
             ),
             Self::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", "Not found".to_owned()),
+            Self::ShareRevoked => (
+                StatusCode::GONE,
+                "SHARE_REVOKED",
+                "Share has been stopped".to_owned(),
+            ),
+            Self::ShareExpired => (
+                StatusCode::GONE,
+                "SHARE_EXPIRED",
+                "Share has expired".to_owned(),
+            ),
             Self::Internal(err) => {
                 tracing::error!(error = %err, "internal server error");
                 (

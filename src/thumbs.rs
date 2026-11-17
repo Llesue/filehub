@@ -96,6 +96,7 @@ pub(crate) async fn thumbnail_response(
         let max_pixels = settings.settings.thumbnails.max_pixels;
         let jpeg_max_pixels = settings.settings.thumbnails.jpeg_max_pixels;
         let video_seek_seconds = settings.settings.thumbnails.video_seek_seconds;
+        let video_seek_percent = settings.settings.thumbnails.video_seek_percent;
         let video_timeout_secs = settings.settings.thumbnails.video_timeout_secs.max(1);
         let job_state = Arc::clone(state);
         let job_source = source.clone();
@@ -147,6 +148,7 @@ pub(crate) async fn thumbnail_response(
                             jpeg_max_pixels,
                             job_ffmpeg.as_deref(),
                             video_seek_seconds,
+                            video_seek_percent,
                             video_timeout_secs,
                             &scan_cancel,
                             &job_cache_dir,
@@ -345,6 +347,7 @@ fn generate_thumbnail(
     jpeg_max_pixels: u64,
     ffmpeg: Option<&Path>,
     video_seek_seconds: u64,
+    video_seek_percent: u32,
     video_timeout_secs: u64,
     cancel: &CancellationToken,
     cache_dir: &Path,
@@ -388,11 +391,19 @@ fn generate_thumbnail(
                 "no decoder is available for this file",
             ));
         };
+        let seek_seconds = video_seek_seconds_for(
+            ffmpeg,
+            source,
+            video_seek_seconds,
+            video_seek_percent,
+            video_timeout_secs,
+            cancel,
+        );
         extract_video_frame_with_fallback(
             ffmpeg,
             source,
             width,
-            video_seek_seconds,
+            seek_seconds,
             video_timeout_secs,
             cancel,
         )?
@@ -555,19 +566,104 @@ fn decode_jpeg(
     })
 }
 
+fn video_seek_seconds_for(
+    ffmpeg: &Path,
+    source: &Path,
+    fallback_seconds: u64,
+    percent: u32,
+    timeout_secs: u64,
+    cancel: &CancellationToken,
+) -> f64 {
+    if percent == 0 {
+        return fallback_seconds as f64;
+    }
+    let Some(duration) = probe_duration(ffmpeg, source, timeout_secs.min(5), cancel) else {
+        return fallback_seconds as f64;
+    };
+    let seek = duration * f64::from(percent) / 100.0;
+    if seek.is_finite() && seek > 0.0 {
+        seek
+    } else {
+        fallback_seconds as f64
+    }
+}
+
+fn probe_duration(
+    ffmpeg: &Path,
+    source: &Path,
+    timeout_secs: u64,
+    cancel: &CancellationToken,
+) -> Option<f64> {
+    let mut child = Command::new(ffmpeg)
+        .args(["-hide_banner", "-nostdin", "-i"])
+        .arg(source)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stderr = child.stderr.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
+    loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let bytes = reader.join().ok()?;
+                return parse_duration(&String::from_utf8_lossy(&bytes));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn parse_duration(text: &str) -> Option<f64> {
+    let rest = text.split("Duration: ").nth(1)?;
+    let stamp = rest.split(',').next()?.trim();
+    if stamp == "N/A" {
+        return None;
+    }
+    let mut parts = stamp.split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
 fn extract_video_frame_with_fallback(
     ffmpeg: &Path,
     source: &Path,
     width: u32,
-    seek_seconds: u64,
+    seek_seconds: f64,
     timeout_secs: u64,
     cancel: &CancellationToken,
 ) -> Result<image::DynamicImage, ThumbError> {
     match extract_video_frame(ffmpeg, source, width, seek_seconds, timeout_secs, cancel) {
         Err(ThumbError::Failed {
             reason: "ffmpeg", ..
-        }) if seek_seconds > 0 => {
-            extract_video_frame(ffmpeg, source, width, 0, timeout_secs, cancel)
+        }) if seek_seconds > 0.0 => {
+            extract_video_frame(ffmpeg, source, width, 0.0, timeout_secs, cancel)
         }
         other => other,
     }
@@ -577,19 +673,13 @@ fn extract_video_frame(
     ffmpeg: &Path,
     source: &Path,
     width: u32,
-    seek_seconds: u64,
+    seek_seconds: f64,
     timeout_secs: u64,
     cancel: &CancellationToken,
 ) -> Result<image::DynamicImage, ThumbError> {
+    let seek = format!("{seek_seconds:.3}");
     let mut child = Command::new(ffmpeg)
-        .args([
-            "-nostdin",
-            "-loglevel",
-            "error",
-            "-ss",
-            &seek_seconds.to_string(),
-            "-i",
-        ])
+        .args(["-nostdin", "-loglevel", "error", "-ss", &seek, "-i"])
         .arg(source)
         .args([
             "-frames:v",
@@ -703,7 +793,7 @@ fn cache_key(path: &Path, width: u32, fit_short: bool, edge: u32) -> Result<Stri
     hasher.update(width.to_le_bytes());
     hasher.update(edge.to_le_bytes());
     hasher.update(if fit_short { b"short" } else { b"width" });
-    hasher.update(b"thumb-v3");
+    hasher.update(b"thumb-v4");
     Ok(hasher
         .finalize()
         .iter()
@@ -898,4 +988,22 @@ fn collect_cache_files(
 
 fn io_error(error: std::io::Error) -> AppError {
     AppError::internal(anyhow::Error::from(error))
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::parse_duration;
+
+    #[test]
+    fn parses_ffmpeg_duration() {
+        let stderr =
+            "Input #0, mov,mp4,m4a:\n  Duration: 01:23:45.67, start: 0.000000, bitrate: 123 kb/s\n";
+        assert!((parse_duration(stderr).unwrap() - 5025.67).abs() < 0.001);
+    }
+
+    #[test]
+    fn rejects_unknown_duration() {
+        assert!(parse_duration("Duration: N/A, start: 0.0").is_none());
+        assert!(parse_duration("no duration here").is_none());
+    }
 }

@@ -21,21 +21,36 @@ pub fn public_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/branding", get(branding))
         .route("/branding/icon", get(icon))
+        .route("/custom.css", get(custom_css))
 }
 
-fn branding_json(state: &AppState, version: i64, has_icon: bool) -> Value {
+fn branding_json(state: &AppState, version: i64, has_icon: bool, custom_css_version: i64) -> Value {
     let name = state.settings().settings.ui.brand_name.trim().to_owned();
     json!({
         "name": name,
         "version": version,
         "icon_url": has_icon.then(|| format!("/api/v1/branding/icon?v={version}")),
+        "custom_css_version": custom_css_version,
     })
 }
 
 pub async fn branding(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
     let icon = state.db.branding_icon().await.map_err(AppError::internal)?;
     let version = icon.as_ref().map(|icon| icon.version).unwrap_or(0);
-    Ok(Json(branding_json(&state, version, icon.is_some())))
+    let custom_css_version = state
+        .db
+        .custom_css()
+        .await
+        .map_err(AppError::internal)?
+        .filter(|(content, _)| !content.is_empty())
+        .map(|(_, version)| version)
+        .unwrap_or(0);
+    Ok(Json(branding_json(
+        &state,
+        version,
+        icon.is_some(),
+        custom_css_version,
+    )))
 }
 
 pub async fn icon(
@@ -107,6 +122,67 @@ pub async fn delete_icon(
         .map_err(AppError::internal)?;
     audit(&state, current.user.id, "branding_reset", &headers).await;
     Ok(Json(json!({ "deleted": removed })))
+}
+
+pub async fn custom_css(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
+    let Some((content, version)) = state.db.custom_css().await.map_err(AppError::internal)? else {
+        return Err(AppError::NotFound);
+    };
+    if content.is_empty() {
+        return Err(AppError::NotFound);
+    }
+    let etag = format!("\"css-{version}\"");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/css; charset=utf-8")
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(axum::body::Body::from(content))
+        .map_err(|error| AppError::internal(anyhow::Error::from(error)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CustomCssRequest {
+    content: String,
+}
+
+pub async fn put_custom_css(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CustomCssRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    auth::require_csrf(&current, &headers)?;
+    if request.content.trim().is_empty() {
+        return Err(AppError::bad_request("custom CSS must not be empty"));
+    }
+    if request.content.len() > 256 * 1024 {
+        return Err(AppError::too_large("custom CSS must be at most 256 KiB"));
+    }
+    let version = state
+        .db
+        .set_custom_css(&request.content)
+        .await
+        .map_err(AppError::internal)?;
+    audit(&state, current.user.id, "custom_css_updated", &headers).await;
+    Ok(Json(json!({ "version": version })))
+}
+
+pub async fn delete_custom_css(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    auth::require_csrf(&current, &headers)?;
+    let version = state
+        .db
+        .clear_custom_css()
+        .await
+        .map_err(AppError::internal)?;
+    audit(&state, current.user.id, "custom_css_cleared", &headers).await;
+    Ok(Json(json!({ "version": version })))
 }
 
 fn normalize_icon(bytes: &[u8]) -> Result<Vec<u8>, AppError> {

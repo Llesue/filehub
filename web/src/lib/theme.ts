@@ -1,3 +1,4 @@
+export type ThemePreference = 'light' | 'dark' | 'system';
 export type Theme = 'light' | 'dark';
 
 export function resolveTheme(stored: string | null, prefersDark: boolean): Theme {

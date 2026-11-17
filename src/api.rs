@@ -37,7 +37,6 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
                 .post(crate::preferences::upload_avatar)
                 .delete(crate::preferences::delete_avatar),
         )
-        .route("/me/custom-css", get(crate::preferences::get_custom_css))
         .route("/auth/tokens", get(list_tokens).post(create_token))
         .route("/auth/tokens/{id}", delete(delete_token))
         .route("/admin/users", get(list_users).post(create_user))
@@ -59,6 +58,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/admin/branding/icon",
             post(crate::branding::upload_icon).delete(crate::branding::delete_icon),
+        )
+        .route(
+            "/admin/custom-css",
+            put(crate::branding::put_custom_css).delete(crate::branding::delete_custom_css),
         )
         .route("/roots", get(crate::files::roots))
         .route("/list", get(crate::files::list))
@@ -572,11 +575,7 @@ async fn create_user(
         .get_user_preferences(id)
         .await
         .map_err(AppError::internal)?;
-    preferences.theme = if settings_snapshot.settings.ui.default_theme == "dark" {
-        "dark".to_owned()
-    } else {
-        "light".to_owned()
-    };
+    preferences.theme = settings_snapshot.settings.ui.default_theme.clone();
     preferences.language = settings_snapshot.settings.ui.default_locale.clone();
     preferences.show_hidden = settings_snapshot.settings.show_hidden_default;
     preferences.show_thumbnails = settings_snapshot.settings.thumbnails.enabled;
@@ -770,16 +769,19 @@ async fn delete_user(
         }
     }
 
-    state
+    if !state
         .db
-        .update_user(id, None, None, Some(true))
+        .soft_delete_user(id)
         .await
-        .map_err(AppError::internal)?;
+        .map_err(AppError::internal)?
+    {
+        return Err(AppError::NotFound);
+    }
 
     audit(
         &state,
         Some(current.user.id),
-        "user_disabled",
+        "user_deleted",
         None,
         Some(&format!("user_id={id}")),
         &headers,

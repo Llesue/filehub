@@ -64,6 +64,7 @@ pub struct ThumbnailsSettings {
     pub jpeg_max_pixels: u64,
     pub video: bool,
     pub video_seek_seconds: u64,
+    pub video_seek_percent: u32,
     pub video_timeout_secs: u64,
     pub cache_max_bytes: u64,
 }
@@ -78,6 +79,7 @@ impl Default for ThumbnailsSettings {
             jpeg_max_pixels: 250_000_000,
             video: true,
             video_seek_seconds: 1,
+            video_seek_percent: 33,
             video_timeout_secs: 15,
             cache_max_bytes: 2 * 1024 * 1024 * 1024,
         }
@@ -278,6 +280,9 @@ impl Settings {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.thumbnails.workers == 0 {
             bail!("thumbnails.workers must be greater than zero");
+        }
+        if self.thumbnails.video_seek_percent > 100 {
+            bail!("thumbnails.video_seek_percent must be between 0 and 100");
         }
         if self.uploads.chunk_size == 0 {
             bail!("uploads.chunk_size must be greater than zero");

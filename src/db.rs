@@ -44,6 +44,12 @@ const MIGRATIONS: &[(i64, &str)] = &[
         20,
         include_str!("../migrations/0020_directory_size_has_value.sql"),
     ),
+    (
+        21,
+        include_str!("../migrations/0021_drop_duplicate_index_indexes.sql"),
+    ),
+    (22, include_str!("../migrations/0022_user_soft_delete.sql")),
+    (23, include_str!("../migrations/0023_global_custom_css.sql")),
 ];
 
 pub fn unix_now() -> i64 {
@@ -369,7 +375,7 @@ impl Db {
     pub async fn count_active_admins(&self) -> anyhow::Result<i64> {
         self.call(|connection| {
             connection.query_row(
-                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0",
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0 AND deleted_at IS NULL",
                 [],
                 |row| row.get(0),
             )
@@ -382,7 +388,7 @@ impl Db {
         self.call(move |connection| {
             connection
                 .query_row(
-                    "SELECT * FROM users WHERE username = ?1",
+                    "SELECT * FROM users WHERE username = ?1 AND deleted_at IS NULL",
                     params![username],
                     User::from_row,
                 )
@@ -395,7 +401,7 @@ impl Db {
         self.call(move |connection| {
             connection
                 .query_row(
-                    "SELECT * FROM users WHERE id = ?1",
+                    "SELECT * FROM users WHERE id = ?1 AND deleted_at IS NULL",
                     params![id],
                     User::from_row,
                 )
@@ -407,7 +413,7 @@ impl Db {
     pub async fn list_users(&self) -> anyhow::Result<Vec<User>> {
         self.call(|connection| {
             let mut statement = connection.prepare(
-                "SELECT * FROM users ORDER BY role = 'admin' DESC, username COLLATE NOCASE",
+                "SELECT * FROM users WHERE deleted_at IS NULL ORDER BY role = 'admin' DESC, username COLLATE NOCASE",
             )?;
             let rows = statement.query_map([], User::from_row)?;
             rows.collect()
@@ -451,7 +457,7 @@ impl Db {
         self.call(move |connection| {
             let now = unix_now();
             let current = connection
-                .query_row("SELECT role, quota_bytes, disabled FROM users WHERE id = ?1", params![id], |row| {
+                .query_row("SELECT role, quota_bytes, disabled FROM users WHERE id = ?1 AND deleted_at IS NULL", params![id], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<i64>>(1)?,
@@ -484,12 +490,75 @@ impl Db {
         self.call(move |connection| {
             let now = unix_now();
             let changed = connection.execute(
-                "UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
                 params![password_hash, now, id],
             )?;
             Ok(changed > 0)
         })
         .await
+    }
+
+    pub async fn soft_delete_user(&self, id: i64) -> anyhow::Result<bool> {
+        self.call(move |connection| {
+            let now = unix_now();
+            let transaction = connection.transaction()?;
+            let changed = transaction.execute(
+                "UPDATE users SET deleted_at = ?1, disabled = 1, updated_at = ?1 \
+                 WHERE id = ?2 AND deleted_at IS NULL",
+                params![now, id],
+            )?;
+            if changed == 0 {
+                transaction.commit()?;
+                return Ok(false);
+            }
+            transaction.execute("DELETE FROM sessions WHERE user_id = ?1", params![id])?;
+            transaction.execute("DELETE FROM api_tokens WHERE user_id = ?1", params![id])?;
+            transaction.execute(
+                "DELETE FROM upload_sessions WHERE user_id = ?1",
+                params![id],
+            )?;
+            transaction.execute(
+                "UPDATE shares SET revoked = 1 WHERE creator_id = ?1",
+                params![id],
+            )?;
+            transaction.commit()?;
+            Ok(true)
+        })
+        .await
+    }
+
+    pub async fn custom_css(&self) -> anyhow::Result<Option<(String, i64)>> {
+        self.call(|connection| {
+            connection
+                .query_row(
+                    "SELECT content, version FROM custom_css WHERE id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn set_custom_css(&self, content: &str) -> anyhow::Result<i64> {
+        let content = content.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO custom_css (id, content, version, updated_at) \
+                 VALUES (1, ?1, 1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET content = excluded.content, \
+                   version = custom_css.version + 1, updated_at = excluded.updated_at",
+                params![content, unix_now()],
+            )?;
+            connection.query_row("SELECT version FROM custom_css WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+        })
+        .await
+    }
+
+    pub async fn clear_custom_css(&self) -> anyhow::Result<i64> {
+        self.set_custom_css("").await
     }
 
     pub async fn insert_session(
@@ -532,7 +601,7 @@ impl Db {
                 .query_row(
                     "SELECT u.*, s.csrf_token AS session_csrf, s.expires_at AS session_expires \
                      FROM sessions s JOIN users u ON u.id = s.user_id \
-                     WHERE s.token_hash = ?1",
+                     WHERE s.token_hash = ?1 AND u.deleted_at IS NULL",
                     params![token_hash],
                     |row| {
                         Ok(SessionUser {
@@ -621,7 +690,7 @@ impl Db {
                 .query_row(
                     "SELECT t.id AS token_id, t.scope AS token_scope, t.expires_at AS token_expires, u.* \
                      FROM api_tokens t JOIN users u ON u.id = t.user_id \
-                     WHERE t.token_hash = ?1",
+                     WHERE t.token_hash = ?1 AND u.deleted_at IS NULL",
                     params![token_hash],
                     |row| {
                         Ok(TokenUser {

@@ -1314,12 +1314,14 @@ async fn load_public_share(state: &Arc<AppState>, token: &str) -> Result<Share, 
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
-    if share.revoked
-        || share
-            .expires_at
-            .is_some_and(|expires| expires <= unix_now())
+    if share.revoked {
+        return Err(AppError::ShareRevoked);
+    }
+    if share
+        .expires_at
+        .is_some_and(|expires| expires <= unix_now())
     {
-        return Err(AppError::NotFound);
+        return Err(AppError::ShareExpired);
     }
     Ok(share)
 }

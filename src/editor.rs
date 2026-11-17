@@ -10,7 +10,7 @@ use crate::auth;
 use crate::authz;
 use crate::error::AppError;
 use crate::fsops;
-use crate::state::AppState;
+use crate::state::{AppState, UsageInvalidation};
 
 #[derive(Debug, Deserialize)]
 pub struct FileQuery {
@@ -153,15 +153,22 @@ pub async fn save(
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("editor save task failed: {err}")))??;
 
-    state
-        .invalidate_path_caches(&path, Some(current.user.id), false)
-        .await;
     let new_info = tokio::task::spawn_blocking({
         let path = resolved.absolute.clone();
         move || fsops::file_info(&path)
     })
     .await
     .map_err(|err| AppError::internal(anyhow::anyhow!("editor metadata task failed: {err}")))??;
+    let delta = new_info.size as i64 - info.size as i64;
+    let usage = if crate::platform::path_within(&path, std::path::Path::new(&current.user.home_dir))
+    {
+        UsageInvalidation::Delta(delta)
+    } else {
+        UsageInvalidation::None
+    };
+    state
+        .invalidate_path_caches_with_usage(&path, Some(current.user.id), false, usage)
+        .await;
 
     audit(&state, current.user.id, &resolved.relative, &headers).await;
 
