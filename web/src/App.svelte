@@ -2,11 +2,12 @@
   /* global __APP_VERSION__ */
   import DOMPurify from 'dompurify';
   import { marked } from 'marked';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import AccountDialog from './lib/components/AccountDialog.svelte';
   import NoticeDialog from './lib/components/NoticeDialog.svelte';
   import ProgressPanel from './lib/components/ProgressPanel.svelte';
+  import UploadPanel from './lib/components/UploadPanel.svelte';
   import ToastPanel from './lib/components/ToastPanel.svelte';
   import AdminPage from './lib/components/AdminPage.svelte';
   import AuditPage from './lib/components/AuditPage.svelte';
@@ -14,6 +15,7 @@
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import FileTypeIcon from './lib/components/FileTypeIcon.svelte';
   import NameDialog from './lib/components/NameDialog.svelte';
+  import NotificationCenter from './lib/components/NotificationCenter.svelte';
   import PreviewModal from './lib/components/PreviewModal.svelte';
   import PropertiesDialog from './lib/components/PropertiesDialog.svelte';
   import PreferencesPage from './lib/components/PreferencesPage.svelte';
@@ -29,7 +31,14 @@
   import { showToast } from './lib/toast';
   import { branding, brandMark, loadBranding } from './lib/branding';
   import { playAudio, type AudioTrack } from './lib/audio';
+  import { uploadManager } from './lib/uploads.svelte';
   import { resolveViewPreference } from './lib/viewPref';
+  import { connectEvents, disconnectEvents, realtimeActive, realtimeEvent } from './lib/events';
+  import {
+    addNotification,
+    clearNotifications,
+    ensureNotificationOwner,
+  } from './lib/notifications';
   import { absoluteTime, relativeTimeParts } from './lib/time';
   import {
     failProgress,
@@ -108,7 +117,7 @@
   let virtualPadBottom = $state(0);
   let nextCursor = $state<string | null>(null);
   let filesError = $state('');
-  let uploading = $state(false);
+
   let fileInput = $state<HTMLInputElement | null>(null);
   let folderInput = $state<HTMLInputElement | null>(null);
   const shareToken = (() => {
@@ -138,6 +147,26 @@
   let editorError = $state('');
   let editorSaving = $state(false);
   let editorPreview = $state(false);
+  let thumbVersions = $state<Record<string, number>>({});
+  let thumbFailures = $state<Record<string, boolean>>({});
+  let remoteEditors = $state<Record<string, Record<string, number>>>({});
+  let presenceRoot: number | null = null;
+  let presencePath = '';
+  let presenceTimer: ReturnType<typeof setInterval> | null = null;
+  const presenceClient = (() => {
+    try {
+      const existing = sessionStorage.getItem('filehub.edit.client');
+      if (existing) return existing;
+      const next =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      sessionStorage.setItem('filehub.edit.client', next);
+      return next;
+    } catch {
+      return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+  })();
   let lineNumbersElement = $state<HTMLPreElement | null>(null);
   let usage = $state<Usage | null>(null);
   let marquee = $state<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
@@ -155,6 +184,14 @@
   let blankMenuLeft = $state(false);
   let blankMenuUp = $state(false);
   let terminalOpen = $state(false);
+  let jobProgressRestored = $state(false);
+  let terminalAvailable = $derived(
+    systemFeatures.terminal && preferences?.terminal_enabled !== false,
+  );
+
+  $effect(() => {
+    if (!terminalAvailable) terminalOpen = false;
+  });
   let transfer = $state<{ mode: 'copy' | 'move'; entries: Entry[] } | null>(null);
   let dragPayload = $state<{ rootId: number; path: string; name: string } | null>(null);
   let dragOverKey = $state<string | null>(null);
@@ -182,6 +219,12 @@
   let editorDirty = $derived(editorContent !== editorOriginalContent);
   let editorLineNumbers = $derived(
     Array.from({ length: editorContent.split('\n').length }, (_, index) => index + 1),
+  );
+  let editorPresenceKey = $derived(activeRootId === null ? '' : `${activeRootId}:${editorPath}`);
+  let editorPeerEditing = $derived(
+    editorOpen &&
+      editorPresenceKey !== '' &&
+      Object.keys(remoteEditors[editorPresenceKey] ?? {}).length > 0,
   );
   let previewHtml = $derived(
     editorPreview ? DOMPurify.sanitize(String(marked.parse(editorContent))) : '',
@@ -264,8 +307,7 @@
         (event.key === '`' || event.key === '~') &&
         (terminalOpen || !typing) &&
         activeRoot &&
-        preferences?.terminal_enabled !== false &&
-        systemFeatures.terminal
+        terminalAvailable
       ) {
         event.preventDefault();
         terminalOpen = !terminalOpen;
@@ -273,7 +315,7 @@
       }
       if (event.key === 'Escape') {
         if (editorOpen) {
-          editorOpen = false;
+          closeEditor();
         } else if (searchActive) {
           exitSearch();
         } else if (sidebarOpen) {
@@ -299,6 +341,25 @@
       }
     };
 
+    const unsubscribeEvents = realtimeEvent.subscribe((event) => {
+      if (!event) return;
+      if (event.type === 'usage.updated') {
+        void loadUsage();
+      }
+      if (event.type === 'thumbnail.ready' || event.type === 'thumbnail.failed') {
+        handleThumbnailEvent(event.type, event.data);
+      }
+      if (event.type === 'edit.presence') {
+        handlePresenceEvent(event.data);
+      }
+      if (event.type === 'notification') {
+        const message = String(event.data.message ?? '');
+        if (message) {
+          addNotification(String(event.data.kind ?? 'notice'), message);
+          showToast(message);
+        }
+      }
+    });
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('resize', updateVirtualRange);
     const autoSaveTimer = window.setInterval(() => {
@@ -307,11 +368,30 @@
       }
     }, 30_000);
     const clockTimer = window.setInterval(() => (clock = Date.now()), 60_000);
+    const presencePruneTimer = window.setInterval(pruneRemotePresence, 5000);
+    const onPageHide = () => {
+      if (presenceRoot !== null) {
+        void sendPresence('close', presenceRoot, presencePath, true);
+        stopPresenceHeartbeat();
+      }
+    };
+    const onPageShow = () => {
+      if (editorOpen && activeRootId !== null) {
+        beginEditPresence(activeRootId, editorPath);
+      }
+    };
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('pageshow', onPageShow);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('resize', updateVirtualRange);
+      window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('pageshow', onPageShow);
       window.clearInterval(autoSaveTimer);
       window.clearInterval(clockTimer);
+      window.clearInterval(presencePruneTimer);
+      stopPresenceHeartbeat();
+      unsubscribeEvents();
       if (usagePollTimer) clearTimeout(usagePollTimer);
       if (bootSlowTimer) clearTimeout(bootSlowTimer);
       if (filesSlowTimer) clearTimeout(filesSlowTimer);
@@ -385,6 +465,10 @@
         const auth = await api.me();
         user = auth.user;
         csrf = auth.csrf_token;
+        ensureNotificationOwner(auth.user.id);
+        connectEvents(auth.user.id);
+        attachUploads(auth.user.id);
+        void restoreJobs(auth.user.id);
         await loadPreferences();
         await loadRoots();
       } catch (error) {
@@ -404,11 +488,129 @@
   function handleAuth(auth: AuthResponse): void {
     user = auth.user;
     csrf = auth.csrf_token;
+    ensureNotificationOwner(auth.user.id);
+    connectEvents(auth.user.id);
+    attachUploads(auth.user.id);
+    void restoreJobs(auth.user.id);
     initialized = true;
     loading = false;
     stopBootSlowHint();
     void loadPreferences();
     void loadRoots();
+  }
+
+  async function restoreJobs(userId: number): Promise<void> {
+    const seenKey = `filehub.jobs.seen.${userId}`;
+    const notifiedKey = `filehub.jobs.notified.${userId}`;
+    const stored = Number(localStorage.getItem(seenKey));
+    const since =
+      Number.isFinite(stored) && stored > 0 ? Math.floor(stored) : Math.floor(Date.now() / 1000);
+    let notified: string[] = [];
+    try {
+      const raw = JSON.parse(localStorage.getItem(notifiedKey) ?? '[]') as unknown;
+      if (Array.isArray(raw)) {
+        notified = raw.filter((value): value is string => typeof value === 'string');
+      }
+    } catch {
+      notified = [];
+    }
+
+    let jobs: JobInfo[];
+    try {
+      jobs = await api.jobs(since);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        console.warn('could not restore jobs', error);
+      }
+      return;
+    }
+
+    const active = jobs
+      .filter((job) => job.status === 'queued' || job.status === 'running')
+      .filter((job) => job.kind === 'copy' || job.kind === 'move')
+      .sort((left, right) => right.created_at - left.created_at);
+    if (active.length > 0 && !jobProgressRestored) {
+      jobProgressRestored = true;
+      const queue = active.slice(0, 5);
+      const runRestored = async (): Promise<void> => {
+        const job = queue.shift();
+        if (!job) return;
+        startProgress(
+          t($language, '{kind}任务', { kind: jobKindLabel(job.kind) }),
+          100,
+          t($language, '正在恢复任务…'),
+        );
+        try {
+          await waitForTransferJob(job.id);
+        } catch (error) {
+          console.warn('restored job failed', error);
+        }
+        if (activeRootId !== null) await loadList(activeRootId, currentPath);
+        await runRestored();
+      };
+      void runRestored();
+    }
+
+    for (const job of jobs) {
+      if (job.kind !== 'copy' && job.kind !== 'move') continue;
+      if (!job.finished_at || job.finished_at < since || notified.includes(job.id)) continue;
+      if (job.status === 'completed') {
+        notified.push(job.id);
+        addNotification(
+          'job_completed',
+          t($language, '{kind}任务已完成', { kind: jobKindLabel(job.kind) }),
+        );
+        showToast(t($language, '{kind}任务已完成', { kind: jobKindLabel(job.kind) }));
+      } else if (job.status === 'failed') {
+        notified.push(job.id);
+        addNotification(
+          'job_failed',
+          t($language, '{kind}任务失败：{message}', {
+            kind: jobKindLabel(job.kind),
+            message: job.error ?? t($language, '操作失败'),
+          }),
+        );
+      }
+    }
+    try {
+      localStorage.setItem(seenKey, String(Math.floor(Date.now() / 1000)));
+      localStorage.setItem(notifiedKey, JSON.stringify(notified.slice(-100)));
+    } catch {
+      // Storage may be unavailable; restoring jobs still works.
+    }
+  }
+
+  function jobKindLabel(kind: string): string {
+    if (kind === 'copy') return t($language, '复制');
+    if (kind === 'move') return t($language, '移动');
+    if (kind === 'index') return t($language, '索引');
+    if (kind === 'dir_size') return t($language, '目录大小');
+    if (kind === 'thumbnail') return t($language, '缩略图');
+    return kind;
+  }
+
+  function attachUploads(userId: number): void {
+    uploadManager.attach(userId, () => csrf, {
+      onUploaded: (rootId, directory) => {
+        clearDirSizeCache();
+        if (rootId === activeRootId && directory === currentPath) {
+          void loadList(rootId, currentPath);
+        }
+      },
+      onNotice: (message, kind) => showNotice(message, kind),
+      onAllDone: () => showToast(t($language, '上传完成')),
+    });
+    if (uploadManager.pendingCount > 0) {
+      showNoticeAction(
+        t($language, '有 {count} 个上传未完成，重新选择相同文件即可续传', {
+          count: uploadManager.pendingCount,
+        }),
+        t($language, '继续上传'),
+        uploadManager.pendingHasDirectories ? t($language, '选择目录') : t($language, '选择文件'),
+        () => (uploadManager.pendingHasDirectories ? folderInput?.click() : fileInput?.click()),
+        'info',
+      );
+    }
   }
 
   async function loadPreferences(): Promise<void> {
@@ -450,14 +652,19 @@
     if (loggingOut) return;
 
     loggingOut = true;
+    endEditPresence();
     try {
       await api.logout(csrf);
     } catch (error) {
       console.warn('logout request failed', error);
     } finally {
+      clearNotifications();
+      uploadManager.detach();
+      jobProgressRestored = false;
       user = null;
       preferences = null;
       csrf = '';
+      disconnectEvents();
       roots = [];
       entries = [];
       currentPath = '';
@@ -521,6 +728,7 @@
     listAbort = controller;
     filesLoading = true;
     filesError = '';
+    thumbFailures = {};
     nextCursor = null;
     clearDrag();
     startFilesSlowHint();
@@ -561,19 +769,38 @@
       loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration, true);
       selected = [];
       selectionAnchor = null;
-      const remembered = resolveViewPreference(
-        localStorage.getItem('filehub.view'),
-        localStorage.getItem(`view:${result.root.id}:${result.path}`),
-      );
-      if (remembered) {
-        view = remembered;
-        try {
+      const viewKey = `view:${result.root.id}:${result.path}`;
+      const sortKey = `sort:${result.root.id}:${result.path}`;
+      try {
+        const remembered = resolveViewPreference(
+          localStorage.getItem('filehub.view'),
+          localStorage.getItem(viewKey),
+        );
+        if (remembered) {
+          view = remembered;
+          // Pin the first resolved view to this directory so a later change
+          // in another directory cannot leak back through the global default.
+          if (!localStorage.getItem(viewKey)) {
+            localStorage.setItem(viewKey, remembered);
+          }
           if (!localStorage.getItem('filehub.view')) {
             localStorage.setItem('filehub.view', remembered);
           }
-        } catch (error) {
-          console.warn('could not persist view preference', error);
         }
+
+        const savedSort = localStorage.getItem(sortKey) ?? localStorage.getItem('filehub.sort');
+        if (savedSort) {
+          const [field, order] = savedSort.split(':');
+          if (field === 'name' || field === 'size' || field === 'modified') {
+            sortField = field;
+            sortOrder = order === 'desc' ? 'desc' : 'asc';
+          }
+        }
+        if (!localStorage.getItem(sortKey)) {
+          localStorage.setItem(sortKey, `${sortField}:${sortOrder}`);
+        }
+      } catch (error) {
+        console.warn('could not persist view preference', error);
       }
       void loadUsage();
     } catch (error) {
@@ -866,6 +1093,7 @@
 
   function handleFilesError(error: unknown): void {
     if (error instanceof ApiError && error.status === 401) {
+      uploadManager.detach();
       user = null;
       csrf = '';
       return;
@@ -1065,8 +1293,37 @@
         await loadList(root, parent);
         selected = [entry.name];
         selectionAnchor = entry.name;
+        await tick();
+        await scrollEntryIntoView(entry.name);
       })();
     }
+  }
+
+  async function scrollEntryIntoView(name: string): Promise<void> {
+    const index = entries.findIndex((entry) => entry.name === name);
+    if (index < 0 || !contentElement) return;
+    const find = (): HTMLElement | null =>
+      contentElement?.querySelector<HTMLElement>(`[data-entry-name="${CSS.escape(name)}"]`) ?? null;
+    let target = find();
+    if (!target) {
+      if (view === 'list') {
+        contentElement.scrollTop = Math.max(
+          0,
+          index * VIRTUAL_ROW_HEIGHT - contentElement.clientHeight / 2 + VIRTUAL_ROW_HEIGHT / 2,
+        );
+      } else if (gridElement) {
+        const metrics = galleryMetrics(gridElement);
+        const row = Math.floor(index / metrics.columns);
+        contentElement.scrollTop = Math.max(
+          0,
+          row * metrics.rowHeight - contentElement.clientHeight / 2,
+        );
+      }
+      updateVirtualRange();
+      await tick();
+      target = find();
+    }
+    target?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 
   function exitSearch(): void {
@@ -1111,6 +1368,8 @@
     }
     if (entry.is_dir) {
       navigate(joinPath(currentPath, entry.name));
+    } else if (isAudioName(entry.name)) {
+      startAudio(entry);
     } else if (isTextFile(entry.name)) {
       if (systemFeatures.editor && preferences?.editor_enabled !== false) void openEditor(entry);
       else showUnsupported(entry);
@@ -1322,7 +1581,9 @@
   }
 
   function openPreview(entry: Entry): void {
-    const items = entries.filter((item) => !item.is_dir && isLightboxPreview(item.name));
+    const items = entries.filter(
+      (item) => !item.is_dir && (isImageName(item.name) || isVideoName(item.name)),
+    );
     const index = items.findIndex((item) => item.name === entry.name);
     if (index >= 0) {
       preview = { items, index };
@@ -1330,7 +1591,9 @@
   }
 
   function previewEntry(entry: Entry): void {
-    if (isTextFile(entry.name)) {
+    if (isAudioName(entry.name)) {
+      startAudio(entry);
+    } else if (isTextFile(entry.name)) {
       if (systemFeatures.editor && preferences?.editor_enabled !== false) void openEditor(entry);
       else showUnsupported(entry);
     } else if (isPdfName(entry.name)) {
@@ -1439,6 +1702,10 @@
   }
 
   function handleDragOver(event: DragEvent, entry: Entry): void {
+    if (event.dataTransfer?.types.includes('Files')) {
+      handleFileDragOver(event, entry);
+      return;
+    }
     if (!entry.is_dir || !dragPayload || activeRootId === null) return;
     event.preventDefault();
     event.stopPropagation();
@@ -1486,7 +1753,13 @@
             : job.status === 'running'
               ? t($language, '处理中…')
               : t($language, '排队中…');
-        updateProgress(job.total > 0 ? Math.min(job.progress, job.total) : job.progress, detail);
+        const percent =
+          job.bytes_total > 0
+            ? Math.min(100, Math.round((job.bytes_done / job.bytes_total) * 100))
+            : job.total > 0
+              ? Math.min(100, Math.round((job.progress / job.total) * 100))
+              : 0;
+        updateProgress(percent, detail, 100);
         if (job.status === 'completed') {
           const result = (job.result as TransferJobResult | null) ?? null;
           if (result?.failed) {
@@ -1514,6 +1787,13 @@
   async function dropInto(event: DragEvent, destRoot: number, destPath: string): Promise<void> {
     event.preventDefault();
     event.stopPropagation();
+    dragOverKey = null;
+    dragOverValid = true;
+    if (event.dataTransfer?.types.includes('Files')) {
+      const candidates = await collectDroppedFiles(event.dataTransfer);
+      if (candidates.length > 0) enqueueUploads(candidates, destPath);
+      return;
+    }
     const payload = dragPayload;
     clearDrag();
     if (!payload) return;
@@ -1533,7 +1813,7 @@
         csrf,
       );
       await waitForTransferJob(job.job_id);
-      updateProgress(1, t($language, '完成'));
+      updateProgress(100, t($language, '完成'), 100);
       finishProgress();
       showToast(t($language, '已移动到 {name}', { name: destPath.split('/').pop() ?? destPath }));
       clearDirSizeCache();
@@ -1549,6 +1829,7 @@
     transfer = null;
     if (!pending || activeRootId === null) return;
     const rootId = activeRootId;
+    const sourcePath = currentPath;
     startProgress(
       pending.mode === 'copy' ? t($language, '复制文件') : t($language, '移动文件'),
       pending.entries.length,
@@ -1557,15 +1838,22 @@
       const job = await api.transferJob(
         pending.mode,
         rootId,
-        pending.entries.map((entry) => joinPath(currentPath, entry.name)),
+        pending.entries.map((entry) => joinPath(sourcePath, entry.name)),
         destRoot,
         destPath,
         csrf,
       );
       await waitForTransferJob(job.job_id);
-      updateProgress(pending.entries.length, t($language, '完成'));
-      clearDirSizeCache();
-      await loadList(rootId, currentPath);
+      updateProgress(100, t($language, '完成'), 100);
+      const viewingSource = activeRootId === rootId && currentPath === sourcePath;
+      const viewingDestination = activeRootId === destRoot && currentPath === destPath;
+      if (viewingSource) {
+        clearDirSizeCache();
+        await loadList(rootId, currentPath);
+      } else if (viewingDestination) {
+        clearDirSizeCache();
+        await loadList(destRoot, currentPath);
+      }
       finishProgress();
     } catch (error) {
       failProgress(error instanceof Error ? error.message : t($language, '操作失败'));
@@ -1784,7 +2072,6 @@
   }
 
   function uploadClick(): void {
-    if (uploading) return;
     if (!activeRoot) return;
     if (currentReadOnly) {
       showToast(t($language, '当前目录只读'));
@@ -1797,18 +2084,22 @@
     const input = event.currentTarget as HTMLInputElement;
     const files = Array.from(input.files ?? []);
     input.value = '';
-    await uploadFiles(files);
+    enqueueUploads(files.map((file) => ({ file, relativePath: file.name })));
   }
 
   async function handleFolderFiles(event: Event): Promise<void> {
     const input = event.currentTarget as HTMLInputElement;
     const files = Array.from(input.files ?? []);
     input.value = '';
-    await uploadFiles(files, true);
+    enqueueUploads(
+      files.map((file) => ({
+        file,
+        relativePath: file.webkitRelativePath || file.name,
+      })),
+    );
   }
 
   function folderUploadClick(): void {
-    if (uploading) return;
     if (!activeRoot) return;
     if (currentReadOnly) {
       showToast(t($language, '当前目录只读'));
@@ -1817,97 +2108,76 @@
     folderInput?.click();
   }
 
-  async function uploadFiles(files: File[], preservePaths = false): Promise<void> {
-    if (activeRootId === null || files.length === 0) return;
+  function enqueueUploads(
+    candidates: { file: File; relativePath: string }[],
+    basePath = currentPath,
+  ): void {
+    if (activeRootId === null || candidates.length === 0) return;
     if (currentReadOnly) {
       showToast(t($language, '当前目录只读'));
       return;
     }
-
-    const rootId = activeRootId;
-    const controller = new AbortController();
-    let cancelled = false;
-    const failed: File[] = [];
-    let completed = 0;
-
     filesError = '';
-    uploading = true;
-    startProgress(t($language, '上传文件'), files.length);
-    setProgressCancel(() => {
-      cancelled = true;
-      controller.abort();
-    });
-    try {
-      for (const file of files) {
-        if (cancelled) break;
-        updateProgress(completed, file.name);
-        try {
-          await uploadOne(rootId, file, preservePaths, controller.signal);
-          completed += 1;
-        } catch (error) {
-          if (cancelled || isAbortError(error)) break;
-          failed.push(file);
-          console.warn('upload failed', file.name, error);
-        }
-      }
-      if (cancelled) {
-        failProgress(t($language, '上传已取消'));
-        return;
-      }
-      clearDirSizeCache();
-      await loadList(rootId, currentPath);
-      if (failed.length > 0) {
-        failProgress(t($language, '{count} 个文件上传失败', { count: failed.length }));
-        showNoticeAction(
-          t($language, '{count} 个文件上传失败', { count: failed.length }),
-          t($language, '上传失败'),
-          t($language, '重试失败文件'),
-          () => void uploadFiles(failed, preservePaths),
-          'error',
-        );
-      } else {
-        updateProgress(files.length, t($language, '{count} 个文件完成', { count: files.length }));
-        finishProgress();
-      }
-    } finally {
-      setProgressCancel(null);
-      uploading = false;
-    }
+    uploadManager.enqueue(candidates, activeRootId, basePath);
   }
 
-  async function uploadOne(
-    rootId: number,
-    file: File,
-    preservePaths: boolean,
-    signal: AbortSignal,
-  ): Promise<void> {
-    if (file.size === 0) {
-      throw new Error(t($language, '空文件暂不支持上传：{name}', { name: file.name }));
+  async function collectDroppedFiles(
+    dataTransfer: DataTransfer,
+  ): Promise<{ file: File; relativePath: string }[]> {
+    const entries: FileSystemEntry[] = [];
+    for (const item of Array.from(dataTransfer.items ?? [])) {
+      const entry = item.webkitGetAsEntry?.() ?? null;
+      if (entry) entries.push(entry);
     }
-    const relative = preservePaths ? file.webkitRelativePath || file.name : file.name;
-    const parts = relative.split('/').filter(Boolean);
-    const filename = parts.pop() ?? file.name;
-    const directory = parts.join('/');
-    const targetPath = joinPath(currentPath, directory);
-    if (directory) {
-      await api.mkdir(rootId, currentPath, directory, csrf, true);
+    if (entries.length === 0) {
+      return Array.from(dataTransfer.files ?? []).map((file) => ({
+        file,
+        relativePath: file.name,
+      }));
     }
-    const created = await api.createUpload(rootId, targetPath, filename, file.size, csrf);
-    try {
-      for (let index = 0; index < created.chunks; index += 1) {
-        if (signal.aborted) {
-          await api.cancelUpload(created.upload_id, csrf).catch(() => undefined);
-          throw new DOMException('aborted', 'AbortError');
-        }
-        const start = index * created.chunk_size;
-        const end = Math.min(start + created.chunk_size, file.size);
-        await api.uploadChunk(created.upload_id, index, file.slice(start, end), csrf, signal);
+    const readDirectory = (reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> =>
+      new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    const walk = async (
+      entry: FileSystemEntry,
+      prefix: string,
+    ): Promise<{ file: File; relativePath: string }[]> => {
+      if (entry.isFile) {
+        const file = await new Promise<File>((resolve, reject) =>
+          (entry as FileSystemFileEntry).file(resolve, reject),
+        );
+        return [{ file, relativePath: `${prefix}${file.name}` }];
       }
-      await api.completeUpload(created.upload_id, csrf);
-    } catch (error) {
-      await api.cancelUpload(created.upload_id, csrf).catch(() => undefined);
-      throw error;
-    }
+      if (!entry.isDirectory) return [];
+      const reader = (entry as FileSystemDirectoryEntry).createReader();
+      const children: FileSystemEntry[] = [];
+      for (;;) {
+        const batch = await readDirectory(reader);
+        if (batch.length === 0) break;
+        children.push(...batch);
+      }
+      const nested = await Promise.all(
+        children.map((child) => walk(child, `${prefix}${entry.name}/`)),
+      );
+      return nested.flat();
+    };
+    const collected = await Promise.all(entries.map((entry) => walk(entry, '')));
+    return collected.flat();
+  }
+
+  async function handleAppDrop(event: DragEvent): Promise<void> {
+    event.preventDefault();
+    if (!event.dataTransfer) return;
+    const candidates = await collectDroppedFiles(event.dataTransfer);
+    enqueueUploads(candidates);
+  }
+
+  function handleFileDragOver(event: DragEvent, entry: Entry): void {
+    if (!entry.is_dir || !event.dataTransfer?.types.includes('Files')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragOverKey = entryDragKey(entry);
+    dragOverValid = true;
+    event.dataTransfer.dropEffect = currentReadOnly ? 'none' : 'copy';
   }
 
   async function deleteEntry(entry: Entry): Promise<void> {
@@ -1925,8 +2195,9 @@
 
     const rootId = activeRootId;
     const path = currentPath;
+    const deletingPaths = items.map((entry) => joinPath(path, entry.name));
     try {
-      const paths = items.map((entry) => joinPath(path, entry.name));
+      const paths = deletingPaths;
       const result = await api.deletePreview(rootId, paths, csrf);
       const totalSize = items.reduce((sum, entry) => sum + entry.size, 0);
       const needsCode =
@@ -1951,8 +2222,15 @@
               updateProgress(items.length, t($language, '完成'));
               finishProgress();
               confirmState = null;
-              clearDirSizeCache();
-              await loadList(rootId, path);
+              const stillHere = activeRootId === rootId && currentPath === path;
+              const insideDeleted = deletingPaths.some(
+                (deleted) =>
+                  currentPath === deleted || currentPath.startsWith(`${deleted}/`),
+              );
+              if (stillHere || insideDeleted) {
+                clearDirSizeCache();
+                await loadList(rootId, path);
+              }
             } catch (error) {
               failProgress(error instanceof Error ? error.message : t($language, '删除失败'));
               handleFilesError(error);
@@ -1986,10 +2264,138 @@
 
   function setView(next: 'list' | 'thumb' | 'tile'): void {
     view = next;
-    localStorage.setItem('filehub.view', next);
-    if (activeRootId !== null) {
-      localStorage.setItem(`view:${activeRootId}:${currentPath}`, next);
+    try {
+      localStorage.setItem('filehub.view', next);
+      if (activeRootId !== null) {
+        localStorage.setItem(`view:${activeRootId}:${currentPath}`, next);
+      }
+    } catch (error) {
+      console.warn('could not persist view preference', error);
     }
+  }
+
+  function thumbKey(root: number, path: string): string {
+    return `${root}:${path}`;
+  }
+
+  function handleThumbnailEvent(type: string, data: Record<string, unknown>): void {
+    const root = Number(data.root);
+    const path = typeof data.path === 'string' ? data.path : '';
+    if (!Number.isFinite(root) || root <= 0 || !path) return;
+    const key = thumbKey(root, path);
+    if (type === 'thumbnail.failed') {
+      thumbFailures = { ...thumbFailures, [key]: true };
+      return;
+    }
+    thumbVersions = { ...thumbVersions, [key]: (thumbVersions[key] ?? 0) + 1 };
+    if (thumbFailures[key]) {
+      const next = { ...thumbFailures };
+      delete next[key];
+      thumbFailures = next;
+    }
+  }
+
+  function handlePresenceEvent(data: Record<string, unknown>): void {
+    const client = typeof data.client === 'string' ? data.client : '';
+    if (client === presenceClient) return;
+    const root = Number(data.root);
+    const path = typeof data.path === 'string' ? data.path : '';
+    if (!Number.isFinite(root) || root <= 0 || !path) return;
+    const key = thumbKey(root, path);
+    const state = typeof data.state === 'string' ? data.state : '';
+    if (state === 'open') {
+      const seconds = Number(data.expires_at);
+      const expiresAt = Number.isFinite(seconds) ? seconds * 1000 : Date.now() + 45_000;
+      const peers = remoteEditors[key] ?? {};
+      remoteEditors = { ...remoteEditors, [key]: { ...peers, [client]: expiresAt } };
+      return;
+    }
+    if (state === 'close' && remoteEditors[key]) {
+      const peers = { ...remoteEditors[key] };
+      delete peers[client];
+      const next = { ...remoteEditors };
+      if (Object.keys(peers).length === 0) delete next[key];
+      else next[key] = peers;
+      remoteEditors = next;
+    }
+  }
+
+  function seedPresencePeers(
+    key: string,
+    peers: Array<{ client: string; expires_at: number }>,
+  ): void {
+    if (peers.length === 0) return;
+    const existing = remoteEditors[key] ?? {};
+    const merged = { ...existing };
+    for (const peer of peers) {
+      if (peer.client !== presenceClient) merged[peer.client] = peer.expires_at * 1000;
+    }
+    if (Object.keys(merged).length > 0) remoteEditors = { ...remoteEditors, [key]: merged };
+  }
+
+  function pruneRemotePresence(): void {
+    const now = Date.now();
+    const next: Record<string, Record<string, number>> = {};
+    for (const [key, peers] of Object.entries(remoteEditors)) {
+      const alive = Object.fromEntries(
+        Object.entries(peers).filter(([, expiresAt]) => expiresAt > now),
+      );
+      if (Object.keys(alive).length > 0) next[key] = alive;
+    }
+    if (JSON.stringify(next) !== JSON.stringify(remoteEditors)) {
+      remoteEditors = next;
+    }
+  }
+
+  async function sendPresence(
+    state: 'open' | 'close',
+    root: number,
+    path: string,
+    keepalive = false,
+  ): Promise<Awaited<ReturnType<typeof api.editPresence>> | null> {
+    if (!csrf) return null;
+    try {
+      return await api.editPresence(root, path, state, presenceClient, csrf, keepalive);
+    } catch (error) {
+      console.warn('edit presence update failed', error);
+      return null;
+    }
+  }
+
+  function stopPresenceHeartbeat(): void {
+    if (presenceTimer) clearInterval(presenceTimer);
+    presenceTimer = null;
+  }
+
+  function beginEditPresence(root: number, path: string): void {
+    endEditPresence();
+    presenceRoot = root;
+    presencePath = path;
+    const key = thumbKey(root, path);
+    void sendPresence('open', root, path).then((reply) => {
+      if (reply) seedPresencePeers(key, reply.peers);
+    });
+    presenceTimer = setInterval(() => {
+      if (presenceRoot !== null) void sendPresence('open', presenceRoot, presencePath);
+    }, 20_000);
+  }
+
+  function endEditPresence(keepalive = false): void {
+    if (presenceRoot === null) {
+      stopPresenceHeartbeat();
+      return;
+    }
+    const root = presenceRoot;
+    const path = presencePath;
+    presenceRoot = null;
+    presencePath = '';
+    stopPresenceHeartbeat();
+    void sendPresence('close', root, path, keepalive);
+  }
+
+  function closeEditor(): void {
+    endEditPresence();
+    editorOpen = false;
   }
 
   async function openEditor(entry: Entry): Promise<void> {
@@ -2010,6 +2416,7 @@
       editorError = '';
       editorPreview = false;
       editorOpen = true;
+      beginEditPresence(activeRootId, path);
     } catch (error) {
       if (error instanceof ApiError && (error.status === 400 || error.status === 415)) {
         showUnsupported(entry);
@@ -2027,7 +2434,7 @@
       const saved = await api.saveFile(activeRootId, editorPath, editorContent, editorEtag, csrf);
       editorEtag = saved.etag;
       editorOriginalContent = editorContent;
-      if (!auto) editorOpen = false;
+      if (!auto) closeEditor();
       clearDirSizeCache();
       await loadList(activeRootId, currentPath);
     } catch (error) {
@@ -2076,9 +2483,10 @@
     return /\.(jpe?g|png|gif|webp|bmp|tiff?)$/i.test(name);
   }
 
-  function hideBrokenThumb(event: Event): void {
+  function hideBrokenThumb(event: Event, key: string): void {
     const image = event.currentTarget as HTMLImageElement;
     image.style.display = 'none';
+    thumbFailures = { ...thumbFailures, [key]: true };
   }
 
   function formatRelativeDate(seconds: number): string {
@@ -2144,10 +2552,7 @@
     class="app"
     role="application"
     ondragover={(event) => event.preventDefault()}
-    ondrop={(event) => {
-      event.preventDefault();
-      void uploadFiles(Array.from(event.dataTransfer?.files ?? []));
-    }}
+    ondrop={(event) => void handleAppDrop(event)}
   >
     <header class="topbar">
       <button
@@ -2220,6 +2625,8 @@
           </div>
         {/if}
 
+        <NotificationCenter />
+
         <button
           type="button"
           class="icon-button"
@@ -2237,13 +2644,13 @@
             type="button"
             class="upload-top"
             class:inactive={currentReadOnly}
-            aria-disabled={!activeRoot || currentReadOnly || uploading}
+            aria-disabled={!activeRoot || currentReadOnly}
             title={currentReadOnly ? t($language, '当前目录只读') : t($language, '上传文件')}
             aria-label={t($language, '上传')}
             onclick={uploadClick}
           >
             <Icon name="upload" size={18} />
-            <span>{uploading ? t($language, '上传中…') : t($language, '上传')}</span>
+            <span>{t($language, '上传')}</span>
           </button>
         {/if}
 
@@ -2285,16 +2692,18 @@
             <span class="nav-empty">{t($language, '暂无目录')}</span>
           {/if}
           <div class="nav-sep"></div>
-          <button
-            type="button"
-            class="nav-item"
-            disabled={!activeRoot}
-            title={activeRoot ? t($language, '终端') : t($language, '请先选择存储目录')}
-            onclick={() => (terminalOpen = true)}
-          >
-            <Icon name="terminal" size={18} />
-            <span>{t($language, '终端')}</span>
-          </button>
+          {#if terminalAvailable}
+            <button
+              type="button"
+              class="nav-item"
+              disabled={!activeRoot}
+              title={activeRoot ? t($language, '终端') : t($language, '请先选择存储目录')}
+              onclick={() => (terminalOpen = true)}
+            >
+              <Icon name="terminal" size={18} />
+              <span>{t($language, '终端')}</span>
+            </button>
+          {/if}
           <button
             type="button"
             class:active={appView === 'shares'}
@@ -2610,11 +3019,11 @@
                       type="button"
                       class="upload-primary"
                       class:inactive={currentReadOnly}
-                      aria-disabled={!activeRoot || currentReadOnly || uploading}
+                      aria-disabled={!activeRoot || currentReadOnly}
                       onclick={uploadClick}
                     >
                       <Icon name="upload" size={18} />
-                      <span>{uploading ? t($language, '上传中…') : t($language, '上传文件')}</span>
+                      <span>{t($language, '上传文件')}</span>
                     </button>
                   </section>
                 {:else if view === 'list'}
@@ -2822,6 +3231,8 @@
                     >
                       {#each visibleEntries as entry (entry.name)}
                         {@const nameParts = splitFileName(entry.name)}
+                        {@const thumbPath = joinPath(currentPath, entry.name)}
+                        {@const thumbId = thumbKey(activeRootId ?? 0, thumbPath)}
                         <div
                           class="file-card"
                           data-entry-name={entry.name}
@@ -2869,18 +3280,21 @@
                           />
                           <div class="card-icon">
                             <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={40} />
-                            {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && entry.has_preview && activeRootId !== null}
+                            {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && entry.has_preview && activeRootId !== null && !thumbFailures[thumbId]}
                               <img
                                 class="thumb-image"
                                 src={api.thumbUrl(
                                   activeRootId,
-                                  joinPath(currentPath, entry.name),
+                                  thumbPath,
                                   320,
+                                  thumbVersions[thumbId],
+                                  !$realtimeActive,
                                 )}
                                 alt=""
                                 loading="lazy"
                                 decoding="async"
-                                onerror={hideBrokenThumb}
+                                fetchpriority="low"
+                                onerror={(event) => hideBrokenThumb(event, thumbId)}
                               />
                             {/if}
                           </div>
@@ -2922,6 +3336,8 @@
                     >
                       {#each visibleEntries as entry (entry.name)}
                         {@const nameParts = splitFileName(entry.name)}
+                        {@const thumbPath = joinPath(currentPath, entry.name)}
+                        {@const thumbId = thumbKey(activeRootId ?? 0, thumbPath)}
                         <div
                           class="file-tile"
                           data-entry-name={entry.name}
@@ -2969,18 +3385,21 @@
                           />
                           <div class="tile-icon">
                             <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={34} />
-                            {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && entry.has_preview && activeRootId !== null}
+                            {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && entry.has_preview && activeRootId !== null && !thumbFailures[thumbId]}
                               <img
                                 class="thumb-image"
                                 src={api.thumbUrl(
                                   activeRootId,
-                                  joinPath(currentPath, entry.name),
+                                  thumbPath,
                                   320,
+                                  thumbVersions[thumbId],
+                                  !$realtimeActive,
                                 )}
                                 alt=""
                                 loading="lazy"
                                 decoding="async"
-                                onerror={hideBrokenThumb}
+                                fetchpriority="low"
+                                onerror={(event) => hideBrokenThumb(event, thumbId)}
                               />
                             {/if}
                           </div>
@@ -3031,6 +3450,7 @@
 
   <NoticeDialog />
   <ProgressPanel />
+  <UploadPanel />
   <ToastPanel />
 
   {#if accountOpen}
@@ -3155,15 +3575,17 @@
           }}>{t($language, '上传目录')}</button
         >
       {/if}
-      <button
-        type="button"
-        role="menuitem"
-        onclick={() => {
-          blankMenu = null;
-          terminalOpen = true;
-        }}>{t($language, '打开终端')}</button
-      >
-      <div class="menu-sep"></div>
+      {#if terminalAvailable}
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            blankMenu = null;
+            terminalOpen = true;
+          }}>{t($language, '打开终端')}</button
+        >
+        <div class="menu-sep"></div>
+      {/if}
       <div class="menu-item">
         <button type="button" role="menuitem">
           {t($language, '排序方式')} <span class="menu-arrow">›</span>
@@ -3323,7 +3745,7 @@
   {/if}
 
   {#if editorOpen}
-    <div class="editor-overlay" role="presentation" onclick={() => (editorOpen = false)}>
+    <div class="editor-overlay" role="presentation" onclick={() => closeEditor()}>
       <dialog
         open
         class="editor-panel"
@@ -3332,6 +3754,11 @@
       >
         <header class="editor-header">
           <strong id="editor-title">{editorName}</strong>
+          {#if editorPeerEditing}
+            <span class="editor-peer" role="status">
+              {t($language, '另一个标签页正在编辑')}
+            </span>
+          {/if}
           <div class="editor-actions">
             {#if isMarkdown(editorName)}
               <button type="button" class="ghost" onclick={() => (editorPreview = !editorPreview)}>
@@ -3342,7 +3769,7 @@
               type="button"
               class="icon-button"
               aria-label={t($language, '关闭编辑器')}
-              onclick={() => (editorOpen = false)}
+              onclick={() => closeEditor()}
             >
               <Icon name="close" size={18} />
             </button>
@@ -3379,7 +3806,7 @@
             {editorContent.length} chars</span
           >
           <div>
-            <button type="button" class="ghost" onclick={() => (editorOpen = false)}
+            <button type="button" class="ghost" onclick={() => closeEditor()}
               >{t($language, '取消')}</button
             >
             <button
@@ -3397,7 +3824,7 @@
   {/if}
 {/if}
 
-<AudioPlayer />
+<AudioPlayer hidden={preview !== null} />
 
 {#if properties}
   <PropertiesDialog
@@ -4554,6 +4981,15 @@
     font-weight: 500;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .editor-peer {
+    flex: none;
+    padding: 2px 8px;
+    border-radius: var(--radius-pill);
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font-size: 11.5px;
   }
 
   .editor-actions,

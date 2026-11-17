@@ -84,6 +84,15 @@ export interface UploadCreated {
   expires_at: number;
 }
 
+export interface UploadStatus {
+  upload_id: string;
+  total_size: number;
+  chunk_size: number;
+  received: number;
+  received_chunks: number[];
+  expires_at: number;
+}
+
 export interface ServerPath {
   id: number;
   alias: string;
@@ -424,13 +433,14 @@ export const api = {
     return `${BASE}/download?${query.toString()}`;
   },
 
-  thumbUrl(root: number, path: string, width = 256, version?: number): string {
+  thumbUrl(root: number, path: string, width = 256, version?: number, wait = false): string {
     const query = new URLSearchParams({
       root: String(root),
       path,
       w: String(width),
     });
     if (version !== undefined) query.set('v', String(version));
+    if (wait) query.set('wait', '1');
     return `${BASE}/thumb?${query.toString()}`;
   },
 
@@ -456,6 +466,30 @@ export const api = {
     return request(
       '/thumb/retry',
       { method: 'POST', body: JSON.stringify({ root, path, w: width }) },
+      csrf,
+    );
+  },
+
+  editPresence(
+    root: number,
+    path: string,
+    state: 'open' | 'close',
+    client: string,
+    csrf: string,
+    keepalive = false,
+  ): Promise<{
+    ok: boolean;
+    others: number;
+    peers: Array<{ client: string; expires_at: number }>;
+    expires_at: number;
+  }> {
+    return request(
+      '/edit/presence',
+      {
+        method: 'POST',
+        body: JSON.stringify({ root, path, state, client }),
+        keepalive,
+      },
       csrf,
     );
   },
@@ -512,10 +546,20 @@ export const api = {
     return `${BASE}/public/shares/${token}/zip/form`;
   },
 
-  publicThumbUrl(token: string, path: string, width = 320, ticket?: string, item?: number): string {
+  publicThumbUrl(
+    token: string,
+    path: string,
+    width = 320,
+    ticket?: string,
+    item?: number,
+    version?: number,
+    wait = false,
+  ): string {
     const query = new URLSearchParams({ path, w: String(width) });
     if (ticket) query.set('ticket', ticket);
     if (item !== undefined) query.set('item', String(item));
+    if (version !== undefined) query.set('v', String(version));
+    if (wait) query.set('wait', '1');
     return `${BASE}/public/shares/${token}/thumb?${query.toString()}`;
   },
 
@@ -902,12 +946,21 @@ export const api = {
     return request<JobInfo>(`/jobs/${id}`, { method: 'DELETE' }, csrf);
   },
 
+  jobs(since = 0, signal?: AbortSignal): Promise<JobInfo[]> {
+    return request<{ jobs: JobInfo[] }>(`/jobs?since=${Math.max(0, Math.floor(since))}`, {
+      signal,
+    }).then((value) => value.jobs);
+  },
+
   previewThumbUrl(root: number, path: string, edge = 2048): string {
     const query = new URLSearchParams({
       root: String(root),
       path,
       fit: 'short',
       edge: String(edge),
+      // The lightbox has no per-image SSE reload hook, so keep its thumbnail
+      // request synchronous instead of showing the async placeholder.
+      wait: '1',
     });
     return `${BASE}/thumb?${query.toString()}`;
   },
@@ -1196,27 +1249,52 @@ export const api = {
     );
   },
 
-  async uploadChunk(
+  uploadStatus(uploadId: string, signal?: AbortSignal): Promise<UploadStatus> {
+    return request<UploadStatus>(`/uploads/${uploadId}`, { signal });
+  },
+
+  uploadChunk(
     uploadId: string,
     index: number,
     chunk: Blob,
     csrf: string,
     signal?: AbortSignal,
+    onProgress?: (loaded: number) => void,
   ): Promise<void> {
-    const response = await fetch(`${BASE}/uploads/${uploadId}/chunks/${index}`, {
-      method: 'PUT',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'X-CSRF-Token': csrf,
-      },
-      body: chunk,
-      signal,
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', `${BASE}/uploads/${uploadId}/chunks/${index}`);
+      xhr.withCredentials = true;
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.setRequestHeader('X-CSRF-Token', csrf);
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress?.(event.loaded);
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve();
+          return;
+        }
+        let code = 'INTERNAL_ERROR';
+        let message = xhr.statusText || 'Request failed';
+        try {
+          const parsed = JSON.parse(xhr.responseText) as {
+            error?: { code?: string; message?: string };
+          };
+          code = parsed.error?.code ?? code;
+          message = parsed.error?.message ?? message;
+        } catch (error) {
+          console.warn('failed to parse upload error response', error);
+        }
+        reject(new ApiError(xhr.status, code, message));
+      };
+      xhr.onerror = () => reject(new ApiError(0, 'NETWORK_ERROR', '网络连接中断'));
+      xhr.onabort = () => reject(new DOMException('aborted', 'AbortError'));
+      const abort = (): void => xhr.abort();
+      signal?.addEventListener('abort', abort, { once: true });
+      xhr.onloadend = () => signal?.removeEventListener('abort', abort);
+      xhr.send(chunk);
     });
-
-    if (!response.ok) {
-      throw await apiErrorFromResponse(response);
-    }
   },
 
   async uploadBrandingIcon(

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: FileHub API
-  version: 0.1.3
+  version: 0.1.7
   description: FileHub 自托管文件管理器 API。所有业务接口前缀 /api/v1。
 servers:
   - url: /
@@ -103,6 +103,37 @@ paths:
         '204': { description: Password changed }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
+  /api/v1/events:
+    get:
+      tags: [auth]
+      summary: 当前用户实时事件流（SSE）
+      description: 使用 session cookie 鉴权；只推送当前用户事件，管理员额外收到 admin 事件。事件包含 `id`、`event`、`data`，心跳间隔 20 秒。
+      responses:
+        '200':
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/edit/presence:
+    post:
+      tags: [files]
+      summary: 编辑占用提示（仅提示，不做强锁）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, path, state, client]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string }
+                state: { type: string, enum: [open, close] }
+                client: { type: string, description: 每个标签页独立的随机标识 }
+      responses:
+        '200': { description: 当前同文件的其他编辑器数量与过期时间 }
+        '400': { $ref: '#/components/responses/Error' }
   /api/v1/auth/tokens:
     get:
       tags: [auth]
@@ -264,6 +295,24 @@ paths:
       responses:
         '200': { description: OK }
         '404': { $ref: '#/components/responses/Error' }
+  /api/v1/jobs:
+    get:
+      tags: [jobs]
+      summary: 当前用户的后台任务
+      description: 返回排队/运行中的任务，以及 `since` 之后结束的任务，用于刷新页面后恢复进度面板。
+      parameters:
+        - { name: since, in: query, schema: { type: integer, format: int64, minimum: 0 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items: { type: object }
   /api/v1/jobs/{id}:
     get:
       tags: [jobs]
@@ -329,7 +378,13 @@ paths:
                 root: { type: integer, format: int64 }
                 path: { type: string, default: '' }
                 filename: { type: string }
-                total_size: { type: integer, format: int64 }
+                total_size:
+                  {
+                    type: integer,
+                    format: int64,
+                    minimum: 0,
+                    description: 允许为 0，用于上传空文件,
+                  }
                 chunk_size: { type: integer, format: int64, nullable: true }
       responses:
         '200': { description: OK }
@@ -401,12 +456,18 @@ paths:
     get:
       tags: [files]
       summary: 缩略图
+      description: '默认异步：缓存未命中时立即返回透明占位图（`X-FileHub-Thumb-State: pending`），生成完成后通过 `thumbnail.ready` 事件通知；`wait=1` 恢复同步等待。'
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, required: true, schema: { type: string } }
         - { name: w, in: query, schema: { type: integer, minimum: 16, maximum: 2048, default: 256 } }
+        - { name: wait, in: query, schema: { type: integer, enum: [0, 1], default: 0 } }
       responses:
-        '200': { description: image/jpeg }
+        '200':
+          description: image/jpeg；异步占位响应为 image/png
+          headers:
+            X-FileHub-Thumb-State:
+              schema: { type: string, enum: [pending] }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/file/probe:
     get:
@@ -615,6 +676,25 @@ paths:
         - { name: X-Share-Ticket, in: header, schema: { type: string } }
       responses:
         '200': { description: File }
+
+  /api/v1/public/shares/{token}/events:
+    get:
+      tags: [shares]
+      security: []
+      summary: 公开分享实时事件流（SSE）
+      description: 仅推送该分享的访问/下载/上传/缩略图事件；已撤销返回 410 `SHARE_REVOKED`，已过期返回 410 `SHARE_EXPIRED`，未知链接返回 404。密码分享需在 `ticket` 查询参数中携带解锁票据。
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+        - { name: ticket, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '410': { $ref: '#/components/responses/Error' }
 
   /api/v1/admin/users:
     get:

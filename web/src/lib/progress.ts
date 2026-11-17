@@ -41,8 +41,13 @@ export function setProgressCancel(onCancel: (() => void) | null): void {
   progress.update((value) => ({ ...value, onCancel }));
 }
 
-export function updateProgress(current: number, detail = ''): void {
-  progress.update((value) => ({ ...value, current, detail }));
+export function updateProgress(current: number, detail = '', total?: number): void {
+  progress.update((value) => ({
+    ...value,
+    current,
+    detail,
+    total: total ?? value.total,
+  }));
 }
 
 export function finishProgress(detail = t(get(language), '完成')): void {

@@ -150,7 +150,7 @@ Proxy requirements:
 
 - WebSocket: `/api/v1/terminal/ws` needs HTTP/1.1 and the `Upgrade`/`Connection` headers. Caddy handles this automatically; Nginx needs the `map` block shown below.
 - Upload body limit: set it above `uploads.chunk_size` (8 MiB by default). The examples use 32 MiB; raise it if you increase the chunk size.
-- Downloads and ZIP streams: disable proxy buffering (`proxy_buffering off` and `proxy_request_buffering off` in Nginx, `flush_interval -1` in Caddy). FileHub does not send `X-Accel-Buffering`, so buffering must be disabled in the proxy.
+- Downloads and ZIP streams: disable proxy buffering (`proxy_buffering off` and `proxy_request_buffering off` in Nginx, `flush_interval -1` in Caddy). Downloads do not send `X-Accel-Buffering`; realtime event streams (`/api/v1/events` and public share events) do send `X-Accel-Buffering: no`, but disabling buffering in the proxy is still recommended.
 - Long transfers: the examples use a 1-hour read/send timeout. Increase it, or lower `downloads.zip_max_bytes`, if very large ZIP archives can take longer.
 
 ### Caddy

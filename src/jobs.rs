@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::{Db, JobRecord, unix_now};
 use crate::error::AppError;
+use crate::events::EventBus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobKind {
@@ -71,7 +72,7 @@ pub struct Job {
 }
 
 impl Job {
-    fn from_record(record: JobRecord) -> Self {
+    pub(crate) fn from_record(record: JobRecord) -> Self {
         Self {
             id: record.id,
             user_id: record.user_id,
@@ -158,16 +159,22 @@ pub struct JobManager {
     db: Db,
     inner: Mutex<Inner>,
     io: Arc<Semaphore>,
+    interactive_io: Arc<Semaphore>,
+    dir_size_io: Arc<Semaphore>,
     queue_limit: usize,
     thumbnail_queue_limit: usize,
+    events: Arc<EventBus>,
 }
 
 impl JobManager {
     pub fn new(
         db: Db,
         io_workers: usize,
+        interactive_workers: usize,
+        dir_size_workers: usize,
         queue_limit: usize,
         thumbnail_queue_limit: usize,
+        events: Arc<EventBus>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
@@ -179,8 +186,11 @@ impl JobManager {
                 waiters: HashMap::new(),
             }),
             io: Arc::new(Semaphore::new(io_workers.max(1))),
+            interactive_io: Arc::new(Semaphore::new(interactive_workers.max(1))),
+            dir_size_io: Arc::new(Semaphore::new(dir_size_workers.max(1))),
             queue_limit: queue_limit.max(1),
             thumbnail_queue_limit: thumbnail_queue_limit.max(1),
+            events,
         })
     }
 
@@ -192,6 +202,7 @@ impl JobManager {
         Ok(count)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit<F, Fut>(
         self: &Arc<Self>,
         kind: JobKind,
@@ -199,6 +210,7 @@ impl JobManager {
         user_id: i64,
         payload: Value,
         total: usize,
+        priority: bool,
         run: F,
     ) -> Result<SubmitOutcome, AppError>
     where
@@ -224,7 +236,10 @@ impl JobManager {
                             && matches!(job.status.as_str(), "queued" | "running")
                     })
                     .count();
-                if queued_thumbnails >= self.thumbnail_queue_limit {
+                // Full-size previews get a small reserved queue allowance so a
+                // folder full of list thumbnails cannot turn them into 503s.
+                let limit = self.thumbnail_queue_limit + usize::from(priority) * 2;
+                if queued_thumbnails >= limit {
                     return Err(AppError::QueueFull);
                 }
             }
@@ -283,7 +298,7 @@ impl JobManager {
         );
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.execute(id, kind, key, token, run).await;
+            manager.execute(id, kind, key, user_id, token, run).await;
         });
         Ok(SubmitOutcome { job, created })
     }
@@ -293,14 +308,26 @@ impl JobManager {
         id: String,
         kind: JobKind,
         key: String,
+        user_id: i64,
         token: CancellationToken,
         run: F,
     ) where
         F: FnOnce(JobContext) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<JobOutcome, AppError>> + Send + 'static,
     {
-        let permit = if kind.uses_shared_io() {
-            match self.io.clone().acquire_owned().await {
+        // Transfers are interactive: keep them out of the maintenance queue so a
+        // long index/dir-size scan cannot make a move sit at "queued" for long.
+        let semaphore = if kind.is_transfer() {
+            Some(Arc::clone(&self.interactive_io))
+        } else if kind == JobKind::DirSize {
+            Some(Arc::clone(&self.dir_size_io))
+        } else if kind.uses_shared_io() {
+            Some(Arc::clone(&self.io))
+        } else {
+            None
+        };
+        let permit = if let Some(semaphore) = semaphore {
+            match semaphore.acquire_owned().await {
                 Ok(permit) => Some(permit),
                 Err(_) => {
                     self.finish_row(&id, "failed", None, Some("job worker closed"))
@@ -330,6 +357,15 @@ impl JobManager {
                 job.started_at = Some(unix_now());
             }
         }
+        self.events.publish(
+            "job.updated",
+            Some(user_id),
+            serde_json::json!({
+                "id": id,
+                "kind": kind.as_str(),
+                "status": "running",
+            }),
+        );
         tracing::info!(job_id = %id, kind = kind.as_str(), key = %key, "job started");
         let started = Instant::now();
         let context = JobContext {
@@ -411,6 +447,30 @@ impl JobManager {
         {
             tracing::warn!(job_id = %id, error = %write_error, "failed to persist job result");
         }
+        if status == "failed"
+            && let Some(error_text) = error.as_deref()
+        {
+            self.events.publish(
+                "notification",
+                Some(user_id),
+                serde_json::json!({
+                    "kind": "job_failed",
+                    "message": error_text,
+                }),
+            );
+        }
+        self.events.publish(
+            "job.updated",
+            Some(user_id),
+            serde_json::json!({
+                "id": id,
+                "kind": kind.as_str(),
+                "status": status,
+                "progress": progress,
+                "total": total,
+                "error": error,
+            }),
+        );
         if status == "completed" {
             tracing::info!(
                 job_id = %id,
@@ -563,6 +623,26 @@ impl JobManager {
         }
         let record = self.db.find_job(id).await.map_err(AppError::internal)?;
         Ok(record.map(Job::from_record))
+    }
+
+    /// Active jobs plus jobs finished after `since`, newest first. The browser
+    /// uses this to re-attach to work that kept running after a reload.
+    pub async fn list_for_user(&self, user_id: i64, since: i64) -> Result<Vec<Job>, AppError> {
+        let records = self
+            .db
+            .list_jobs_for_user(user_id, since, 50)
+            .await
+            .map_err(AppError::internal)?;
+        let memory = self.inner.lock().jobs.clone();
+        Ok(records
+            .into_iter()
+            .map(|record| {
+                memory
+                    .get(&record.id)
+                    .cloned()
+                    .unwrap_or_else(|| Job::from_record(record))
+            })
+            .collect())
     }
 
     pub async fn cancel(&self, id: &str, user_id: i64, is_admin: bool) -> Result<Job, AppError> {

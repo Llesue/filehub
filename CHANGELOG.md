@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.1.7 - 2026-11-17
+
+### Added
+
+- SSE event bus and authenticated `/api/v1/events` stream with heartbeat, per-user filtering, `X-Accel-Buffering: no` and scoped public-share events.
+- Real-time job progress, usage updates, share changes, admin audit/slow-request events and notifications.
+- Asynchronous thumbnails by default: cache misses return a transparent placeholder immediately and reload when `thumbnail.ready` arrives; `wait=1` keeps the synchronous 120-second path as a fallback.
+- Editor presence hints (`edit.presence`) with a 60-second TTL and a "another tab is editing" indicator; saves are never blocked.
+- Topbar notification center with unread count, local persistence and a small dropdown list.
+- Token-scoped public share event stream for visits, downloads, uploads and thumbnails, with live feedback on the share page.
+- Frontend EventSource client with BroadcastChannel forwarding, localStorage leader election and per-tab fallback.
+- Optional folder upload path creation now creates each directory level and deduplicates within a batch.
+
+### Changed
+
+- Share management refreshes immediately on share events in addition to the 15-second fallback.
+- Public share pages reconnect their event stream and fall back to synchronous thumbnails if the stream fails.
+- Audio playback pauses automatically when another tab starts playing.
+- Uploads run three files concurrently with a merged, per-file progress queue. Files can be paused, resumed, cancelled and retried individually; completed files leave the list immediately.
+- Paused or interrupted uploads resume from the server-side chunk bitmap after the same file is selected again; active copy/move jobs are reattached after a page reload.
+- Copy/move progress bars use bytes instead of file counts; interactive transfers use a separate worker pool so index and directory-size scans cannot leave a move at "queued".
+- Image preview shows a blurred cached thumbnail clipped to the sharp image bounds, fades the sharp image in over 80ms, then removes the blurred layer; no feathered edges remain. Thumbnail long edge is capped at 4096.
+- Full-size preview thumbnails use a reserved worker lane (`thumbnails.preview_workers`, default 1), so scrolling a folder full of large photos no longer blocks preview generation.
+- Double-clicking an audio file opens the player instead of the lightbox; the player gained a compact persisted volume slider next to the controls, and opening a video pauses music until the video is closed. Video volume and mute state are persisted separately.
+- The audio player is hidden while the lightbox is open; playback continues for images and is paused/resumed by video as before.
+- Each directory pins its first resolved view and sort mode, so changing the view in a subdirectory no longer changes the parent directory.
+- The preview blur uses the same 320px thumbnail as the grid, avoiding a duplicate thumbnail generation.
+- Background index writes are committed in bounded chunks, the DB pool prefers idle connections, and cache invalidation for a path chain is applied in one transaction; slow deletes are logged with phase timings.
+- Index invalidation now keeps the last directory-size value as `stale` instead of deleting it, and quick scans aggregate ready child sizes into the parent. Directories no longer fall back to "calculating" just because a quick scan marked their index partial.
+- Directory-size scans have their own worker lane (`jobs.dir_size_workers`, default 1), so a long index or full scan cannot leave a directory at "calculating".
+- Delete/copy/move completion only refreshes the list when the user is still viewing the source or destination directory; navigating away during a slow operation no longer pulls the view back.
+
+### Fixed
+
+- The terminal preference now actually hides the terminal entry and shortcut.
+- Folder uploads accept zero-byte files and no longer fail the batch because of them.
+- Windows filenames are validated by UTF-16 length, so long Chinese photo names no longer fail upload.
+- Notification bell uses the same borderless icon-button styling as the theme toggle.
+- Clicking a search result scrolls the matching entry into view.
+- Upload preemption no longer raises a notice titled "Operation failed"; the paused file is shown in the queue instead.
+- Info notices now default to a "Notice" title instead of "Operation failed".
+
+### Verification
+
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets`.
+- `pnpm lint`, `pnpm check`, `pnpm test`, `pnpm build`.
+
 ## v0.1.6 - 2026-11-17
 
 ### Added

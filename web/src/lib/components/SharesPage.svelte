@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { realtimeEvent } from '../events';
   import { api, type ShareInfo } from '../api';
   import { copyText } from '../clipboard';
   import { language, localeOf, t } from '../i18n';
@@ -82,7 +83,11 @@
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisibility);
     refreshTimer = setInterval(() => void refresh(), 15_000);
+    const unsubscribe = realtimeEvent.subscribe((event) => {
+      if (event?.type.startsWith('share.')) void refresh();
+    });
     return () => {
+      unsubscribe();
       window.removeEventListener('scroll', onScroll, true);
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibility);

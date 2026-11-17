@@ -1,10 +1,13 @@
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State, rejection::JsonRejection};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
@@ -27,6 +30,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/logout", post(logout))
         .route("/me", get(me))
         .route("/me/password", post(change_password))
+        .route("/events", get(events_stream))
         .route(
             "/me/preferences",
             get(crate::preferences::get_preferences).patch(crate::preferences::update_preferences),
@@ -75,6 +79,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage", get(crate::usage::usage))
         .route("/file/probe", get(crate::editor::probe))
         .route("/file", get(crate::editor::read).put(crate::editor::save))
+        .route("/edit/presence", post(crate::presence::update))
         .route("/thumb", get(crate::thumbs::thumb))
         .route("/thumb/status", get(crate::thumbs::status))
         .route("/thumb/retry", post(crate::thumbs::retry))
@@ -98,6 +103,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/public/shares/{token}/upload", post(crate::shares::upload))
         .route("/public/shares/{token}/thumb", get(crate::shares::thumb))
+        .route("/public/shares/{token}/events", get(crate::shares::events))
         .route(
             "/public/shares/{token}/uploads",
             post(crate::shares::create_upload),
@@ -146,6 +152,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/fs/transfer-jobs/{id}",
             get(crate::files::job_status).delete(crate::files::job_cancel),
         )
+        .route("/jobs", get(crate::files::list_jobs))
         .route(
             "/jobs/{id}",
             get(crate::files::job_status).delete(crate::files::job_cancel),
@@ -178,6 +185,42 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             HeaderValue::from_static("no-store"),
         ))
         .merge(crate::branding::public_router())
+}
+
+async fn events_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let user_id = current.user.id;
+    let admin = current.user.role == "admin";
+    let receiver = state.events.subscribe();
+    let stream = futures_util::stream::unfold(receiver, move |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if !event.visible_to_user(user_id, admin) {
+                        continue;
+                    }
+                    let data = serde_json::to_string(&event.data).unwrap_or_default();
+                    let out = SseEvent::default()
+                        .id(event.id.to_string())
+                        .event(event.event)
+                        .data(data);
+                    return Some((Ok::<_, Infallible>(out), receiver));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    Ok(response)
 }
 
 async fn require_initialized(

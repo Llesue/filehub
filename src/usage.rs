@@ -118,6 +118,15 @@ pub async fn load_snapshot(
     }
     let snapshot = compute_snapshot(state, user).await?;
     state.usage_cache.lock().insert(user.id, snapshot.clone());
+    state.events.publish(
+        "usage.updated",
+        Some(user.id),
+        json!({
+            "used_bytes": snapshot.used_bytes,
+            "quota_bytes": snapshot.quota_bytes,
+            "computed_at": snapshot.computed_at,
+        }),
+    );
     Ok(snapshot)
 }
 
@@ -142,7 +151,16 @@ fn spawn_refresh(state: Arc<AppState>, user: User) {
         }
         match compute_snapshot(&state, &user).await {
             Ok(snapshot) => {
-                state.usage_cache.lock().insert(user.id, snapshot);
+                state.usage_cache.lock().insert(user.id, snapshot.clone());
+                state.events.publish(
+                    "usage.updated",
+                    Some(user.id),
+                    json!({
+                        "used_bytes": snapshot.used_bytes,
+                        "quota_bytes": snapshot.quota_bytes,
+                        "computed_at": snapshot.computed_at,
+                    }),
+                );
             }
             Err(error) => {
                 tracing::warn!(user_id = user.id, %error, "failed to refresh usage cache");

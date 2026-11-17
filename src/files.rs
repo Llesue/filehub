@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -252,6 +253,7 @@ async fn schedule_browse_index(
             user_id,
             payload,
             1,
+            false,
             move |ctx| async move {
                 let cancel = ctx.token();
                 let mut progress = |directories: usize, _entries: usize| {
@@ -313,8 +315,10 @@ async fn enrich_directory_sizes(
             continue;
         }
         if let Some((status, size, _error)) = cached.get(&path)
-            && status == "ready"
+            && matches!(status.as_str(), "ready" | "stale")
         {
+            // Keep showing the last known size while a refresh runs. The
+            // per-directory /dir-size request reports the stale flag.
             entries[index].size = (*size).max(0);
             continue;
         }
@@ -617,6 +621,16 @@ pub struct CreateUploadRequest {
     chunk_size: Option<i64>,
 }
 
+fn warn_upload(user_id: i64, filename: &str, action: &str, error: &AppError) {
+    tracing::warn!(
+        user_id,
+        filename,
+        action,
+        error = %error,
+        "upload request failed"
+    );
+}
+
 pub async fn create_upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -626,8 +640,10 @@ pub async fn create_upload(
     let root = load_root(&state, current.user.id, request.root).await?;
     let path = request.path.unwrap_or_default();
     let resolved = authz::resolve(&state, current.user.id, root.id, &path, true).await?;
-    let filename = validate_filename(&request.filename)?;
-    let size = validate_upload_size(&state, request.total_size)?;
+    let filename = validate_filename(&request.filename)
+        .inspect_err(|error| warn_upload(current.user.id, &request.filename, "filename", error))?;
+    let size = validate_upload_size(&state, request.total_size)
+        .inspect_err(|error| warn_upload(current.user.id, &filename, "size", error))?;
     let concurrency = state
         .settings()
         .settings
@@ -640,7 +656,9 @@ pub async fn create_upload(
         .await
         .map_err(AppError::internal)?;
     if active >= concurrency {
-        return Err(AppError::TooManyRequests);
+        let error = AppError::TooManyRequests;
+        warn_upload(current.user.id, &filename, "concurrency", &error);
+        return Err(error);
     }
 
     if let Some(quota_bytes) = current.user.quota_bytes
@@ -654,7 +672,9 @@ pub async fn create_upload(
             .await
             .map_err(|err| AppError::internal(anyhow::anyhow!("quota task failed: {err}")))??;
         if usage.saturating_add(size as u64) > quota_bytes.max(0) as u64 {
-            return Err(AppError::QuotaExceeded);
+            let error = AppError::QuotaExceeded;
+            warn_upload(current.user.id, &filename, "quota", &error);
+            return Err(error);
         }
     }
 
@@ -663,17 +683,21 @@ pub async fn create_upload(
         .unwrap_or_else(|| state.settings().settings.uploads.chunk_size as i64);
 
     if !(1..=64 * 1024 * 1024).contains(&chunk_size) {
-        return Err(AppError::bad_request(
-            "chunk_size must be between 1 and 64 MiB",
-        ));
+        let error = AppError::bad_request("chunk_size must be between 1 and 64 MiB");
+        warn_upload(current.user.id, &filename, "chunk_size", &error);
+        return Err(error);
     }
     if !resolved.absolute.is_dir() {
-        return Err(AppError::bad_request("upload target is not a directory"));
+        let error = AppError::bad_request("upload target is not a directory");
+        warn_upload(current.user.id, &filename, "target", &error);
+        return Err(error);
     }
 
     let chunks = (size + chunk_size - 1) / chunk_size;
     if chunks > 100_000 {
-        return Err(AppError::bad_request("too many upload chunks"));
+        let error = AppError::bad_request("too many upload chunks");
+        warn_upload(current.user.id, &filename, "chunks", &error);
+        return Err(error);
     }
 
     let upload_id = format!("up_{}", auth::random_token(16));
@@ -698,7 +722,9 @@ pub async fn create_upload(
 
     if let Err(err) = state.db.insert_upload(&upload).await {
         fsops::delete_temp(&temp);
-        return Err(AppError::internal(err));
+        let error = AppError::internal(err);
+        warn_upload(current.user.id, &filename, "insert", &error);
+        return Err(error);
     }
 
     Ok(Json(json!({
@@ -762,7 +788,9 @@ pub async fn upload_chunk(
     let index = index as i64;
     let chunks = (upload.total_size + upload.chunk_size - 1) / upload.chunk_size;
     if index < 0 || index >= chunks {
-        return Err(AppError::bad_request("chunk index out of range"));
+        let error = AppError::bad_request("chunk index out of range");
+        warn_upload(current.user.id, &upload.filename, "chunk_index", &error);
+        return Err(error);
     }
 
     let expected = if index == chunks - 1 {
@@ -771,7 +799,9 @@ pub async fn upload_chunk(
         upload.chunk_size
     };
     if body.len() as i64 != expected {
-        return Err(AppError::bad_request("unexpected chunk size"));
+        let error = AppError::bad_request("unexpected chunk size");
+        warn_upload(current.user.id, &upload.filename, "chunk_size", &error);
+        return Err(error);
     }
 
     let byte_index = (index / 8) as usize;
@@ -785,9 +815,15 @@ pub async fn upload_chunk(
         let temp_path = PathBuf::from(&upload.temp_path);
         let data = body.to_vec();
         let offset = (index * upload.chunk_size) as u64;
-        tokio::task::spawn_blocking(move || fsops::write_upload_chunk(&temp_path, offset, &data))
-            .await
-            .map_err(|err| AppError::internal(anyhow::anyhow!("chunk task failed: {err}")))??;
+        let written = tokio::task::spawn_blocking(move || {
+            fsops::write_upload_chunk(&temp_path, offset, &data)
+        })
+        .await
+        .map_err(|err| AppError::internal(anyhow::anyhow!("chunk task failed: {err}")))?;
+        if let Err(error) = written {
+            warn_upload(current.user.id, &upload.filename, "chunk_write", &error);
+            return Err(error);
+        }
 
         if let Some(value) = upload.chunk_bitmap.get_mut(byte_index) {
             *value |= bit;
@@ -821,7 +857,9 @@ pub async fn complete_upload(
     let upload = load_upload(&state, current.user.id, &id).await?;
     let chunks = (upload.total_size + upload.chunk_size - 1) / upload.chunk_size;
     if received_chunks(&upload).len() as i64 != chunks {
-        return Err(AppError::bad_request("upload is incomplete"));
+        let error = AppError::bad_request("upload is incomplete");
+        warn_upload(current.user.id, &upload.filename, "incomplete", &error);
+        return Err(error);
     }
 
     let root = load_root(&state, current.user.id, upload.root_id).await?;
@@ -857,7 +895,9 @@ pub async fn complete_upload(
             }
             "overwrite" => {
                 if target_path.is_dir() {
-                    return Err(AppError::conflict("target is a directory"));
+                    let error = AppError::conflict("target is a directory");
+                    warn_upload(current.user.id, &upload.filename, "complete", &error);
+                    return Err(error);
                 }
                 tokio::fs::remove_file(&target_path)
                     .await
@@ -877,9 +917,14 @@ pub async fn complete_upload(
     }
 
     let finalize_target = target_path.clone();
-    tokio::task::spawn_blocking(move || fsops::finalize_upload(&temp, &finalize_target))
-        .await
-        .map_err(|err| AppError::internal(anyhow::anyhow!("finalize task failed: {err}")))??;
+    let finalized =
+        tokio::task::spawn_blocking(move || fsops::finalize_upload(&temp, &finalize_target))
+            .await
+            .map_err(|err| AppError::internal(anyhow::anyhow!("finalize task failed: {err}")))?;
+    if let Err(error) = finalized {
+        warn_upload(current.user.id, &upload.filename, "finalize", &error);
+        return Err(error);
+    }
 
     state
         .db
@@ -1012,21 +1057,45 @@ pub async fn delete_confirm(
         let mut tokens = state.delete_tokens.lock();
         tokens.remove(&request.token);
     }
+    let started = Instant::now();
+    let mut resolve_ns = 0_u128;
+    let mut remove_ns = 0_u128;
+    let mut cache_ns = 0_u128;
     let root = load_root(&state, current.user.id, preview.root_id).await?;
     for item in &preview.items {
+        let phase = Instant::now();
         let resolved =
             authz::resolve(&state, current.user.id, root.id, &item.relative, true).await?;
+        resolve_ns += phase.elapsed().as_nanos();
         let relative = resolved.relative.clone();
         let path = resolved.absolute.clone();
+        let phase = Instant::now();
         tokio::task::spawn_blocking(move || fsops::remove_path(&path, &relative))
             .await
             .map_err(|err| AppError::internal(anyhow::anyhow!("delete task failed: {err}")))??;
+        remove_ns += phase.elapsed().as_nanos();
+        let phase = Instant::now();
         state
             .invalidate_path_caches(&resolved.absolute, Some(current.user.id), true)
             .await;
+        cache_ns += phase.elapsed().as_nanos();
     }
 
+    let audit_started = Instant::now();
     audit(&state, current.user.id, "delete", None, &headers).await;
+    let total_ms = started.elapsed().as_millis() as u64;
+    if total_ms >= 500 {
+        tracing::warn!(
+            user_id = current.user.id,
+            items = preview.items.len(),
+            resolve_ms = resolve_ns / 1_000_000,
+            remove_ms = remove_ns / 1_000_000,
+            cache_ms = cache_ns / 1_000_000,
+            audit_ms = audit_started.elapsed().as_millis() as u64,
+            total_ms,
+            "slow delete request"
+        );
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1116,7 +1185,14 @@ pub(crate) fn validate_filename(filename: &str) -> Result<String, AppError> {
     {
         return Err(AppError::invalid_path("invalid filename"));
     }
-    if filename.len() > 255 {
+    // NTFS limits names by UTF-16 code units, not UTF-8 bytes. A long Chinese
+    // filename that Explorer accepts must not be rejected by a byte count.
+    let too_long = if cfg!(windows) {
+        filename.encode_utf16().count() > 255
+    } else {
+        filename.len() > 255
+    };
+    if too_long {
         return Err(AppError::invalid_path("filename is too long"));
     }
     #[cfg(windows)]
@@ -1165,8 +1241,8 @@ pub(crate) fn validate_filename(filename: &str) -> Result<String, AppError> {
 }
 
 pub(crate) fn validate_upload_size(state: &Arc<AppState>, size: i64) -> Result<i64, AppError> {
-    if size <= 0 {
-        return Err(AppError::bad_request("total_size must be positive"));
+    if size < 0 {
+        return Err(AppError::bad_request("total_size must not be negative"));
     }
     let max = state.settings().settings.uploads.max_file_bytes;
     if size as u64 > max {
@@ -1290,6 +1366,19 @@ pub async fn dir_size(
         let mtime_matches = cached_mtime == mtime;
         let fresh = status == "ready" && mtime_matches;
         let ttl_expired = now.saturating_sub(updated_at) > ttl;
+        if has_value && status == "stale" && mtime_matches && !ttl_expired {
+            // Index invalidation only marks the value stale; keep showing it
+            // until the TTL expires instead of queueing a scan on every list.
+            return Ok(Json(json!({
+                "status": "ready",
+                "size": size.max(0) as u64,
+                "indexed": false,
+                "partial": error.is_some(),
+                "stale": true,
+                "refreshing": false,
+                "error": error,
+            })));
+        }
         if fresh && !ttl_expired {
             return Ok(Json(json!({
                 "status": "ready",
@@ -1429,6 +1518,7 @@ async fn enqueue_dir_size(
             user_id,
             payload,
             1,
+            false,
             move |ctx| async move {
                 let _ = job_state
                     .db
@@ -1775,6 +1865,7 @@ async fn submit_transfer(
                 user_id,
                 payload_value,
                 total,
+                false,
                 move |ctx| async move {
                     execute_transfer_job(job_state, user_id, job_payload, ctx).await
                 },
@@ -2024,6 +2115,22 @@ async fn can_view_job(
             std::path::Path::new(&root.real_path),
         )
     }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JobsQuery {
+    since: Option<i64>,
+}
+
+pub async fn list_jobs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<JobsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let since = query.since.unwrap_or(0).max(0);
+    let jobs = state.jobs.list_for_user(current.user.id, since).await?;
+    Ok(Json(json!({ "jobs": jobs })))
 }
 
 pub async fn job_status(

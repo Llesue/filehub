@@ -6,6 +6,7 @@
   "thumbnails": {
     "enabled": true,
     "workers": 2,
+    "preview_workers": 1,
     "max_source_bytes": 536870912,
     "max_pixels": 50000000,
     "jpeg_max_pixels": 250000000,
@@ -59,6 +60,8 @@
   },
   "jobs": {
     "io_workers": 1,
+    "interactive_workers": 2,
+    "dir_size_workers": 1,
     "queue_max": 256,
     "thumbnail_queue_max": 64,
     "dir_size_ttl_seconds": 300,

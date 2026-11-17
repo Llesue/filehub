@@ -31,6 +31,7 @@ pub mod config;
 pub mod db;
 pub mod editor;
 pub mod error;
+pub mod events;
 pub mod files;
 pub mod fsops;
 pub mod indexer;
@@ -38,6 +39,7 @@ pub mod jobs;
 pub mod pathresolver;
 pub mod platform;
 pub mod preferences;
+pub mod presence;
 pub mod properties;
 pub mod search;
 #[cfg(windows)]

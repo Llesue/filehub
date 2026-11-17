@@ -59,6 +59,9 @@ impl Default for Settings {
 pub struct ThumbnailsSettings {
     pub enabled: bool,
     pub workers: usize,
+    /// Reserved workers for full-size preview thumbnails. List thumbnails use
+    /// the remaining workers, so scrolling a folder cannot block a preview.
+    pub preview_workers: usize,
     pub max_source_bytes: u64,
     pub max_pixels: u64,
     pub jpeg_max_pixels: u64,
@@ -74,6 +77,7 @@ impl Default for ThumbnailsSettings {
         Self {
             enabled: true,
             workers: 2,
+            preview_workers: 1,
             max_source_bytes: 512 * 1024 * 1024,
             max_pixels: 50_000_000,
             jpeg_max_pixels: 250_000_000,
@@ -147,7 +151,9 @@ impl Default for UploadSettings {
             max_file_bytes: 10 * 1024 * 1024 * 1024,
             chunk_size: 8 * 1024 * 1024,
             session_ttl_hours: 24,
-            concurrency_per_user: 2,
+            // Paused uploads keep their session, so the limit must be well above
+            // the three concurrent transfers the UI runs.
+            concurrency_per_user: 32,
         }
     }
 }
@@ -230,6 +236,8 @@ impl Default for SecuritySettings {
 #[serde(default)]
 pub struct JobsSettings {
     pub io_workers: usize,
+    pub interactive_workers: usize,
+    pub dir_size_workers: usize,
     pub queue_max: usize,
     pub thumbnail_queue_max: usize,
     pub dir_size_ttl_seconds: u64,
@@ -245,6 +253,8 @@ impl Default for JobsSettings {
     fn default() -> Self {
         Self {
             io_workers: 1,
+            interactive_workers: 2,
+            dir_size_workers: 1,
             queue_max: 256,
             thumbnail_queue_max: 64,
             dir_size_ttl_seconds: 300,
@@ -281,6 +291,9 @@ impl Settings {
         if self.thumbnails.workers == 0 {
             bail!("thumbnails.workers must be greater than zero");
         }
+        if self.thumbnails.preview_workers == 0 {
+            bail!("thumbnails.preview_workers must be greater than zero");
+        }
         if self.thumbnails.video_seek_percent > 100 {
             bail!("thumbnails.video_seek_percent must be between 0 and 100");
         }
@@ -313,6 +326,12 @@ impl Settings {
         }
         if self.jobs.io_workers == 0 {
             bail!("jobs.io_workers must be greater than zero");
+        }
+        if self.jobs.interactive_workers == 0 {
+            bail!("jobs.interactive_workers must be greater than zero");
+        }
+        if self.jobs.dir_size_workers == 0 {
+            bail!("jobs.dir_size_workers must be greater than zero");
         }
         if self.jobs.queue_max == 0 {
             bail!("jobs.queue_max must be greater than zero");

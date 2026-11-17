@@ -20,6 +20,16 @@ use crate::error::AppError;
 use crate::jobs::{JobKind, JobOutcome};
 use crate::state::AppState;
 
+/// Identifies the source image in `thumbnail.ready` / `thumbnail.failed`
+/// events so the browser can reload only the affected thumbnail.
+#[derive(Debug, Clone)]
+pub(crate) struct ThumbScope {
+    pub root_id: Option<i64>,
+    pub share_id: Option<i64>,
+    pub item_id: Option<i64>,
+    pub path: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ThumbQuery {
     root: i64,
@@ -27,6 +37,7 @@ pub struct ThumbQuery {
     w: Option<u32>,
     edge: Option<u32>,
     fit: Option<String>,
+    wait: Option<String>,
 }
 
 pub async fn thumb(
@@ -56,10 +67,22 @@ pub async fn thumb(
         fit_short,
         current.user.id,
         &headers,
+        Some(ThumbScope {
+            root_id: Some(root.id),
+            share_id: None,
+            item_id: None,
+            path: resolved.relative,
+        }),
+        wants_wait(query.wait.as_deref()),
     )
     .await
 }
 
+pub(crate) fn wants_wait(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn thumbnail_response(
     state: &Arc<AppState>,
     source: PathBuf,
@@ -68,6 +91,8 @@ pub(crate) async fn thumbnail_response(
     fit_short: bool,
     user_id: i64,
     headers: &HeaderMap,
+    scope: Option<ThumbScope>,
+    wait: bool,
 ) -> Result<Response, AppError> {
     let settings = state.settings();
     if !settings.settings.thumbnails.enabled {
@@ -103,6 +128,8 @@ pub(crate) async fn thumbnail_response(
         let job_cache_dir = cache_dir.clone();
         let job_cache_path = cache_path.clone();
         let job_failure_path = failure_path.clone();
+        let job_cache_max_bytes = settings.settings.thumbnails.cache_max_bytes;
+        let job_prune_dir = job_cache_dir.clone();
         let job_ffmpeg = state.ffmpeg.clone();
         let job_key = cache_key.clone();
         let job_log_source = job_source.clone();
@@ -120,16 +147,14 @@ pub(crate) async fn thumbnail_response(
                 user_id,
                 payload,
                 1,
+                width >= 1024,
                 move |ctx| async move {
                     let cancel = ctx.token();
-                    let file_size = std::fs::metadata(&job_source)
-                        .map(|metadata| metadata.len())
-                        .unwrap_or_default();
-                    let semaphore = if file_size >= 8 * 1024 * 1024 {
-                        job_state
-                            .thumb_large_semaphore
-                            .clone()
-                            .unwrap_or_else(|| Arc::clone(&job_state.thumb_semaphore))
+                    // Select the lane by output size: a 256px list thumbnail must
+                    // never occupy the reserved full-size preview lane, even for
+                    // a 50MP source image.
+                    let semaphore = if width >= 1024 {
+                        Arc::clone(&job_state.thumb_preview_semaphore)
                     } else {
                         Arc::clone(&job_state.thumb_semaphore)
                     };
@@ -162,6 +187,7 @@ pub(crate) async fn thumbnail_response(
                     match result {
                         Ok(bytes) => {
                             let _ = std::fs::remove_file(&job_failure_path);
+                            let _ = prune_cache(&job_prune_dir, job_cache_max_bytes);
                             tracing::debug!(
                                 path = %job_log_source.display(),
                                 width,
@@ -204,6 +230,17 @@ pub(crate) async fn thumbnail_response(
         outcome.job
     };
 
+    if !wait {
+        spawn_thumb_notifier(
+            Arc::clone(state),
+            job.id.clone(),
+            user_id,
+            scope.clone(),
+            edge,
+        );
+        return pending_response();
+    }
+
     let finished = if job.is_finished() {
         job
     } else {
@@ -245,6 +282,78 @@ pub(crate) async fn thumbnail_response(
             Err(AppError::NotFound)
         }
     }
+}
+
+fn spawn_thumb_notifier(
+    state: Arc<AppState>,
+    job_id: String,
+    user_id: i64,
+    scope: Option<ThumbScope>,
+    width: u32,
+) {
+    let Some(scope) = scope else {
+        return;
+    };
+    tokio::spawn(async move {
+        let Some(finished) = state.jobs.wait_for(&job_id).await else {
+            return;
+        };
+        let event = match finished.status.as_str() {
+            "completed" => "thumbnail.ready",
+            "failed" | "cancelled" => "thumbnail.failed",
+            _ => return,
+        };
+        publish_thumb_event(&state, event, user_id, &Some(scope), width);
+    });
+}
+
+fn publish_thumb_event(
+    state: &Arc<AppState>,
+    event: &str,
+    user_id: i64,
+    scope: &Option<ThumbScope>,
+    width: u32,
+) {
+    let Some(scope) = scope else {
+        return;
+    };
+    let data = json!({
+        "root": scope.root_id,
+        "share": scope.share_id,
+        "item": scope.item_id,
+        "path": scope.path,
+        "width": width,
+    });
+    if let Some(share_id) = scope.share_id {
+        state.events.publish_share(event, share_id, data);
+    } else {
+        state.events.publish(event, Some(user_id), data);
+    }
+}
+
+/// 1x1 transparent PNG shown while a thumbnail is being generated. The file
+/// icon underneath remains visible, so a pending thumbnail never looks broken.
+const THUMB_PLACEHOLDER: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x60, 0x60, 0x60,
+    0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0xa5, 0xf6, 0x45, 0x40, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+fn pending_response() -> Result<Response, AppError> {
+    let mut response = Response::new(Body::from(THUMB_PLACEHOLDER));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    response
+        .headers_mut()
+        .insert("x-filehub-thumb-state", HeaderValue::from_static("pending"));
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,17 +521,21 @@ fn generate_thumbnail(
         return Err(ThumbError::Cancelled);
     }
     let image = apply_orientation(image, crate::properties::orientation(source));
-    let (target_width, target_height) = if fit_short {
-        let (source_width, source_height) = image.dimensions();
-        let short = source_width.min(source_height).max(1);
-        let scale = (width as f64 / short as f64).min(1.0);
-        (
-            ((source_width as f64 * scale).round() as u32).max(1),
-            ((source_height as f64 * scale).round() as u32).max(1),
-        )
+    // Cap the long edge as well: `fit=short` alone would turn a panorama into
+    // an absurdly large intermediate image (e.g. 10240x2048 for 5:1).
+    const MAX_EDGE: f64 = 4096.0;
+    let (source_width, source_height) = image.dimensions();
+    let base = if fit_short {
+        width as f64 / source_width.min(source_height).max(1) as f64
     } else {
-        (width, u32::MAX)
+        width as f64 / source_width.max(1) as f64
     };
+    let scale = base
+        .min(1.0)
+        .min(MAX_EDGE / source_width.max(1) as f64)
+        .min(MAX_EDGE / source_height.max(1) as f64);
+    let target_width = ((source_width as f64 * scale).round() as u32).max(1);
+    let target_height = ((source_height as f64 * scale).round() as u32).max(1);
     let thumbnail = image.thumbnail(target_width, target_height);
     let rgb = thumbnail.to_rgb8();
 

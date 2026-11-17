@@ -155,10 +155,31 @@ pub async fn index_path(
                 continue;
             }
         };
+        let child_sizes = if child_dirs.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            state
+                .db
+                .directory_size_values(child_dirs.clone())
+                .await
+                .unwrap_or_default()
+        };
         for child in child_dirs {
             match totals.remove(&child) {
                 Some(child_size) => total_size = total_size.saturating_add(child_size),
-                None => partial = true,
+                None => {
+                    // Quick scans index one directory at a time, so child
+                    // totals are usually not in `totals`. Reuse the child's
+                    // cached directory size instead of marking the parent
+                    // permanently partial and forcing a full rescan.
+                    if let Some((status, child_size)) = child_sizes.get(&child)
+                        && matches!(status.as_str(), "ready" | "stale")
+                    {
+                        total_size = total_size.saturating_add((*child_size).max(0) as u64);
+                    } else {
+                        partial = true;
+                    }
+                }
             }
         }
         let _ = state
@@ -207,12 +228,12 @@ pub async fn index_path(
     while let Some(path) = current {
         let value = path.to_string_lossy().to_string();
         let _ = state.db.mark_index_partial(&value).await;
-        let _ = state.db.delete_directory_size_exact(&value).await;
+        let _ = state.db.mark_directory_size_stale(&value).await;
         current = path.parent().map(Path::to_path_buf);
     }
     let _ = state
         .db
-        .invalidate_directory_sizes(&base.to_string_lossy())
+        .mark_directory_sizes_stale(&base.to_string_lossy())
         .await;
 
     Ok(stats)
@@ -440,6 +461,32 @@ pub async fn quick_scan(
                 .filter(|entry| !entry.is_dir)
                 .map(|entry| entry.size.max(0) as u64)
                 .sum();
+            let child_paths: Vec<String> = change
+                .child_dirs
+                .iter()
+                .map(|child| child.to_string_lossy().to_string())
+                .collect();
+            let child_sizes = if child_paths.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                state
+                    .db
+                    .directory_size_values(child_paths)
+                    .await
+                    .unwrap_or_default()
+            };
+            let mut total_size = direct_size;
+            let mut partial = change.partial;
+            for child in &change.child_dirs {
+                let child = child.to_string_lossy().to_string();
+                if let Some((status, child_size)) = child_sizes.get(&child)
+                    && matches!(status.as_str(), "ready" | "stale")
+                {
+                    total_size = total_size.saturating_add((*child_size).max(0) as u64);
+                } else {
+                    partial = true;
+                }
+            }
             let count = state
                 .db
                 .replace_index_entries(dir_id, change.entries)
@@ -451,13 +498,12 @@ pub async fn quick_scan(
                     dir_id,
                     "ready",
                     count as i64,
-                    direct_size.min(i64::MAX as u64) as i64,
-                    true,
+                    total_size.min(i64::MAX as u64) as i64,
+                    partial,
                     change.error.as_deref(),
                 )
                 .await;
-            let _ = state.db.mark_index_partial(&change.path).await;
-            let _ = state.db.delete_directory_size_exact(&change.path).await;
+            let _ = state.db.mark_directory_size_stale(&change.path).await;
             for child in change.child_dirs {
                 new_dir_candidates.insert(child.to_string_lossy().to_string());
             }
@@ -466,7 +512,6 @@ pub async fn quick_scan(
             }
             stats.changed += 1;
             stats.entries += count;
-            let _ = change.partial;
         }
         for missing in batch.missing {
             let _ = state.db.invalidate_index_subtree(&missing).await;
@@ -560,6 +605,7 @@ async fn queue_new_directory_indexes(
                     "auto": "quick-scan",
                 }),
                 1,
+                false,
                 move |ctx| async move {
                     let cancel = ctx.token();
                     let mut progress = |directories: usize, _entries: usize| {

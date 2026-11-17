@@ -8,6 +8,7 @@ struct TestApp {
     _dir: tempfile::TempDir,
     home: std::path::PathBuf,
     router: Router,
+    state: std::sync::Arc<filehub::state::AppState>,
     cookie: String,
     csrf: String,
     root_id: i64,
@@ -18,7 +19,7 @@ async fn setup_app() -> TestApp {
     let state = filehub::state::AppState::new_test(dir.path(), "test-token")
         .await
         .unwrap();
-    let router = filehub::app::router(state);
+    let router = filehub::app::router(state.clone());
     let setup = send_json(
         &router,
         Method::POST,
@@ -46,6 +47,7 @@ async fn setup_app() -> TestApp {
         _dir: dir,
         home,
         router,
+        state,
         cookie,
         csrf,
         root_id,
@@ -127,9 +129,84 @@ async fn json_body(response: Response<Body>) -> Value {
 }
 
 #[tokio::test]
+async fn async_thumbnails_return_a_placeholder_and_publish_events() {
+    let app = setup_app().await;
+    let mut events = app.state.events.subscribe();
+    let uri = format!("/api/v1/thumb?root={}&path=photo.png&w=64", app.root_id);
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-filehub-thumb-state")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert!(body.starts_with(&[0x89, 0x50, 0x4e, 0x47]));
+
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(event) if event.event == "thumbnail.ready" => break event,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("event bus closed")
+                }
+            }
+        }
+    })
+    .await
+    .expect("thumbnail.ready event");
+    assert_eq!(ready.data["root"], app.root_id);
+    assert_eq!(ready.data["path"], "photo.png");
+    assert_eq!(ready.data["width"], 64);
+
+    let sync_uri = format!(
+        "/api/v1/thumb?root={}&path=photo.png&w=64&wait=1",
+        app.root_id
+    );
+    let response = send(&app.router, Method::GET, &sync_uri, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/jpeg"
+    );
+
+    let broken = format!("/api/v1/thumb?root={}&path=broken.png&w=64", app.root_id);
+    let response = send(&app.router, Method::GET, &broken, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(event) if event.event == "thumbnail.failed" => break event,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("event bus closed")
+                }
+            }
+        }
+    })
+    .await
+    .expect("thumbnail.failed event");
+    assert_eq!(failed.data["path"], "broken.png");
+    let response = send(&app.router, Method::GET, &broken, Some(&app.cookie)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn thumbnails_are_generated_cached_and_safe() {
     let app = setup_app().await;
-    let uri = format!("/api/v1/thumb?root={}&path=photo.png&w=64", app.root_id);
+    let uri = format!(
+        "/api/v1/thumb?root={}&path=photo.png&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -162,11 +239,17 @@ async fn thumbnails_are_generated_cached_and_safe() {
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let heic = format!("/api/v1/thumb?root={}&path=fake.heic&w=64", app.root_id);
+    let heic = format!(
+        "/api/v1/thumb?root={}&path=fake.heic&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &heic, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let broken = format!("/api/v1/thumb?root={}&path=broken.png&w=64", app.root_id);
+    let broken = format!(
+        "/api/v1/thumb?root={}&path=broken.png&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &broken, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let cache_root = app._dir.path().join("cache/thumbs");
@@ -175,7 +258,10 @@ async fn thumbnails_are_generated_cached_and_safe() {
     let response = send(&app.router, Method::GET, &broken, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let traversal = format!("/api/v1/thumb?root={}&path=../photo.png&w=64", app.root_id);
+    let traversal = format!(
+        "/api/v1/thumb?root={}&path=../photo.png&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &traversal, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(response).await["error"]["code"], "INVALID_PATH");
@@ -215,7 +301,10 @@ async fn video_thumbnails_fall_back_to_first_frame_and_reject_broken_files() {
         .unwrap();
     assert!(status.success(), "failed to generate the test clip");
 
-    let uri = format!("/api/v1/thumb?root={}&path=short.mp4&w=64", app.root_id);
+    let uri = format!(
+        "/api/v1/thumb?root={}&path=short.mp4&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
     assert_eq!(
         response.status(),
@@ -228,7 +317,10 @@ async fn video_thumbnails_fall_back_to_first_frame_and_reject_broken_files() {
     );
 
     std::fs::write(app.home.join("broken.mp4"), b"not a video").unwrap();
-    let uri = format!("/api/v1/thumb?root={}&path=broken.mp4&w=64", app.root_id);
+    let uri = format!(
+        "/api/v1/thumb?root={}&path=broken.mp4&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
@@ -249,7 +341,7 @@ async fn video_thumbnails_fall_back_to_first_frame_and_reject_broken_files() {
         .unwrap();
     if status.success() {
         let uri = format!(
-            "/api/v1/thumb?root={}&path=audio-only.mp4&w=64",
+            "/api/v1/thumb?root={}&path=audio-only.mp4&w=64&wait=1",
             app.root_id
         );
         let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
@@ -315,7 +407,7 @@ async fn large_and_variant_jpegs_generate_thumbnails() {
             .status()
             .unwrap();
         assert!(status.success(), "failed to generate {name}");
-        let uri = format!("/api/v1/thumb?root={}&path={name}&w=64", app.root_id);
+        let uri = format!("/api/v1/thumb?root={}&path={name}&w=64&wait=1", app.root_id);
         let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
         assert_eq!(response.status(), StatusCode::OK, "{name} thumbnail failed");
         assert_eq!(
@@ -328,12 +420,15 @@ async fn large_and_variant_jpegs_generate_thumbnails() {
 #[tokio::test]
 async fn thumbnail_failures_report_reason_and_can_be_retried() {
     let app = setup_app().await;
-    let uri = format!("/api/v1/thumb?root={}&path=broken.png&w=64", app.root_id);
+    let uri = format!(
+        "/api/v1/thumb?root={}&path=broken.png&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let status_uri = format!(
-        "/api/v1/thumb/status?root={}&path=broken.png&w=64",
+        "/api/v1/thumb/status?root={}&path=broken.png&w=64&wait=1",
         app.root_id
     );
     let response = send(&app.router, Method::GET, &status_uri, Some(&app.cookie)).await;
@@ -376,7 +471,10 @@ async fn oversized_source_reports_max_source_reason() {
     .await;
     assert_eq!(update.status(), StatusCode::OK);
 
-    let uri = format!("/api/v1/thumb?root={}&path=too-big.png&w=64", app.root_id);
+    let uri = format!(
+        "/api/v1/thumb?root={}&path=too-big.png&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let status_uri = format!(
@@ -399,7 +497,7 @@ async fn thumbnails_sniff_image_format_and_skip_size_limit_for_video() {
     // A PNG saved with a .jpeg name must still decode.
     std::fs::copy(app.home.join("photo.png"), app.home.join("mislabeled.jpeg")).unwrap();
     let uri = format!(
-        "/api/v1/thumb?root={}&path=mislabeled.jpeg&w=64",
+        "/api/v1/thumb?root={}&path=mislabeled.jpeg&w=64&wait=1",
         app.root_id
     );
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
@@ -434,11 +532,60 @@ async fn thumbnails_sniff_image_format_and_skip_size_limit_for_video() {
     .await;
     assert_eq!(update.status(), StatusCode::OK);
 
-    let uri = format!("/api/v1/thumb?root={}&path=large.mp4&w=64", app.root_id);
+    let uri = format!(
+        "/api/v1/thumb?root={}&path=large.mp4&w=64&wait=1",
+        app.root_id
+    );
     let response = send(&app.router, Method::GET, &uri, Some(&app.cookie)).await;
     assert_eq!(
         response.status(),
         StatusCode::OK,
         "videos must not be rejected by the image source-size limit"
     );
+}
+
+#[tokio::test]
+async fn preview_thumbnails_use_a_reserved_lane() {
+    let app = setup_app().await;
+    let mut held = Vec::new();
+    while let Ok(permit) = app.state.thumb_semaphore.clone().try_acquire_owned() {
+        held.push(permit);
+    }
+    assert!(!held.is_empty(), "list thumbnail lane should have permits");
+
+    let uri = format!(
+        "/api/v1/thumb?root={}&path=photo.png&w=2048&wait=1",
+        app.root_id
+    );
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        send(&app.router, Method::GET, &uri, Some(&app.cookie)),
+    )
+    .await
+    .expect("preview thumbnail must not wait for the list lane");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(held);
+
+    let mut preview_held = Vec::new();
+    while let Ok(permit) = app
+        .state
+        .thumb_preview_semaphore
+        .clone()
+        .try_acquire_owned()
+    {
+        preview_held.push(permit);
+    }
+    assert!(!preview_held.is_empty(), "preview lane should have permits");
+    let list_uri = format!(
+        "/api/v1/thumb?root={}&path=photo.png&w=64&wait=1&v=2",
+        app.root_id
+    );
+    let list_response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        send(&app.router, Method::GET, &list_uri, Some(&app.cookie)),
+    )
+    .await
+    .expect("list thumbnail must not wait for the preview lane");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    drop(preview_held);
 }

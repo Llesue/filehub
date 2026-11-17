@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { api, type Entry } from '../api';
+  import { audioState, setAudioPlaying } from '../audio';
   import Icon from './Icon.svelte';
   import { language, t } from '../i18n';
 
@@ -32,23 +34,130 @@
   let showOriginal = $state(false);
   let imageFallback = $state(false);
   let previewFailed = $state(false);
+  let hiResLoaded = $state(false);
+  let blurVisible = $state(true);
+  let frameRatio = $state(1);
+  let frameReady = $state(false);
+  let hideBlurTimer: ReturnType<typeof setTimeout> | null = null;
   let dragging = false;
   let dragged = false;
   let dragStart = { x: 0, y: 0, offsetX: 0, offsetY: 0 };
+  let videoWasOpen = false;
+  let resumeAudio = false;
+  let videoVolume = 0.8;
+  let videoMuted = false;
+  try {
+    const rawVolume = localStorage.getItem('filehub.video.volume');
+    const storedVolume = rawVolume === null ? Number.NaN : Number(rawVolume);
+    if (Number.isFinite(storedVolume) && storedVolume >= 0 && storedVolume <= 1) {
+      videoVolume = storedVolume;
+    }
+    videoMuted = localStorage.getItem('filehub.video.muted') === '1';
+  } catch (error) {
+    console.warn('could not read video volume', error);
+  }
+
+  function applyVideoVolume(event: Event): void {
+    const video = event.currentTarget as HTMLVideoElement;
+    video.volume = videoVolume;
+    video.muted = videoMuted;
+  }
+
+  function rememberVideoVolume(event: Event): void {
+    const video = event.currentTarget as HTMLVideoElement;
+    videoVolume = video.volume;
+    videoMuted = video.muted;
+    try {
+      localStorage.setItem('filehub.video.volume', String(videoVolume));
+      localStorage.setItem('filehub.video.muted', videoMuted ? '1' : '0');
+    } catch (error) {
+      console.warn('could not persist video volume', error);
+    }
+  }
+
+  $effect(() => {
+    const videoOpen = current ? isVideo(current.name) : false;
+    if (videoOpen && !videoWasOpen) {
+      if ($audioState?.playing) {
+        resumeAudio = true;
+        setAudioPlaying(false);
+      }
+    } else if (!videoOpen && videoWasOpen && resumeAudio) {
+      resumeAudio = false;
+      if ($audioState) setAudioPlaying(true);
+    }
+    videoWasOpen = videoOpen;
+  });
+
+  onDestroy(() => {
+    clearBlurTimer();
+    if (resumeAudio) setAudioPlaying(true);
+  });
   let entryPath = $derived(
     current ? (currentPath ? `${currentPath}/${current.name}` : current.name) : '',
   );
-  let url = $derived(
-    current ? (srcFor ? srcFor(current) : api.previewUrl(root, entryPath)) : '',
+  let url = $derived(current ? (srcFor ? srcFor(current) : api.previewUrl(root, entryPath)) : '');
+  let lowResUrl = $derived(
+    current
+      ? thumbSrcFor
+        ? thumbSrcFor(current)
+        : api.thumbUrl(root, entryPath, 320, undefined, true)
+      : '',
+  );
+  let previewSrc = $derived(
+    current
+      ? showOriginal || imageFallback
+        ? url
+        : thumbSrcFor
+          ? thumbSrcFor(current)
+          : api.previewThumbUrl(root, entryPath, 2048)
+      : '',
   );
 
+  function clearBlurTimer(): void {
+    if (hideBlurTimer !== null) {
+      clearTimeout(hideBlurTimer);
+      hideBlurTimer = null;
+    }
+  }
+
+  function noteAspect(event: Event): void {
+    const image = event.currentTarget as HTMLImageElement;
+    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+      frameRatio = image.naturalWidth / image.naturalHeight;
+      frameReady = true;
+    }
+  }
+
+  function handleHiResLoad(event: Event): void {
+    noteAspect(event);
+    hiResLoaded = true;
+    clearBlurTimer();
+    // Keep the blurred layer under the 80ms fade, then remove it completely.
+    hideBlurTimer = setTimeout(() => {
+      blurVisible = false;
+      hideBlurTimer = null;
+    }, 100);
+  }
+
+  function handleHiResError(): void {
+    clearBlurTimer();
+    hiResLoaded = false;
+    blurVisible = true;
+    if (showOriginal || imageFallback) previewFailed = true;
+    else imageFallback = true;
+  }
+
   function resetView(): void {
+    clearBlurTimer();
     zoom = 1;
     offsetX = 0;
     offsetY = 0;
     showOriginal = false;
     imageFallback = false;
     previewFailed = false;
+    hiResLoaded = false;
+    blurVisible = true;
   }
 
   function previous(): void {
@@ -121,7 +230,15 @@
         <span>{Math.round(zoom * 100)}%</span>
         <button type="button" onclick={() => (zoom = Math.min(8, zoom + 0.2))}>+</button>
         <button type="button" onclick={() => resetView()}>{t($language, '复位')}</button>
-        <button type="button" onclick={() => (showOriginal = !showOriginal)}>
+        <button
+          type="button"
+          onclick={() => {
+            showOriginal = !showOriginal;
+            hiResLoaded = false;
+            blurVisible = false;
+            clearBlurTimer();
+          }}
+        >
           {showOriginal ? t($language, '显示预览图') : t($language, '显示原图')}
         </button>
       {/if}
@@ -152,8 +269,14 @@
   >
     {#if current}
       {#if isVideo(current.name)}
-        <video src={url} controls autoplay playsinline onclick={(event) => event.stopPropagation()}
-          ><track kind="captions" /></video
+        <video
+          src={url}
+          controls
+          autoplay
+          playsinline
+          onclick={(event) => event.stopPropagation()}
+          onloadedmetadata={applyVideoVolume}
+          onvolumechange={rememberVideoVolume}><track kind="captions" /></video
         >
       {:else if isAudio(current.name)}
         <audio src={url} controls autoplay onclick={(event) => event.stopPropagation()}></audio>
@@ -162,32 +285,42 @@
       {:else if previewFailed}
         <div class="preview-failure" role="alert" onclick={(event) => event.stopPropagation()}>
           <p>{t($language, '图片过大，无法预览')}</p>
-          <a
-            href={downloadHref ? downloadHref(current) : api.downloadUrl(root, entryPath)}
-            download>{t($language, '下载原图')}</a
+          <a href={downloadHref ? downloadHref(current) : api.downloadUrl(root, entryPath)} download
+            >{t($language, '下载原图')}</a
           >
         </div>
       {:else}
-        <img
-          src={showOriginal || imageFallback
-            ? url
-            : thumbSrcFor
-              ? thumbSrcFor(current)
-              : api.previewThumbUrl(root, entryPath, 2048)}
-          alt={current.name}
-          style={`transform:translate(${offsetX}px, ${offsetY}px) scale(${zoom})`}
-          onclick={(event) => {
-            if (dragged) dragged = false;
-            event.stopPropagation();
-          }}
-          onpointerdown={startDrag}
-          onpointerup={endDrag}
-          onpointercancel={endDrag}
-          onerror={() => {
-            if (showOriginal || imageFallback) previewFailed = true;
-            else imageFallback = true;
-          }}
-        />
+        <div
+          class="preview-frame"
+          class:ready={frameReady}
+          class:clipping={blurVisible}
+          style={`--ratio:${frameRatio};transform:translate(${offsetX}px, ${offsetY}px) scale(${zoom})`}
+        >
+          {#if blurVisible}
+            <img
+              class="preview-blur"
+              src={lowResUrl}
+              alt=""
+              aria-hidden="true"
+              onload={noteAspect}
+            />
+          {/if}
+          <img
+            class="preview-hi"
+            class:loaded={hiResLoaded}
+            src={previewSrc}
+            alt={current.name}
+            onclick={(event) => {
+              if (dragged) dragged = false;
+              event.stopPropagation();
+            }}
+            onpointerdown={startDrag}
+            onpointerup={endDrag}
+            onpointercancel={endDrag}
+            onload={handleHiResLoad}
+            onerror={handleHiResError}
+          />
+        </div>
       {/if}
     {/if}
   </div>
@@ -287,12 +420,64 @@
   }
 
   .lightbox-stage {
+    position: relative;
     display: grid;
     flex: 1;
     min-height: 0;
     overflow: auto;
     place-items: center;
     padding: 18px;
+  }
+
+  .preview-frame {
+    position: relative;
+    display: block;
+    width: min(92vw, calc(78vh * var(--ratio, 1)));
+    max-width: 92vw;
+    max-height: 78vh;
+    aspect-ratio: var(--ratio, 1);
+    cursor: grab;
+    transform-origin: center;
+    visibility: hidden;
+  }
+
+  .preview-frame.ready {
+    visibility: visible;
+  }
+
+  .preview-frame.clipping {
+    overflow: hidden;
+  }
+
+  .preview-frame:active {
+    cursor: grabbing;
+  }
+
+  .preview-frame .preview-blur {
+    position: absolute;
+    inset: -72px;
+    width: calc(100% + 144px);
+    height: calc(100% + 144px);
+    max-width: none;
+    max-height: none;
+    object-fit: fill;
+    pointer-events: none;
+    filter: blur(18px);
+  }
+
+  .preview-frame .preview-hi {
+    display: block;
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    object-fit: contain;
+    opacity: 0;
+    transition: opacity 80ms linear;
+  }
+
+  .preview-frame .preview-hi.loaded {
+    opacity: 1;
   }
 
   .lightbox-stage img {

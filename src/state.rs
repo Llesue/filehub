@@ -11,8 +11,10 @@ use tokio::sync::Semaphore;
 use crate::auth::{RateLimiter, random_token};
 use crate::config::{ConfigFile, Snapshot, build_snapshot, ensure_directories, load_config_file};
 use crate::db::{AuditRecord, Db, unix_now};
+use crate::events::EventBus;
 use crate::fsops::DiskUsage;
 use crate::jobs::{JobKind, JobManager, JobOutcome};
+use crate::presence::{PresenceEntry, PresenceKey};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeleteItem {
@@ -103,7 +105,7 @@ pub struct AppState {
     pub share_tickets: Mutex<HashMap<String, ShareTicket>>,
     pub ffmpeg: Option<PathBuf>,
     pub thumb_semaphore: Arc<Semaphore>,
-    pub thumb_large_semaphore: Option<Arc<Semaphore>>,
+    pub thumb_preview_semaphore: Arc<Semaphore>,
     zip_semaphore: Mutex<Arc<Semaphore>>,
     pub jobs: Arc<JobManager>,
     pub audit_tx: tokio::sync::mpsc::Sender<AuditMessage>,
@@ -111,6 +113,8 @@ pub struct AppState {
     pub usage_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     pub public_rate: WindowRateLimiter,
     pub slow_requests: Mutex<VecDeque<SlowRequest>>,
+    pub events: Arc<EventBus>,
+    pub edit_presence: Mutex<HashMap<PresenceKey, PresenceEntry>>,
 }
 
 impl AppState {
@@ -169,29 +173,35 @@ impl AppState {
         }
 
         let thumb_workers = snapshot.settings.thumbnails.workers.max(1);
-        let (thumb_small_workers, thumb_large_workers) = if thumb_workers <= 1 {
-            (thumb_workers, None)
-        } else {
-            let large = if thumb_workers >= 3 { 2 } else { 1 };
-            (thumb_workers - large, Some(large))
-        };
+        // Keep a reserved lane for full-size previews. With workers=1 the two
+        // lanes oversubscribe by one, but a preview can still make progress.
+        let preview_workers = snapshot
+            .settings
+            .thumbnails
+            .preview_workers
+            .clamp(1, thumb_workers);
+        let thumb_list_workers = thumb_workers.saturating_sub(preview_workers).max(1);
         let ffmpeg = if snapshot.settings.thumbnails.video {
             crate::thumbs::detect_ffmpeg()
         } else {
             None
         };
+        let events = EventBus::new(256);
         let jobs = JobManager::new(
             db.clone(),
             snapshot.settings.jobs.io_workers,
+            snapshot.settings.jobs.interactive_workers,
+            snapshot.settings.jobs.dir_size_workers,
             snapshot.settings.jobs.queue_max,
             snapshot.settings.jobs.thumbnail_queue_max,
+            Arc::clone(&events),
         );
         jobs.recover().await?;
         let (audit_tx, audit_rx) = tokio::sync::mpsc::channel::<AuditMessage>(1024);
-        spawn_audit_writer(db.clone(), audit_rx);
+        spawn_audit_writer(db.clone(), audit_rx, Arc::clone(&events));
         let zip_permits = snapshot.settings.downloads.zip_concurrency.max(1);
 
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             db,
             config,
             snapshot: ArcSwap::from_pointee(snapshot),
@@ -203,9 +213,8 @@ impl AppState {
             delete_tokens: Mutex::new(HashMap::new()),
             share_tickets: Mutex::new(HashMap::new()),
             ffmpeg,
-            thumb_semaphore: Arc::new(Semaphore::new(thumb_small_workers)),
-            thumb_large_semaphore: thumb_large_workers
-                .map(|workers| Arc::new(Semaphore::new(workers))),
+            thumb_semaphore: Arc::new(Semaphore::new(thumb_list_workers)),
+            thumb_preview_semaphore: Arc::new(Semaphore::new(preview_workers)),
             zip_semaphore: Mutex::new(Arc::new(Semaphore::new(zip_permits))),
             jobs,
             audit_tx,
@@ -213,7 +222,10 @@ impl AppState {
             usage_locks: Mutex::new(HashMap::new()),
             public_rate: WindowRateLimiter::default(),
             slow_requests: Mutex::new(VecDeque::new()),
-        }))
+            events,
+            edit_presence: Mutex::new(HashMap::new()),
+        });
+        Ok(state)
     }
 
     pub fn settings(&self) -> Arc<Snapshot> {
@@ -277,20 +289,13 @@ impl AppState {
         subtree: bool,
         usage: UsageInvalidation,
     ) {
+        let mut paths = Vec::new();
         let mut current = Some(target.to_path_buf());
-        let mut first = true;
         while let Some(path) = current {
-            let value = path.to_string_lossy().to_string();
-            if first && subtree {
-                let _ = self.db.invalidate_directory_sizes(&value).await;
-                let _ = self.db.invalidate_index_subtree(&value).await;
-            } else {
-                let _ = self.db.delete_directory_size_exact(&value).await;
-            }
-            let _ = self.db.mark_index_stale(&value).await;
-            first = false;
+            paths.push(path.to_string_lossy().to_string());
             current = path.parent().map(Path::to_path_buf);
         }
+        let _ = self.db.invalidate_path_chain(paths, subtree).await;
         if let Some(user_id) = user_id {
             match usage {
                 UsageInvalidation::Full => self.invalidate_usage(user_id),
@@ -316,7 +321,7 @@ impl AppState {
         while let Some(path) = current {
             let value = path.to_string_lossy().to_string();
             let _ = self.db.mark_index_partial(&value).await;
-            let _ = self.db.delete_directory_size_exact(&value).await;
+            let _ = self.db.mark_directory_size_stale(&value).await;
             current = path.parent().map(Path::to_path_buf);
         }
     }
@@ -349,6 +354,15 @@ impl AppState {
             loop {
                 interval.tick().await;
                 scheduler.schedule_index_scans().await;
+            }
+        });
+
+        let presence = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                crate::presence::cleanup(&presence);
             }
         });
     }
@@ -410,6 +424,7 @@ impl AppState {
                     admin_id,
                     serde_json::json!({ "mode": "quick" }),
                     1,
+                    false,
                     move |ctx| async move {
                         let cancel = ctx.token();
                         let mut progress = |checked: usize, total: usize| {
@@ -463,6 +478,7 @@ impl AppState {
                     admin_id,
                     serde_json::json!({ "mode": "full" }),
                     1,
+                    false,
                     move |ctx| async move {
                         let cancel = ctx.token();
                         let mut progress = |done: usize, total: usize| {
@@ -638,7 +654,11 @@ impl AppState {
     }
 }
 
-fn spawn_audit_writer(db: Db, mut receiver: tokio::sync::mpsc::Receiver<AuditMessage>) {
+fn spawn_audit_writer(
+    db: Db,
+    mut receiver: tokio::sync::mpsc::Receiver<AuditMessage>,
+    events: Arc<EventBus>,
+) {
     tokio::spawn(async move {
         let mut batch = Vec::with_capacity(128);
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -646,6 +666,14 @@ fn spawn_audit_writer(db: Db, mut receiver: tokio::sync::mpsc::Receiver<AuditMes
             tokio::select! {
                 message = receiver.recv() => match message {
                     Some(AuditMessage::Record(record)) => {
+                        events.publish_admin(
+                            "audit.appended",
+                            serde_json::json!({
+                                "action": record.action,
+                                "path": record.path,
+                                "user_id": record.user_id,
+                            }),
+                        );
                         batch.push(record);
                         if batch.len() >= 200 {
                             flush_audit_batch(&db, &mut batch).await;

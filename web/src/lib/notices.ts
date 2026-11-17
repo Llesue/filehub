@@ -13,12 +13,14 @@ export interface Notice {
 
 export const notice = writable<Notice | null>(null);
 
-export function showNotice(
-  message: string,
-  kind: NoticeKind = 'error',
-  title = t(get(language), '操作失败'),
-): void {
-  notice.set({ title, message, kind });
+export function showNotice(message: string, kind: NoticeKind = 'error', title?: string): void {
+  const fallback =
+    kind === 'info'
+      ? t(get(language), '提示')
+      : kind === 'warning'
+        ? t(get(language), '注意')
+        : t(get(language), '操作失败');
+  notice.set({ title: title ?? fallback, message, kind });
 }
 
 export function showNoticeAction(

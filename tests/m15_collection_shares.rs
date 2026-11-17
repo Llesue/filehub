@@ -202,7 +202,7 @@ async fn collection_share_exposes_selected_files_only() {
     let thumb = send(
         &app.router,
         Method::GET,
-        &format!("/api/v1/public/shares/{token}/thumb?item={pic_id}&w=64"),
+        &format!("/api/v1/public/shares/{token}/thumb?item={pic_id}&w=64&wait=1"),
         None,
         None,
     )

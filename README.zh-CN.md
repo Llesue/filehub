@@ -150,7 +150,7 @@ FileHub 只在对端地址命中 `security.trusted_proxies` 时才信任转发�
 
 - WebSocket：`/api/v1/terminal/ws` 需要 HTTP/1.1 以及 `Upgrade`/`Connection` 头。Caddy 自动处理；Nginx 需要下面的 `map` 块。
 - 上传请求体上限：要大于 `uploads.chunk_size`（默认 8 MiB），示例给 32 MiB；调大分片后同步调大。
-- 下载/ZIP 流式响应：关闭代理缓冲（Nginx `proxy_buffering off` 与 `proxy_request_buffering off`，Caddy `flush_interval -1`）。FileHub 不会发送 `X-Accel-Buffering`，必须在代理侧显式关闭。
+- 下载/ZIP 流式响应：关闭代理缓冲（Nginx `proxy_buffering off` 与 `proxy_request_buffering off`，Caddy `flush_interval -1`）。下载不发送 `X-Accel-Buffering`；实时事件流（`/api/v1/events`、公开分享事件流）会发送 `X-Accel-Buffering: no`，但仍建议在代理侧关闭缓冲。
 - 长下载/大 ZIP：示例给 1 小时读写超时；如果归档可能更久，继续调大，或降低 `downloads.zip_max_bytes`。
 
 ### Caddy

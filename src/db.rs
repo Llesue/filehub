@@ -353,11 +353,22 @@ impl Db {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
     {
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.connections.len();
-        let connection = Arc::clone(&self.connections[index]);
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.connections.len();
+        let connections = self.connections.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut connection = connection.lock();
+            // Prefer an idle connection. Long index transactions can hold one
+            // pooled connection for a while; blindly queueing behind it makes
+            // reads and deletes feel blocked even when other connections are free.
+            let mut chosen = start;
+            for offset in 0..connections.len() {
+                let candidate = (start + offset) % connections.len();
+                if connections[candidate].try_lock().is_some() {
+                    chosen = candidate;
+                    break;
+                }
+            }
+            let mut connection = connections[chosen].lock();
             f(&mut connection)
         })
         .await
@@ -1464,36 +1475,52 @@ impl Db {
         dir_id: i64,
         entries: Vec<IndexEntry>,
     ) -> anyhow::Result<usize> {
+        // Commit in bounded chunks. A single transaction for a directory with
+        // tens of thousands of entries keeps the SQLite writer lock for seconds
+        // and makes deletes/uploads/listing wait behind it.
+        const CHUNK: usize = 500;
         self.call(move |connection| {
-            let transaction = connection.transaction()?;
-            transaction.execute(
+            connection.execute(
                 "DELETE FROM index_entries WHERE dir_id = ?1",
                 params![dir_id],
             )?;
-            for entry in &entries {
-                transaction.execute(
-                    "INSERT INTO index_entries \
-                     (dir_id, name, real_path, is_dir, size, mtime, created_at, mime_type, \
-                      has_preview, is_hidden) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        dir_id,
-                        entry.name,
-                        entry.real_path,
-                        entry.is_dir as i64,
-                        entry.size,
-                        entry.mtime,
-                        entry.created_at,
-                        entry.mime_type,
-                        entry.has_preview as i64,
-                        entry.is_hidden as i64
-                    ],
-                )?;
-            }
-            transaction.commit()?;
-            Ok(entries.len())
+            Ok(())
         })
-        .await
+        .await?;
+
+        let total = entries.len();
+        for chunk in entries.chunks(CHUNK) {
+            let rows = chunk.to_vec();
+            self.call(move |connection| {
+                let transaction = connection.transaction()?;
+                {
+                    let mut statement = transaction.prepare(
+                        "INSERT INTO index_entries \
+                         (dir_id, name, real_path, is_dir, size, mtime, created_at, mime_type, \
+                          has_preview, is_hidden) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    )?;
+                    for entry in &rows {
+                        statement.execute(params![
+                            dir_id,
+                            entry.name,
+                            entry.real_path,
+                            entry.is_dir as i64,
+                            entry.size,
+                            entry.mtime,
+                            entry.created_at,
+                            entry.mime_type,
+                            entry.has_preview as i64,
+                            entry.is_hidden as i64
+                        ])?;
+                    }
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(total)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1620,6 +1647,31 @@ impl Db {
                 }
             }
             Ok(states)
+        })
+        .await
+    }
+
+    pub async fn directory_size_values(
+        &self,
+        paths: Vec<String>,
+    ) -> anyhow::Result<std::collections::HashMap<String, (String, i64)>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT status, size_bytes FROM directory_sizes \
+                 WHERE real_path = ?1 AND size_bytes IS NOT NULL",
+            )?;
+            let mut values = std::collections::HashMap::new();
+            for path in paths {
+                if let Some(value) = statement
+                    .query_row(params![path.clone()], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .optional()?
+                {
+                    values.insert(path, value);
+                }
+            }
+            Ok(values)
         })
         .await
     }
@@ -1797,6 +1849,40 @@ impl Db {
         .await
     }
 
+    pub async fn mark_directory_size_stale(&self, real_path: &str) -> anyhow::Result<()> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE directory_sizes SET status = 'stale' \
+                 WHERE real_path = ?1 AND status IN ('ready', 'error')",
+                params![real_path],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn mark_directory_sizes_stale(&self, prefix: &str) -> anyhow::Result<()> {
+        let prefix = prefix.to_owned();
+        self.call(move |connection| {
+            let escaped = prefix
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_");
+            let unix_pattern = format!("{escaped}/%");
+            let windows_pattern = format!("{escaped}\\%");
+            connection.execute(
+                "UPDATE directory_sizes SET status = 'stale' \
+                 WHERE (real_path = ?1 OR real_path LIKE ?2 ESCAPE '!' \
+                        OR real_path LIKE ?3 ESCAPE '!') \
+                 AND status IN ('ready', 'error')",
+                params![prefix, unix_pattern, windows_pattern],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn invalidate_directory_sizes(&self, prefix: &str) -> anyhow::Result<()> {
         let prefix = prefix.to_owned();
         self.call(move |connection| {
@@ -1811,6 +1897,53 @@ impl Db {
                  OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
                 params![prefix, unix_pattern, windows_pattern],
             )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Apply a target + ancestor cache invalidation chain in one transaction.
+    /// This collapses many short write attempts into a single writer-lock wait.
+    pub async fn invalidate_path_chain(
+        &self,
+        paths: Vec<String>,
+        subtree: bool,
+    ) -> anyhow::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            for (index, path) in paths.iter().enumerate() {
+                if index == 0 && subtree {
+                    let escaped = path
+                        .replace('!', "!!")
+                        .replace('%', "!%")
+                        .replace('_', "!_");
+                    let unix_pattern = format!("{escaped}/%");
+                    let windows_pattern = format!("{escaped}\\%");
+                    transaction.execute(
+                        "DELETE FROM directory_sizes WHERE real_path = ?1 \
+                         OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
+                        params![path, unix_pattern, windows_pattern],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM indexed_dirs WHERE real_path = ?1 \
+                         OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
+                        params![path, unix_pattern, windows_pattern],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "DELETE FROM directory_sizes WHERE real_path = ?1",
+                        params![path],
+                    )?;
+                    transaction.execute(
+                        "UPDATE indexed_dirs SET status = 'stale' WHERE real_path = ?1",
+                        params![path],
+                    )?;
+                }
+            }
+            transaction.commit()?;
             Ok(())
         })
         .await
@@ -2110,6 +2243,26 @@ impl Db {
                     job_from_row,
                 )
                 .optional()
+        })
+        .await
+    }
+
+    pub async fn list_jobs_for_user(
+        &self,
+        user_id: i64,
+        since: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<JobRecord>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, user_id, kind, job_key, status, progress, total, bytes_done, \
+                 bytes_total, payload, result, error, created_at, started_at, finished_at \
+                 FROM jobs WHERE user_id = ?1 \
+                 AND (status IN ('queued', 'running') OR COALESCE(finished_at, created_at) >= ?2) \
+                 ORDER BY created_at DESC LIMIT ?3",
+            )?;
+            let rows = statement.query_map(params![user_id, since, limit.max(1)], job_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .await
     }

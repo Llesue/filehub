@@ -209,7 +209,7 @@ async fn public_share_pagination_hidden_files_and_visit_count() {
     let response = send(
         &app.router,
         Method::GET,
-        &format!("/api/v1/public/shares/{token}/thumb?path=img.png&w=64"),
+        &format!("/api/v1/public/shares/{token}/thumb?path=img.png&w=64&wait=1"),
         None,
         None,
     )
@@ -384,7 +384,7 @@ async fn password_share_accepts_query_ticket() {
     let denied = send(
         &app.router,
         Method::GET,
-        &format!("/api/v1/public/shares/{token}/thumb?path=img.png&w=64"),
+        &format!("/api/v1/public/shares/{token}/thumb?path=img.png&w=64&wait=1"),
         None,
         None,
     )
@@ -394,12 +394,45 @@ async fn password_share_accepts_query_ticket() {
     let response = send(
         &app.router,
         Method::GET,
-        &format!("/api/v1/public/shares/{token}/thumb?path=img.png&w=64&ticket={ticket}"),
+        &format!("/api/v1/public/shares/{token}/thumb?path=img.png&w=64&ticket={ticket}&wait=1"),
         None,
         None,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+
+    let denied_events = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{token}/events"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(denied_events.status(), StatusCode::UNAUTHORIZED);
+
+    let events = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{token}/events?ticket={ticket}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(events.status(), StatusCode::OK);
+    assert_eq!(
+        events.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(
+        events
+            .headers()
+            .get("x-accel-buffering")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no"
+    );
 }
 
 #[tokio::test]
@@ -642,7 +675,7 @@ async fn collection_share_lists_downloads_and_zips_selected_files() {
     let thumb = send(
         &app.router,
         Method::GET,
-        &format!("/api/v1/public/shares/{token}/thumb?item={image_id}&w=64"),
+        &format!("/api/v1/public/shares/{token}/thumb?item={image_id}&w=64&wait=1"),
         None,
         None,
     )
@@ -754,4 +787,26 @@ async fn revoked_share_reports_gone_instead_of_not_found() {
     assert_eq!(response.status(), StatusCode::GONE);
     let body = json_body(response).await;
     assert_eq!(body["error"]["code"], "SHARE_REVOKED");
+
+    let events = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{token}/events"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(events.status(), StatusCode::GONE);
+    let body = json_body(events).await;
+    assert_eq!(body["error"]["code"], "SHARE_REVOKED");
+
+    let unknown = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/public/shares/sh_missing/events",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 }

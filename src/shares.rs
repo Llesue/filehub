@@ -3,10 +3,13 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Form, Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::convert::Infallible;
+use std::time::Duration;
 
 use crate::auth;
 use crate::authz;
@@ -133,6 +136,11 @@ pub async fn create(
         &headers,
     )
     .await;
+    state.events.publish(
+        "share.created",
+        Some(current.user.id),
+        json!({ "id": id, "kind": if collection { "collection" } else { "single" } }),
+    );
     Ok(Json(json!({
         "id": id,
         "token": token,
@@ -330,9 +338,19 @@ pub async fn upload(
     state
         .invalidate_path_caches(&target, Some(share.creator_id), false)
         .await;
-    Ok(Json(
-        json!({ "name": target.file_name().and_then(|value| value.to_str()).unwrap_or(filename) }),
-    ))
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(filename)
+        .to_owned();
+    let activity = json!({ "id": share.id, "name": name.clone(), "path": path });
+    state
+        .events
+        .publish("share.uploaded", Some(share.creator_id), activity.clone());
+    state
+        .events
+        .publish_share("share.uploaded", share.id, activity);
+    Ok(Json(json!({ "name": name })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -558,9 +576,23 @@ pub async fn complete_upload(
         .invalidate_path_caches(&target, Some(share.creator_id), false)
         .await;
     let _ = state.db.delete_share_upload(&id, share.id).await;
-    Ok(Json(json!({
-        "name": target.file_name().and_then(|name| name.to_str()).unwrap_or(&upload.filename),
-    })))
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&upload.filename)
+        .to_owned();
+    let activity = json!({
+        "id": share.id,
+        "name": name.clone(),
+        "path": upload.dir_path,
+    });
+    state
+        .events
+        .publish("share.uploaded", Some(share.creator_id), activity.clone());
+    state
+        .events
+        .publish_share("share.uploaded", share.id, activity);
+    Ok(Json(json!({ "name": name })))
 }
 
 pub async fn cancel_upload(
@@ -602,6 +634,9 @@ pub async fn purge(
         &headers,
     )
     .await;
+    state
+        .events
+        .publish_share("share.revoked", id, json!({ "id": id }));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -628,6 +663,12 @@ pub async fn revoke(
         &headers,
     )
     .await;
+    state
+        .events
+        .publish("share.revoked", Some(current.user.id), json!({ "id": id }));
+    state
+        .events
+        .publish_share("share.revoked", id, json!({ "id": id }));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -660,6 +701,16 @@ pub async fn public_meta(
             .increment_share_visit(share.id)
             .await
             .map_err(AppError::internal)?;
+        state.events.publish(
+            "share.visited",
+            Some(share.creator_id),
+            json!({ "id": share.id }),
+        );
+        state.events.publish_share(
+            "share.visited",
+            share.id,
+            json!({ "id": share.id, "path": path, "at": unix_now() }),
+        );
     }
     let video_enabled = {
         let settings = state.settings();
@@ -870,6 +921,20 @@ pub async fn download(
         if item.is_dir {
             return Err(AppError::NotFound);
         }
+        let activity = json!({
+            "id": share.id,
+            "item": item.id,
+            "name": item.display_name.clone(),
+            "path": item.display_name,
+        });
+        if !query.inline.unwrap_or(false) && !headers.contains_key("range") {
+            state
+                .events
+                .publish("share.downloaded", Some(share.creator_id), activity.clone());
+            state
+                .events
+                .publish_share("share.downloaded", share.id, activity);
+        }
         return crate::files::serve_file(
             &headers,
             Path::new(&item.real_path),
@@ -902,7 +967,79 @@ pub async fn download(
     if resolved.absolute.is_dir() {
         return Err(AppError::NotFound);
     }
+    let name = resolved
+        .absolute
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let activity = json!({ "id": share.id, "name": name, "path": path });
+    if !query.inline.unwrap_or(false) && !headers.contains_key("range") {
+        state
+            .events
+            .publish("share.downloaded", Some(share.creator_id), activity.clone());
+        state
+            .events
+            .publish_share("share.downloaded", share.id, activity);
+    }
     crate::files::serve_file(&headers, &resolved.absolute, false).await
+}
+
+pub async fn events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(token): AxumPath<String>,
+    Query(query): Query<ShareQuery>,
+) -> Result<Response, AppError> {
+    let share = load_public_share(&state, &token).await?;
+    require_ticket(&state, &share, &headers, query.ticket.as_deref())?;
+    check_public_rate(&state, &share, &headers)?;
+    let share_id = share.id;
+    let deadline = share.expires_at.map(|expires| {
+        tokio::time::Instant::now()
+            + Duration::from_secs(expires.saturating_sub(unix_now()).max(0) as u64)
+    });
+    let receiver = state.events.subscribe();
+    let stream = futures_util::stream::unfold(
+        (receiver, deadline),
+        move |(mut receiver, deadline)| async move {
+            loop {
+                if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                    return None;
+                }
+                let received = match deadline {
+                    Some(deadline) => tokio::select! {
+                        received = receiver.recv() => Some(received),
+                        () = tokio::time::sleep_until(deadline) => None,
+                    },
+                    None => Some(receiver.recv().await),
+                };
+                let received = received?;
+                match received {
+                    Ok(event) => {
+                        if !event.visible_to_share(share_id) {
+                            continue;
+                        }
+                        let data = serde_json::to_string(&event.data).unwrap_or_default();
+                        let out = SseEvent::default()
+                            .id(event.id.to_string())
+                            .event(event.event)
+                            .data(data);
+                        return Some((Ok::<_, Infallible>(out), (receiver, deadline)));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -913,6 +1050,7 @@ pub struct PublicThumbQuery {
     edge: Option<u32>,
     fit: Option<String>,
     item: Option<i64>,
+    wait: Option<String>,
 }
 
 pub async fn thumb(
@@ -948,6 +1086,13 @@ pub async fn thumb(
             fit_short,
             share.creator_id,
             &headers,
+            Some(crate::thumbs::ThumbScope {
+                root_id: None,
+                share_id: Some(share.id),
+                item_id: Some(item.id),
+                path: item.display_name.clone(),
+            }),
+            crate::thumbs::wants_wait(query.wait.as_deref()),
         )
         .await;
     }
@@ -981,6 +1126,7 @@ pub async fn thumb(
         .edge
         .unwrap_or_else(|| query.w.unwrap_or(256))
         .clamp(16, 2048);
+    let scope_path = resolved.relative.clone();
     crate::thumbs::thumbnail_response(
         &state,
         resolved.absolute,
@@ -989,6 +1135,13 @@ pub async fn thumb(
         fit_short,
         share.creator_id,
         &headers,
+        Some(crate::thumbs::ThumbScope {
+            root_id: None,
+            share_id: Some(share.id),
+            item_id: None,
+            path: scope_path,
+        }),
+        crate::thumbs::wants_wait(query.wait.as_deref()),
     )
     .await
 }

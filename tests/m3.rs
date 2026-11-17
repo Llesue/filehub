@@ -400,3 +400,57 @@ async fn server_paths_require_existing_directory_and_support_crud() {
     .await;
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn zero_byte_upload_completes() {
+    let app = setup_app().await;
+    let upload = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/uploads",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "",
+            "filename": "empty.txt",
+            "total_size": 0,
+            "chunk_size": 5
+        }),
+    )
+    .await;
+    assert_eq!(upload.status(), StatusCode::OK);
+    let upload = json_body(upload).await;
+    assert_eq!(upload["chunks"].as_i64(), Some(0));
+    let upload_id = upload["upload_id"].as_str().unwrap().to_owned();
+
+    let complete = send(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/uploads/{upload_id}/complete"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+    )
+    .await;
+    assert_eq!(complete.status(), StatusCode::OK);
+
+    let target = app.home.join("empty.txt");
+    assert!(target.exists());
+    assert_eq!(std::fs::metadata(target).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn jobs_list_returns_own_jobs() {
+    let app = setup_app().await;
+    let response = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/jobs?since=0",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert!(body["jobs"].is_array());
+}

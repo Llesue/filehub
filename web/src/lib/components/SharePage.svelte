@@ -44,6 +44,15 @@
   let uploads = $state<UploadTask[]>([]);
   let uploadBusy = false;
   let uploadSeq = 0;
+  let thumbVersions = $state<Record<string, number>>({});
+  let thumbFailures = $state<Record<string, boolean>>({});
+  let shareEventsConnected = $state(false);
+  let shareActivity = $state('');
+  let shareEventErrors = 0;
+  let shareEventSource: EventSource | null = null;
+  let shareEventsTicket: string | undefined;
+  let lastOwnUploadAt = 0;
+  let activityTimer: ReturnType<typeof setTimeout> | null = null;
   const clickTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
   let entries = $derived(data?.entries ?? []);
@@ -58,7 +67,9 @@
   });
 
   onDestroy(() => {
+    closeShareEvents();
     for (const timer of Object.values(clickTimers)) clearTimeout(timer);
+    if (activityTimer) clearTimeout(activityTimer);
   });
 
   async function load(cursor?: string): Promise<void> {
@@ -78,6 +89,7 @@
         void refreshZipInfo();
       }
       needsPassword = false;
+      connectShareEvents();
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         needsPassword = true;
@@ -115,6 +127,7 @@
     path = next;
     selected = [];
     preview = null;
+    thumbFailures = {};
     zipInfo = { checked: false, allowed: false, files: 0, bytes: 0, message: '' };
     void load();
   }
@@ -134,9 +147,142 @@
   }
 
   function thumbUrlFor(entry: ShareEntry, width: number): string {
+    const version = thumbVersions[entryThumbKey(entry)];
     return entry.item_id !== undefined
-      ? api.publicThumbUrl(token, '', width, ticket, entry.item_id)
-      : api.publicThumbUrl(token, join(path, entry.name), width, ticket);
+      ? api.publicThumbUrl(
+          token,
+          '',
+          width,
+          ticket,
+          entry.item_id,
+          version,
+          !shareEventsConnected,
+        )
+      : api.publicThumbUrl(
+          token,
+          join(path, entry.name),
+          width,
+          ticket,
+          undefined,
+          version,
+          !shareEventsConnected,
+        );
+  }
+
+  function entryThumbKey(entry: ShareEntry): string {
+    return entry.item_id !== undefined
+      ? `item:${entry.item_id}`
+      : `path:${join(path, entry.name)}`;
+  }
+
+  function eventThumbKey(data: Record<string, unknown>): string {
+    const item = Number(data.item);
+    if (Number.isFinite(item) && item > 0) return `item:${item}`;
+    const eventPath = typeof data.path === 'string' ? data.path : '';
+    return `path:${eventPath}`;
+  }
+
+  function showShareActivity(message: string): void {
+    shareActivity = message;
+    if (activityTimer) clearTimeout(activityTimer);
+    activityTimer = setTimeout(() => {
+      shareActivity = '';
+      activityTimer = null;
+    }, 5000);
+  }
+
+  function handleShareEvent(type: string, raw: string): void {
+    let payload: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      payload = parsed as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    shareEventErrors = 0;
+    if (type === 'thumbnail.ready' || type === 'thumbnail.failed') {
+      const key = eventThumbKey(payload);
+      if (type === 'thumbnail.failed') {
+        thumbFailures = { ...thumbFailures, [key]: true };
+      } else {
+        thumbVersions = { ...thumbVersions, [key]: (thumbVersions[key] ?? 0) + 1 };
+        if (thumbFailures[key]) {
+          const next = { ...thumbFailures };
+          delete next[key];
+          thumbFailures = next;
+        }
+      }
+      return;
+    }
+    if (type === 'share.revoked') {
+      closeShareEvents();
+      data = null;
+      error = t($language, '共享已停止');
+      return;
+    }
+    if (type === 'share.uploaded') {
+      const ownUpload = uploadBusy || Date.now() - lastOwnUploadAt < 1500;
+      const eventPath = typeof payload.path === 'string' ? payload.path : '';
+      if (!ownUpload && eventPath === path) void load();
+      const name = typeof payload.name === 'string' ? payload.name : '';
+      if (!ownUpload && name) showShareActivity(t($language, '有访客上传了 {name}', { name }));
+      return;
+    }
+    if (type === 'share.downloaded') {
+      const name = typeof payload.name === 'string' ? payload.name : '';
+      showShareActivity(
+        name
+          ? t($language, '有访客下载了 {name}', { name })
+          : t($language, '有访客下载了文件'),
+      );
+      return;
+    }
+    if (type === 'share.visited') {
+      showShareActivity(t($language, '有访客打开了分享'));
+    }
+  }
+
+  function connectShareEvents(): void {
+    if (typeof EventSource === 'undefined') return;
+    const nextTicket = ticket;
+    if (shareEventSource && shareEventsTicket === nextTicket) return;
+    closeShareEvents();
+    shareEventsTicket = nextTicket;
+    const query = nextTicket ? `?ticket=${encodeURIComponent(nextTicket)}` : '';
+    const source = new EventSource(
+      `/api/v1/public/shares/${encodeURIComponent(token)}/events${query}`,
+    );
+    shareEventSource = source;
+    // Optimistic so the first thumbnails use async mode; onerror flips it back
+    // and the image URLs are re-rendered with `wait=1`.
+    shareEventsConnected = true;
+    for (const type of [
+      'share.visited',
+      'share.downloaded',
+      'share.uploaded',
+      'share.revoked',
+      'thumbnail.ready',
+      'thumbnail.failed',
+    ]) {
+      source.addEventListener(type, (event) => handleShareEvent(type, (event as MessageEvent).data));
+    }
+    source.onopen = () => {
+      shareEventsConnected = true;
+      shareEventErrors = 0;
+    };
+    source.onerror = () => {
+      shareEventsConnected = false;
+      shareEventErrors += 1;
+      if (shareEventErrors >= 5) closeShareEvents();
+    };
+  }
+
+  function closeShareEvents(): void {
+    shareEventSource?.close();
+    shareEventSource = null;
+    shareEventsConnected = false;
+    shareEventsTicket = undefined;
   }
 
   async function refreshZipInfo(): Promise<void> {
@@ -372,6 +518,7 @@
         task.progress = end / task.file.size;
       }
       await api.completeShareUpload(token, created.upload_id, ticket);
+      lastOwnUploadAt = Date.now();
       task.status = 'done';
       task.progress = 1;
       await load();
@@ -428,6 +575,19 @@
       </div>
       {#if data}
         <h1>{data.name}</h1>
+        <div class="share-live">
+          <span
+            class="live-dot"
+            class:on={shareEventsConnected}
+            title={shareEventsConnected ? t($language, '实时更新已连接') : t($language, '实时更新未连接')}
+            aria-label={shareEventsConnected
+              ? t($language, '实时更新已连接')
+              : t($language, '实时更新未连接')}
+          ></span>
+          {#if shareActivity}
+            <span class="share-activity" role="status">{shareActivity}</span>
+          {/if}
+        </div>
       {/if}
     </header>
 
@@ -523,6 +683,7 @@
         {#if view === 'grid'}
           <div class="share-grid">
             {#each entries as entry (entry.name)}
+              {@const thumbId = entryThumbKey(entry)}
               <div
                 class="share-card-item"
                 class:selected={selected.includes(entryKey(entry))}
@@ -545,15 +706,15 @@
                 />
                 <div class="card-icon">
                   <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={44} />
-                  {#if previewable(entry)}
+                  {#if previewable(entry) && !thumbFailures[thumbId]}
                     <img
                       class="thumb"
                       src={thumbUrlFor(entry, 320)}
                       alt=""
                       loading="lazy"
                       decoding="async"
-                      onerror={(event) => {
-                        (event.currentTarget as HTMLImageElement).style.display = 'none';
+                      onerror={() => {
+                        thumbFailures = { ...thumbFailures, [thumbId]: true };
                       }}
                     />
                     <button
@@ -651,11 +812,22 @@
         {/if}
       {:else}
         <div class="file">
-          {#if data.has_preview && isImage(data.name)}
+          {#if data.has_preview && isImage(data.name) && !thumbFailures['path:']}
             <img
               class="share-preview"
-              src={api.publicThumbUrl(token, '', 2048, ticket)}
+              src={api.publicThumbUrl(
+                token,
+                '',
+                2048,
+                ticket,
+                undefined,
+                thumbVersions['path:'],
+                !shareEventsConnected,
+              )}
               alt={data.name}
+              onerror={() => {
+                thumbFailures = { ...thumbFailures, 'path:': true };
+              }}
             />
           {:else if data.has_preview && isVideo(data.name)}
             <video
@@ -732,8 +904,8 @@
         : api.publicDownloadUrl(token, join(path, entry.name), ticket, true)}
     thumbSrcFor={(entry) =>
       entry.item_id !== undefined
-        ? api.publicThumbUrl(token, '', 2048, ticket, entry.item_id)
-        : api.publicThumbUrl(token, join(path, entry.name), 2048, ticket)}
+        ? api.publicThumbUrl(token, '', 2048, ticket, entry.item_id, undefined, true)
+        : api.publicThumbUrl(token, join(path, entry.name), 2048, ticket, undefined, undefined, true)}
     downloadHref={(entry) =>
       entry.item_id !== undefined
         ? api.publicDownloadUrl(token, '', ticket, false, entry.item_id)
@@ -794,6 +966,31 @@
     color: var(--text);
     font-size: 24px;
     font-weight: 500;
+  }
+
+  .share-live {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 18px;
+    margin-top: 8px;
+    color: var(--text-2);
+    font-size: 12px;
+  }
+
+  .live-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--border);
+  }
+
+  .live-dot.on {
+    background: var(--file-sheet);
+  }
+
+  .share-activity {
+    overflow-wrap: anywhere;
   }
 
   .unlock {

@@ -30,7 +30,10 @@
     | 'trash'
     | 'download'
     | 'link'
-    | 'unlink';
+    | 'unlink'
+    | 'volume'
+    | 'volume-muted'
+    | 'bell';
 
   let { name, size = 20 }: { name: IconName; size?: number } = $props();
 </script>
@@ -141,5 +144,15 @@
   {:else if name === 'unlink'}
     <path d="M15 7h2a5 5 0 0 1 0 10h-2" />
     <path d="M9 17H7A5 5 0 0 1 7 7h2" />
+  {:else if name === 'volume'}
+    <path d="M4 9h4l5-4v14l-5-4H4z" />
+    <path d="M16 8a5 5 0 0 1 0 8" />
+    <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+  {:else if name === 'volume-muted'}
+    <path d="M4 9h4l5-4v14l-5-4H4z" />
+    <path d="m16 9 5 6m0-6-5 6" />
+  {:else if name === 'bell'}
+    <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+    <path d="M10 21h4" />
   {/if}
 </svg>

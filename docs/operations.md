@@ -83,7 +83,7 @@ FileHub 只在对端地址命中 `security.trusted_proxies` 时才信任转发�
 
 - WebSocket：`/api/v1/terminal/ws` 需要 HTTP/1.1 以及 `Upgrade`/`Connection` 头。Caddy 自动处理；Nginx 需要下面的 `map` 块。
 - 上传请求体上限：要大于 `uploads.chunk_size`（默认 8 MiB），示例给 32 MiB；调大分片后同步调大。
-- 下载/ZIP 流式响应：关闭代理缓冲（Nginx `proxy_buffering off` 与 `proxy_request_buffering off`，Caddy `flush_interval -1`）。FileHub 不会发送 `X-Accel-Buffering`，必须在代理侧显式关闭。
+- 下载/ZIP 流式响应：关闭代理缓冲（Nginx `proxy_buffering off` 与 `proxy_request_buffering off`，Caddy `flush_interval -1`）。下载不发送 `X-Accel-Buffering`；实时事件流（`/api/v1/events`、公开分享事件流）会发送 `X-Accel-Buffering: no`，但仍建议在代理侧关闭缓冲。
 - 长下载/大 ZIP：示例给 1 小时读写超时；如果归档可能更久，继续调大，或降低 `downloads.zip_max_bytes`。
 
 ### Caddy
@@ -180,13 +180,18 @@ sqlite3 /home/filehub/filehub.db "VACUUM INTO '/backup/filehub-$(date +%F).db'"
 - 启动失败并提示 users_root：显式配置的目录必须存在且为目录
 - 登录 429：同一用户名 5 次失败后锁定 5 分钟
 - 上传 507：用户配额不足
+- 上传 429：同一用户未完成的会话超过 `uploads.concurrency_per_user`（默认 `32`，暂停的上传也会占用会话），等待过期或取消旧上传
+- 上传支持分片续传：刷新页面后重新选择相同文件会复用服务端会话并跳过已收分片；主动取消会删除临时文件
+- 0 字节文件可以上传；Windows 文件名按 UTF-16 长度校验
 - 缩略图不显示：确认 `thumbnails.enabled`，HEIC/RAW/视频可能按设计降级为图标
 
 ## 后台任务与目录大小
 
 目录大小、复制/移动、索引和缩略图都由进程内后台任务执行，HTTP 请求只负责入队和查询状态。
 
-- `jobs.io_workers` 控制目录大小、索引和复制/移动共享的磁盘并发，默认 `1`
+- `jobs.io_workers` 控制目录大小和索引等后台维护任务的磁盘并发，默认 `1`
+- `jobs.interactive_workers` 控制复制/移动等交互任务的并发，默认 `2`；与后台维护任务分开，避免移动任务长时间停在“排队中”
+- `jobs.dir_size_workers` 控制目录大小扫描的并发，默认 `1`；与索引任务分开，索引大目录时目录大小仍能刷新
 - `jobs.queue_max` 是全局等待队列上限，默认 `256`
 - `jobs.dir_size_ttl_seconds` 控制目录大小缓存有效期，默认 `300` 秒
 - `jobs.dir_size_use_logical` 默认 `true`（逻辑大小）；设为 `false` 使用磁盘块大小并在 Unix 上按 inode 去重硬链接
@@ -216,6 +221,9 @@ sqlite3 /home/filehub/filehub.db "VACUUM INTO '/backup/filehub-$(date +%F).db'"
 - 索引条目保存 `mime_type`、`created_at`、`has_preview`、`is_hidden`，列表和缩略图不再只靠扩展名猜测
 - 搜索结果支持 `min_size`、`max_size`、`modified_after`、`modified_before`、`is_dir`、`kind`
 - 缩略图失败会写 `.fail` 负缓存标记，同一文件/尺寸不会重复解码；成功结果支持 `ETag`/`If-None-Match` 返回 304
+- `thumbnails.preview_workers`（默认 `1`）为预览大图保留独立并发；列表小图使用 `workers - preview_workers` 的通道，滚动目录不会阻塞预览。预览任务还有少量保留队列名额，避免目录缩略图占满队列后返回 503
 - `thumbnails.video_timeout_secs` 现在会真正限制 ffmpeg 抽帧时间，超时会 kill 进程
+- 索引条目按 500 条一批提交，避免单个大目录长时间持有 SQLite 写锁；数据库连接池优先使用空闲连接
+- 路径缓存失效会合并为一个事务；删除超过 500ms 会记录 `slow delete request`，包含 resolve/remove/cache/audit 各阶段耗时
 - 审计日志由后台批量写入（最多 200 条或 1 秒），服务优雅关闭时会 flush
 - Windows 上优先使用 MFT + USN Journal 增量；USN 不可用/回退时自动走 MFT/目录扫描。USN 状态按 volume 存在 `usn_state` 表

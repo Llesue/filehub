@@ -136,6 +136,15 @@ async fn slow_request(
                 "slow request"
             );
         }
+        state.events.publish_admin(
+            "slow_request",
+            json!({
+                "method": method,
+                "path": path,
+                "status": status,
+                "duration_ms": duration_ms,
+            }),
+        );
         state.push_slow_request(SlowRequest {
             method,
             path,

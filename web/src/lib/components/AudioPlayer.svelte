@@ -12,26 +12,46 @@
   import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
 
+  let { hidden = false }: { hidden?: boolean } = $props();
   let audio = $state<HTMLAudioElement | null>(null);
   let currentKey = '';
   let currentTime = $state(0);
   let duration = $state(0);
+  let volume = $state(0.8);
   let position = $state({ x: 0, y: 0 });
   let dragging = false;
   let dragStart = { x: 0, y: 0, left: 0, top: 0 };
 
   let current = $derived($audioState ? $audioState.playlist[$audioState.index] : null);
+  const channel =
+    typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('filehub.audio') : null;
 
   onMount(() => {
+    if (channel) {
+      channel.onmessage = (message: MessageEvent<{ type?: string }>) => {
+        if (message.data?.type === 'play' && audio && !audio.paused) {
+          setAudioPlaying(false);
+        }
+      };
+    }
     try {
       const stored = JSON.parse(localStorage.getItem('filehub.audio.position') ?? 'null') as {
         x: number;
         y: number;
       } | null;
       if (stored) position = stored;
+      const rawVolume = localStorage.getItem('filehub.audio.volume');
+      const storedVolume = rawVolume === null ? Number.NaN : Number(rawVolume);
+      if (Number.isFinite(storedVolume) && storedVolume >= 0 && storedVolume <= 1) {
+        volume = storedVolume;
+      }
     } catch {
       // ignore malformed positions
     }
+  });
+
+  $effect(() => {
+    if (audio) audio.volume = volume;
   });
 
   $effect(() => {
@@ -70,6 +90,27 @@
     const value = Number((event.currentTarget as HTMLInputElement).value);
     audio.currentTime = value;
     currentTime = value;
+  }
+
+  function changeVolume(event: Event): void {
+    const value = Number((event.currentTarget as HTMLInputElement).value);
+    volume = Math.min(1, Math.max(0, value));
+    if (audio) audio.volume = volume;
+    try {
+      localStorage.setItem('filehub.audio.volume', String(volume));
+    } catch {
+      // ignore storage failures
+    }
+  }
+
+  function toggleMute(): void {
+    volume = volume > 0 ? 0 : 0.8;
+    if (audio) audio.volume = volume;
+    try {
+      localStorage.setItem('filehub.audio.volume', String(volume));
+    } catch {
+      // ignore storage failures
+    }
   }
 
   function formatTime(seconds: number): string {
@@ -123,8 +164,10 @@
 {#if current && $audioState}
   <aside
     class="audio-player"
+    class:lightbox-hidden={hidden}
     style={`transform:translate(${position.x}px, ${position.y}px)`}
     aria-label={t($language, '播放器')}
+    aria-hidden={hidden}
   >
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <header
@@ -171,6 +214,26 @@
         aria-label={t($language, '下一首')}
         title={t($language, '下一首')}><Icon name="next" size={16} /></button
       >
+      <div class="audio-volume">
+        <button
+          type="button"
+          class="icon"
+          aria-label={volume > 0 ? t($language, '静音') : t($language, '取消静音')}
+          title={volume > 0 ? t($language, '静音') : t($language, '取消静音')}
+          onclick={toggleMute}
+        >
+          <Icon name={volume > 0 ? 'volume' : 'volume-muted'} size={16} />
+        </button>
+        <input
+          type="range"
+          min="0"
+          max="1"
+          step="0.01"
+          value={volume}
+          aria-label={t($language, '音量')}
+          oninput={changeVolume}
+        />
+      </div>
     </div>
     <div class="audio-progress">
       <span>{formatTime(currentTime)}</span>
@@ -191,7 +254,10 @@
       ontimeupdate={onTimeUpdate}
       onloadedmetadata={onLoaded}
       onended={nextAudio}
-      onplay={() => setAudioPlaying(true)}
+      onplay={() => {
+        setAudioPlaying(true);
+        channel?.postMessage({ type: 'play' });
+      }}
       onpause={() => setAudioPlaying(false)}
     ></audio>
   </aside>
@@ -282,6 +348,32 @@
   .audio-progress input {
     flex: 1;
     min-width: 0;
+  }
+
+  .audio-volume {
+    display: flex;
+    flex: 0 1 86px;
+    min-width: 64px;
+    align-items: center;
+    gap: 2px;
+    margin-left: 2px;
+  }
+
+  .audio-volume input {
+    flex: 1;
+    width: 0;
+    min-width: 0;
+  }
+
+  .audio-volume .icon {
+    width: 22px;
+    height: 22px;
+  }
+
+  .audio-player.lightbox-hidden {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
   }
 
   audio {

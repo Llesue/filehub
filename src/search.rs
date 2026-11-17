@@ -58,6 +58,7 @@ pub async fn index(
             user_id,
             payload,
             1,
+            false,
             move |ctx| async move {
                 let cancel = ctx.token();
                 let mut last_reported = 0_usize;

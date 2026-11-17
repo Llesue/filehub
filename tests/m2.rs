@@ -10,6 +10,7 @@ struct TestApp {
     _dir: tempfile::TempDir,
     home: std::path::PathBuf,
     router: Router,
+    state: std::sync::Arc<filehub::state::AppState>,
     cookie: String,
     csrf: String,
     root_id: i64,
@@ -20,7 +21,7 @@ async fn setup_app() -> TestApp {
     let state = filehub::state::AppState::new_test(dir.path(), "test-token")
         .await
         .unwrap();
-    let router = filehub::app::router(state);
+    let router = filehub::app::router(state.clone());
 
     let setup = send_json(
         &router,
@@ -50,6 +51,7 @@ async fn setup_app() -> TestApp {
         _dir: dir,
         home,
         router,
+        state,
         cookie,
         csrf,
         root_id,
@@ -398,4 +400,109 @@ async fn upload_resume_delete_and_zip() {
     let mut content = String::new();
     file.read_to_string(&mut content).unwrap();
     assert_eq!(content, "hello world");
+}
+
+#[tokio::test]
+async fn edit_presence_is_scoped_to_the_same_user_and_file() {
+    let app = setup_app().await;
+    let mut events = app.state.events.subscribe();
+    let first = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/edit/presence",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "hello.txt",
+            "state": "open",
+            "client": "tab-one",
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(json_body(first).await["others"], 0);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.expect("event bus");
+            if event.event == "edit.presence" {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("presence event");
+    assert_eq!(event.event, "edit.presence");
+    assert_eq!(event.user_id, Some(1));
+    assert_eq!(event.data["path"], "hello.txt");
+    assert_eq!(event.data["client"], "tab-one");
+
+    let second = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/edit/presence",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "hello.txt",
+            "state": "open",
+            "client": "tab-two",
+        }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = json_body(second).await;
+    assert_eq!(second_body["others"], 1);
+    assert_eq!(second_body["peers"][0]["client"], "tab-one");
+
+    let other_file = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/edit/presence",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "sub/nested.txt",
+            "state": "open",
+            "client": "tab-two",
+        }),
+    )
+    .await;
+    assert_eq!(other_file.status(), StatusCode::OK);
+    assert_eq!(json_body(other_file).await["others"], 0);
+
+    let close = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/edit/presence",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "hello.txt",
+            "state": "close",
+            "client": "tab-two",
+        }),
+    )
+    .await;
+    assert_eq!(close.status(), StatusCode::OK);
+    assert_eq!(json_body(close).await["others"], 1);
+
+    let invalid = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/edit/presence",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "hello.txt",
+            "state": "open",
+            "client": "bad client!",
+        }),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 }
