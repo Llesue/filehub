@@ -36,9 +36,20 @@ jobs:
           if not match:
               raise SystemExit(f"CHANGELOG entry for v{version} not found")
           body = match.group(0).split("\n", 1)[1].strip()
-          notes = (
-              f"# FileHub v{version}\n\n{body}\n\n"
-              f"**Full Changelog**: https://github.com/Llesue/filehub/compare/"
+          notes = f"# FileHub v{version}\n\n{body}\n"
+          chinese = Path("CHANGELOG.zh-CN.md")
+          if chinese.exists():
+              text = chinese.read_text()
+              zh_match = re.search(
+                  rf"^## v{re.escape(version)}\b.*?(?=^## |\Z)",
+                  text,
+                  re.MULTILINE | re.DOTALL,
+              )
+              if zh_match:
+                  zh_body = zh_match.group(0).split("\n", 1)[1].strip()
+                  notes += f"\n---\n\n# FileHub v{version}（中文）\n\n{zh_body}\n"
+          notes += (
+              f"\n**Full Changelog**: https://github.com/Llesue/filehub/compare/"
               f"v{version.rsplit('.', 1)[0]}.{int(version.rsplit('.', 1)[1]) - 1}"
               f"...v{version}\n"
           )
