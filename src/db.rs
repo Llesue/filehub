@@ -3592,6 +3592,17 @@ mod tests {
     use super::Db;
 
     #[test]
+    fn name_bigrams_cover_cjk_pairs_only() {
+        assert_eq!(
+            super::name_bigrams("山西旅游"),
+            vec!["山西", "西旅", "旅游"]
+        );
+        assert!(super::name_bigrams("plain-ascii").is_empty());
+        assert_eq!(super::name_bigrams("A山B"), vec!["A山", "山B"]);
+        assert_eq!(super::name_bigrams("哈哈"), vec!["哈哈"]);
+    }
+
+    #[test]
     fn subtree_bounds_handle_both_separators() {
         let bounds = Db::subtree_bounds("/mnt/media");
         assert!(bounds.contains(&("/mnt/media/".to_owned(), "/mnt/media0".to_owned())));
