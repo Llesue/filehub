@@ -249,6 +249,153 @@ pub async fn search(
     Ok(Json(json!({ "entries": results })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SearchAllQuery {
+    q: String,
+    limit: Option<i64>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    modified_after: Option<i64>,
+    modified_before: Option<i64>,
+    kind: Option<String>,
+}
+
+fn root_path_bounds(path: &str) -> Vec<(String, String)> {
+    let mut bounds = Vec::new();
+    for (separator, upper) in [("/", "0"), ("\\", "]")] {
+        let base = path.trim_end_matches(['/', '\\']);
+        let start = format!("{base}{separator}");
+        let end = format!("{base}{upper}");
+        if start < end {
+            bounds.push((start, end));
+        }
+    }
+    bounds
+}
+
+pub async fn search_all(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SearchAllQuery>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let preferences = state
+        .db
+        .get_user_preferences(current.user.id)
+        .await
+        .map_err(AppError::internal)?;
+    let query_text = query.q.trim();
+    if query_text.chars().count() < 3 {
+        return Err(AppError::bad_request(
+            "search query must be at least 3 characters",
+        ));
+    }
+    if let (Some(min), Some(max)) = (query.min_size, query.max_size)
+        && min > max
+    {
+        return Err(AppError::bad_request("min_size must not exceed max_size"));
+    }
+    let mut is_dir = None;
+    let mime_prefix = match query.kind.as_deref() {
+        Some("image") => Some("image/%".to_owned()),
+        Some("video") => Some("video/%".to_owned()),
+        Some("audio") => Some("audio/%".to_owned()),
+        Some("text") => Some("text/%".to_owned()),
+        Some("pdf") => Some("application/pdf".to_owned()),
+        Some("dir") => {
+            is_dir = Some(true);
+            None
+        }
+        Some("file") => {
+            is_dir = Some(false);
+            None
+        }
+        _ => None,
+    };
+    let all_roots = state
+        .db
+        .list_roots(current.user.id)
+        .await
+        .map_err(AppError::internal)?;
+    // A root inside another root would search the same files twice and can
+    // force an extra full FTS scan for a namespace with few matches.
+    let roots: Vec<Root> = all_roots
+        .iter()
+        .filter(|root| {
+            !all_roots.iter().any(|other| {
+                other.id != root.id
+                    && other.real_path.len() < root.real_path.len()
+                    && crate::platform::path_within(
+                        std::path::Path::new(&root.real_path),
+                        std::path::Path::new(&other.real_path),
+                    )
+            })
+        })
+        .cloned()
+        .collect();
+    let ranges: Vec<(String, String)> = roots
+        .iter()
+        .flat_map(|root| root_path_bounds(&root.real_path))
+        .collect();
+    let started = std::time::Instant::now();
+    let entries = state
+        .db
+        .search_entries_all(
+            query_text,
+            ranges,
+            preferences.show_hidden,
+            query.limit.unwrap_or(200),
+            crate::db::IndexSearchFilters {
+                min_size: query.min_size,
+                max_size: query.max_size,
+                modified_after: query.modified_after,
+                modified_before: query.modified_before,
+                is_dir,
+                mime_prefix,
+            },
+        )
+        .await
+        .map_err(AppError::internal)?;
+    if started.elapsed().as_millis() >= 500 {
+        tracing::warn!(
+            roots = roots.len(),
+            query_len = query_text.chars().count(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            "slow unified search"
+        );
+    }
+    let results: Vec<Value> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let (root, relative) = roots
+                .iter()
+                .filter_map(|root| {
+                    entry
+                        .real_path
+                        .strip_prefix(root.real_path.trim_end_matches(['/', '\\']))
+                        .map(|relative| (root, relative))
+                })
+                .min_by_key(|(_, relative)| relative.len())?;
+            let path = relative.trim_start_matches(['/', '\\']).replace('\\', "/");
+            if path.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "root_id": root.id,
+                "name": entry.name,
+                "path": path,
+                "is_dir": entry.is_dir,
+                "size": entry.size,
+                "modified": entry.mtime,
+                "created": entry.created_at,
+                "mime_type": entry.mime_type,
+                "has_preview": entry.has_preview,
+            }))
+        })
+        .collect();
+    Ok(Json(json!({ "entries": results })))
+}
+
 async fn load_root(state: &Arc<AppState>, user_id: i64, root_id: i64) -> Result<Root, AppError> {
     state
         .db

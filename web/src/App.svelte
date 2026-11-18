@@ -137,7 +137,8 @@
   let searchIndexing = $state(false);
   let searchLoading = $state(false);
   let searchTooShort = $state(false);
-  let searchTimer: ReturnType<typeof setTimeout> | null = null;
+  let searchRunning = false;
+  let pendingSearch: string | null = null;
   let searchInput = $state<HTMLInputElement | null>(null);
   let searchFiltersOpen = $state(false);
   let searchKind = $state('');
@@ -1369,23 +1370,22 @@
   }
 
   function handleSearchInput(): void {
-    if (searchTimer) {
-      clearTimeout(searchTimer);
+    const query = searchQuery.trim();
+    if (!query) {
+      exitSearch();
     }
-    searchAbort?.abort();
-    searchIndexing = false;
+  }
 
+  function submitSearch(): void {
     const query = searchQuery.trim();
     if (!query || activeRootId === null) {
-      searchActive = false;
-      searchLoading = false;
-      searchTooShort = false;
-      searchResults = [];
+      exitSearch();
       return;
     }
     const length = Array.from(query).length;
     if (length < 3) {
       searchAbort?.abort();
+      pendingSearch = null;
       searchActive = true;
       searchLoading = false;
       searchIndexing = false;
@@ -1397,10 +1397,12 @@
     searchActive = true;
     searchLoading = true;
     searchResults = [];
-
-    searchTimer = setTimeout(() => {
-      void runSearch(query);
-    }, 250);
+    if (searchRunning) {
+      pendingSearch = query;
+      return;
+    }
+    pendingSearch = null;
+    void runSearch(query);
   }
 
   async function waitForIndexJob(
@@ -1457,8 +1459,7 @@
   }
 
   function applySearchFilters(): void {
-    const query = searchQuery.trim();
-    if (query) void runSearch(query);
+    submitSearch();
   }
 
   function resetSearchFilters(): void {
@@ -1470,6 +1471,7 @@
 
   async function runSearch(query: string): Promise<void> {
     if (roots.length === 0) return;
+    searchRunning = true;
     const token = ++searchToken;
     searchAbort?.abort();
     const controller = new AbortController();
@@ -1478,47 +1480,61 @@
 
     const collect = async (): Promise<SearchEntry[]> => {
       const indexing: Promise<void>[] = [];
-      const settled = await Promise.allSettled(
-        roots.map(async (root) => {
-          if (!indexedRoots.has(root.id)) {
-            indexedRoots.add(root.id);
-            try {
-              const job = await api.index(root.id, '', true, csrf);
-              indexing.push(waitForIndexJob(job.job_id, token, query, controller.signal));
-            } catch (error) {
-              console.warn('background index failed', error);
-            }
-          }
-          const result = await api.search(
-            root.id,
-            query,
-            100,
-            controller.signal,
-            searchFilterParams(),
-          );
-          return result.entries.map((entry) => ({ ...entry, rootId: root.id }));
-        }),
-      );
+      for (const root of roots) {
+        if (indexedRoots.has(root.id)) continue;
+        indexedRoots.add(root.id);
+        try {
+          const job = await api.index(root.id, '', true, csrf);
+          indexing.push(waitForIndexJob(job.job_id, token, query, controller.signal));
+        } catch (error) {
+          console.warn('background index failed', error);
+        }
+      }
       if (indexing.length > 0) {
         searchIndexing = true;
         void Promise.allSettled(indexing).then(() => {
           if (token !== searchToken) return;
           searchIndexing = false;
-          if (searchQuery === query) void runSearch(query);
+          if (searchQuery.trim() === query && !searchRunning) void runSearch(query);
         });
       }
-      return settled.flatMap((result) => (result.status === 'fulfilled' ? result.value : []));
+      const result = await api.searchAll(
+        query,
+        200,
+        controller.signal,
+        searchFilterParams(),
+      );
+      return result.entries.map((entry) => ({
+        ...entry,
+        rootId: entry.root_id ?? entry.rootId,
+      }));
     };
 
     try {
       const results = await collect();
-      if (token !== searchToken || controller.signal.aborted) return;
+      if (
+        token !== searchToken ||
+        controller.signal.aborted ||
+        searchQuery.trim() !== query
+      ) {
+        return;
+      }
       searchResults = results.slice(0, 200);
       searchActive = true;
       searchLoading = false;
     } catch (error) {
-      if (token === searchToken) searchLoading = false;
       if (token === searchToken && !isAbortError(error)) handleFilesError(error);
+    } finally {
+      if (token === searchToken) {
+        searchRunning = false;
+        const next = pendingSearch;
+        pendingSearch = null;
+        if (next && searchQuery.trim() === next) {
+          void runSearch(next);
+        } else if (!searchIndexing) {
+          searchLoading = false;
+        }
+      }
     }
   }
 
@@ -1577,7 +1593,8 @@
 
   function exitSearch(): void {
     searchAbort?.abort();
-    if (searchTimer) clearTimeout(searchTimer);
+    pendingSearch = null;
+    searchRunning = false;
     searchActive = false;
     searchLoading = false;
     searchQuery = '';
@@ -2982,8 +2999,16 @@
       </div>
 
       {#if appView === 'files'}
-        <div class="search">
-          <Icon name="search" size={18} />
+        <form
+          class="search"
+          onsubmit={(event) => {
+            event.preventDefault();
+            submitSearch();
+          }}
+        >
+          <button type="submit" class="search-submit" aria-label={t($language, '搜索')}>
+            <Icon name="search" size={18} />
+          </button>
           <input
             bind:this={searchInput}
             bind:value={searchQuery}
@@ -2991,7 +3016,7 @@
             placeholder={t($language, '搜索文件或目录')}
             oninput={handleSearchInput}
           />
-        </div>
+        </form>
       {:else}
         <div class="page-context"></div>
       {/if}
@@ -4714,6 +4739,16 @@
     border-radius: var(--radius-pill);
     background: var(--surface-2);
     color: var(--text-2);
+  }
+
+  .search-submit {
+    display: grid;
+    flex: 0 0 auto;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    place-items: center;
   }
 
   .search:focus-within {

@@ -939,3 +939,37 @@ async fn usage_delta_updates_cached_snapshot() {
     app.state.adjust_usage(1, -1000);
     assert_eq!(app.state.usage_cache.lock().get(&1).unwrap().used_bytes, 0);
 }
+
+#[tokio::test]
+async fn unified_search_unions_roots_without_duplicates() {
+    let app = setup_app().await;
+    std::fs::write(app.home.join("alpha-note.txt"), b"alpha").unwrap();
+    std::fs::write(app.home.join("beta-note.txt"), b"beta").unwrap();
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    let root = app
+        .state
+        .db
+        .list_roots(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let base = root.real_path.trim_end_matches(['/', '\\']);
+    let ranges = vec![
+        (format!("{base}/"), format!("{base}0")),
+        // Overlapping sub-root must not duplicate results.
+        (format!("{base}/"), format!("{base}0")),
+    ];
+    let entries = app
+        .state
+        .db
+        .search_entries_all("note", ranges, true, 20, Default::default())
+        .await
+        .unwrap();
+    let mut names: Vec<_> = entries.into_iter().map(|entry| entry.name).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names, vec!["alpha-note.txt", "beta-note.txt"]);
+}

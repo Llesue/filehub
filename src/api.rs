@@ -80,6 +80,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/index", post(crate::search::index))
         .route("/index/status", get(crate::search::index_status))
         .route("/search", get(crate::search::search))
+        .route("/search/all", get(crate::search::search_all))
         .route("/usage", get(crate::usage::usage))
         .route("/file/probe", get(crate::editor::probe))
         .route("/file", get(crate::editor::read).put(crate::editor::save))

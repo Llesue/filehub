@@ -271,6 +271,7 @@ export interface SearchEntry {
   mime_type?: string;
   has_preview?: boolean;
   rootId?: number;
+  root_id?: number;
 }
 
 export interface DeletePreview {
@@ -1238,6 +1239,34 @@ export const api = {
   }> {
     const parameters = new URLSearchParams({ root: String(root), path });
     return request(`/index/status?${parameters.toString()}`, { signal });
+  },
+
+  searchAll(
+    query: string,
+    limit = 200,
+    signal?: AbortSignal,
+    filters: {
+      kind?: string;
+      minSize?: number;
+      maxSize?: number;
+      modifiedAfter?: number;
+      modifiedBefore?: number;
+      isDir?: boolean;
+    } = {},
+  ): Promise<{ entries: SearchEntry[] }> {
+    const parameters = new URLSearchParams({ q: query, limit: String(limit) });
+    if (filters.kind) parameters.set('kind', filters.kind);
+    if (filters.minSize !== undefined) parameters.set('min_size', String(filters.minSize));
+    if (filters.maxSize !== undefined) parameters.set('max_size', String(filters.maxSize));
+    if (filters.modifiedAfter !== undefined) {
+      parameters.set('modified_after', String(filters.modifiedAfter));
+    }
+    if (filters.modifiedBefore !== undefined) {
+      parameters.set('modified_before', String(filters.modifiedBefore));
+    }
+    return request<{ entries: SearchEntry[] }>(`/search/all?${parameters.toString()}`, {
+      signal,
+    });
   },
 
   search(

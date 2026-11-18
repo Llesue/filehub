@@ -2697,6 +2697,124 @@ impl Db {
         .await
     }
 
+    /// Searches all accessible roots in one FTS pass with unioned path ranges.
+    /// This prevents a root with few matches from scanning the whole FTS set on
+    /// its own, which is the main source of multi-second searches.
+    pub async fn search_entries_all(
+        &self,
+        query: &str,
+        root_ranges: Vec<(String, String)>,
+        show_hidden: bool,
+        limit: i64,
+        filters: IndexSearchFilters,
+    ) -> anyhow::Result<Vec<IndexEntry>> {
+        if root_ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = query.to_owned();
+        self.call(move |connection| {
+            let limit = limit.clamp(1, 500);
+            let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
+            let mut sql = String::from(
+                "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, \
+                        e.mime_type, e.has_preview, e.is_hidden \
+                 FROM index_fts JOIN index_entries e ON e.id = index_fts.rowid \
+                 JOIN indexed_dirs d ON d.id = e.dir_id \
+                 WHERE index_fts MATCH ?1 AND (",
+            );
+            let mut params: Vec<rusqlite::types::Value> =
+                vec![rusqlite::types::Value::Text(fts_query)];
+            let mut index = 2;
+            for (position, (start, end)) in root_ranges.iter().enumerate() {
+                if position > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str(&format!(
+                    "(e.real_path >= ?{index} AND e.real_path < ?{})",
+                    index + 1
+                ));
+                params.push(rusqlite::types::Value::Text(start.clone()));
+                params.push(rusqlite::types::Value::Text(end.clone()));
+                index += 2;
+            }
+            sql.push_str(&format!(
+                ") AND (?{index} = 1 OR e.name NOT LIKE '.%') \
+                 AND (?{next} IS NULL OR e.size >= ?{next}) \
+                 AND (?{after} IS NULL OR e.size <= ?{after}) \
+                 AND (?{mtime_after} IS NULL OR e.mtime >= ?{mtime_after}) \
+                 AND (?{mtime_before} IS NULL OR e.mtime <= ?{mtime_before}) \
+                 AND (?{is_dir} IS NULL OR e.is_dir = ?{is_dir}) \
+                 AND (?{mime} IS NULL OR e.mime_type LIKE ?{mime}) \
+                 LIMIT ?{limit_param}",
+                next = index + 1,
+                after = index + 2,
+                mtime_after = index + 3,
+                mtime_before = index + 4,
+                is_dir = index + 5,
+                mime = index + 6,
+                limit_param = index + 7,
+            ));
+            // The format above uses `?{index}` at the start and named offsets;
+            // push values in the same order.
+            params.push(rusqlite::types::Value::Integer(show_hidden as i64));
+            params.push(
+                filters
+                    .min_size
+                    .map(|value| rusqlite::types::Value::Integer(value.min(i64::MAX as u64) as i64))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .max_size
+                    .map(|value| rusqlite::types::Value::Integer(value.min(i64::MAX as u64) as i64))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .modified_after
+                    .map(rusqlite::types::Value::Integer)
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .modified_before
+                    .map(rusqlite::types::Value::Integer)
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .is_dir
+                    .map(|value| rusqlite::types::Value::Integer(value as i64))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .mime_prefix
+                    .clone()
+                    .map(rusqlite::types::Value::Text)
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(rusqlite::types::Value::Integer(limit));
+
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(IndexEntry {
+                    name: row.get(0)?,
+                    real_path: row.get(1)?,
+                    is_dir: row.get::<_, i64>(2)? != 0,
+                    size: row.get(3)?,
+                    mtime: row.get(4)?,
+                    created_at: row.get(5)?,
+                    mime_type: row.get(6)?,
+                    has_preview: row.get::<_, i64>(7)? != 0,
+                    is_hidden: row.get::<_, i64>(8)? != 0,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
     pub async fn search_entries(
         &self,
         query: &str,
