@@ -77,6 +77,9 @@ export interface ListResponse {
   read_only_reason?: 'policy' | 'filesystem' | null;
   entries: Entry[];
   next_cursor: string | null;
+  focus_index?: number;
+  focus_offset?: number;
+  total?: number;
 }
 
 export interface UploadCreated {
@@ -416,6 +419,7 @@ export const api = {
     cursor?: string,
     limit = 200,
     signal?: AbortSignal,
+    focus?: string,
   ): Promise<ListResponse> {
     const query = new URLSearchParams({
       root: String(root),
@@ -426,6 +430,7 @@ export const api = {
       limit: String(limit),
     });
     if (cursor) query.set('cursor', cursor);
+    if (focus) query.set('focus', focus);
     return request<ListResponse>(`/list?${query.toString()}`, { signal });
   },
 

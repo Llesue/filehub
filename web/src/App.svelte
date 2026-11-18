@@ -122,6 +122,7 @@
   let virtualPadTop = $state(0);
   let virtualPadBottom = $state(0);
   let nextCursor = $state<string | null>(null);
+  let focusPage = $state<{ offset: number; total: number } | null>(null);
   let filesError = $state('');
 
   let fileInput = $state<HTMLInputElement | null>(null);
@@ -870,7 +871,7 @@
     });
   }
 
-  async function loadList(rootId: number, path: string): Promise<void> {
+  async function loadList(rootId: number, path: string, focus?: string): Promise<boolean> {
     const generation = ++listGeneration;
     listAbort?.abort();
     loadMoreAbort?.abort();
@@ -878,6 +879,7 @@
     dirSizeGeneration += 1;
     const controller = new AbortController();
     listAbort = controller;
+    focusPage = null;
     if (
       viewRootId !== null &&
       (viewRootId !== rootId || viewPath !== path)
@@ -920,8 +922,9 @@
         undefined,
         200,
         controller.signal,
+        focus,
       );
-      if (generation !== listGeneration || controller.signal.aborted) return;
+      if (generation !== listGeneration || controller.signal.aborted) return false;
       activeRootId = result.root.id;
       currentPath = result.path;
       viewRootId = result.root.id;
@@ -933,8 +936,22 @@
       entries = result.entries;
       nextCursor = result.next_cursor;
       loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration, true);
-      selected = [];
-      selectionAnchor = null;
+      if (focus && typeof result.focus_index === 'number') {
+        const offset = result.focus_offset ?? 0;
+        const pageStart = offset - result.focus_index;
+        focusPage =
+          pageStart > 0
+            ? {
+                offset,
+                total: result.total ?? result.entries.length,
+              }
+            : null;
+        selected = [focus];
+        selectionAnchor = focus;
+      } else {
+        selected = [];
+        selectionAnchor = null;
+      }
       const viewKey = `view:${result.root.id}:${result.path}`;
       const sortKey = `sort:${result.root.id}:${result.path}`;
       try {
@@ -971,9 +988,12 @@
       void loadUsage();
       await tick();
       if (pathElement) pathElement.scrollLeft = pathElement.scrollWidth;
+      return true;
     } catch (error) {
-      if (isAbortError(error)) return;
+      if (isAbortError(error)) return false;
+      if (focus && error instanceof ApiError && error.status === 404) return false;
       handleFilesError(error);
+      return false;
     } finally {
       if (generation === listGeneration) {
         filesLoading = false;
@@ -1553,7 +1573,15 @@
         ? entry.path.slice(0, entry.path.lastIndexOf('/'))
         : '';
       void (async () => {
-        await loadList(root, parent);
+        const located = await loadList(root, parent, entry.name);
+        if (!located) {
+          showToast(t($language, '文件可能已被移动或删除，已刷新目录'));
+          void api.index(root, parent, false, csrf).catch((error) => {
+            console.warn('failed to refresh directory index', error);
+          });
+          await loadList(root, parent);
+          return;
+        }
         selected = [entry.name];
         selectionAnchor = entry.name;
         await tick();
@@ -3523,6 +3551,25 @@
                   </button>
                 </div>
               {:else}
+                {#if focusPage}
+                  <div class="focus-banner" role="status">
+                    <span
+                      >{t($language, '已定位到第 {index} 项，共 {total} 项', {
+                        index: focusPage.offset + 1,
+                        total: focusPage.total,
+                      })}</span
+                    >
+                    <button
+                      type="button"
+                      class="ghost"
+                      onclick={() => {
+                        if (activeRootId !== null) void loadList(activeRootId, currentPath);
+                      }}
+                    >
+                      {t($language, '回到目录开头')}
+                    </button>
+                  </div>
+                {/if}
                 {#if entries.length === 0}
                   <section class="empty-state" aria-labelledby="empty-title">
                     <div class="empty-icon">
@@ -4983,6 +5030,20 @@
 
   .content-drag.file-area {
     user-select: none;
+  }
+
+  .focus-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 13px;
   }
 
   .browser {

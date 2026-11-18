@@ -207,11 +207,13 @@ paths:
       summary: 目录列表
       description: |
         响应包含 `read_only` 与 `read_only_reason`。`read_only_reason` 为 `policy`（root 或可信链接配置只读）或 `filesystem`（服务进程没有当前目录的写权限），两者皆无时为 `null`。写入只读目录返回 `403 PERMISSION_DENIED`（文件系统）或 `403 FORBIDDEN`（策略）。
+        传入 `focus` 时按当前排序定位该名称，返回目标所在页，并附带 `focus_index`、`focus_offset`、`total`；目标不存在返回 `404`。`focus` 不能与 `cursor` 同时使用。
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, schema: { type: string, default: '' } }
         - { name: sort, in: query, schema: { type: string, enum: [name, size, modified], default: name } }
         - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: asc } }
+        - { name: focus, in: query, schema: { type: string }, description: 定位文件并返回其所在页，不能与 cursor 同时使用 }
       responses:
         '200': { description: OK }
         '400': { $ref: '#/components/responses/Error' }
@@ -366,7 +368,7 @@ paths:
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, required: true, schema: { type: string } }
-        - { name: inline, in: query, schema: { type: boolean, default: false }, description: 图片/视频以 inline 展示；SVG 仍强制下载 }
+        - { name: inline, in: query, schema: { type: boolean, default: false }, description: 图片/视频以 inline 展示；SVG 仍强制下载；带 9 字节微信引子帧的 AAC 在 inline 时跳过后按 Range 映射返回 }
       responses:
         '200': { description: File }
         '206': { description: Partial content }

@@ -48,6 +48,25 @@ pub struct ListQuery {
     sizes: Option<bool>,
     limit: Option<usize>,
     cursor: Option<String>,
+    focus: Option<String>,
+}
+
+fn map_indexed_entry(entry: crate::db::IndexEntry, video_enabled: bool) -> fsops::Entry {
+    // Recompute preview support from the current settings so a stale indexed
+    // flag cannot keep requesting thumbnails that are now disabled.
+    let has_preview = !entry.is_dir && crate::thumbs::can_preview(&entry.name, video_enabled);
+    fsops::Entry {
+        name: entry.name,
+        is_dir: entry.is_dir,
+        is_symlink: false,
+        size: entry.size,
+        modified: entry.mtime,
+        created_at: entry.created_at,
+        mime_type: entry.mime_type,
+        has_preview,
+        symlink_state: None,
+        symlink_target: None,
+    }
 }
 
 pub async fn list(
@@ -101,6 +120,20 @@ pub async fn list(
     .await
     .unwrap_or((0, true));
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let focus = query
+        .focus
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if focus.is_some()
+        && query
+            .cursor
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Err(AppError::bad_request("cursor and focus cannot be combined"));
+    }
     let offset = query
         .cursor
         .as_deref()
@@ -113,56 +146,88 @@ pub async fn list(
         .transpose()?
         .unwrap_or(0);
 
-    if !sort_by_size
-        && !has_symlinks
-        && let Some((indexed_mtime, indexed_entries, has_more)) = state
+    if !sort_by_size && !has_symlinks {
+        if let Some(focus_name) = focus.as_deref() {
+            if let Some((indexed_mtime, focus_offset, total)) = state
+                .db
+                .locate_indexed_child(&real_path, focus_name, &sort, &order, show_hidden)
+                .await
+                .map_err(AppError::internal)?
+                && indexed_mtime == current_mtime
+            {
+                let page_start = focus_offset
+                    .saturating_sub(limit / 2)
+                    .min(total.saturating_sub(limit));
+                if let Some((page_mtime, indexed_entries, has_more)) = state
+                    .db
+                    .indexed_children_page(
+                        &real_path,
+                        &sort,
+                        &order,
+                        show_hidden,
+                        page_start,
+                        limit,
+                    )
+                    .await
+                    .map_err(AppError::internal)?
+                    && page_mtime == current_mtime
+                {
+                    let mut entries: Vec<fsops::Entry> = indexed_entries
+                        .into_iter()
+                        .map(|entry| map_indexed_entry(entry, video_enabled))
+                        .collect();
+                    if query.sizes.unwrap_or(false) {
+                        let (enriched, _) =
+                            enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
+                        entries = enriched;
+                    }
+                    let focus_index = focus_offset.saturating_sub(page_start);
+                    return Ok(Json(json!({
+                        "root": root_json(&resolved.root),
+                        "path": resolved.relative,
+                        "read_only": read_only_reason.is_some(),
+                        "read_only_reason": read_only_reason,
+                        "entries": entries,
+                        "next_cursor": has_more.then(|| (page_start + limit).to_string()),
+                        "focus_index": focus_index,
+                        "focus_offset": focus_offset,
+                        "total": total,
+                    })));
+                }
+            }
+            // The index is stale or does not know this name; the filesystem
+            // scan below is authoritative.
+        } else if let Some((indexed_mtime, indexed_entries, has_more)) = state
             .db
             .indexed_children_page(&real_path, &sort, &order, show_hidden, offset, limit)
             .await
             .map_err(AppError::internal)?
-    {
-        if indexed_mtime == current_mtime {
-            let mut entries: Vec<fsops::Entry> = indexed_entries
-                .into_iter()
-                .map(|entry| {
-                    // Recompute preview support from the current settings so a
-                    // stale indexed flag cannot keep requesting thumbnails
-                    // that are now disabled.
-                    let has_preview =
-                        !entry.is_dir && crate::thumbs::can_preview(&entry.name, video_enabled);
-                    fsops::Entry {
-                        name: entry.name,
-                        is_dir: entry.is_dir,
-                        is_symlink: false,
-                        size: entry.size,
-                        modified: entry.mtime,
-                        created_at: entry.created_at,
-                        mime_type: entry.mime_type,
-                        has_preview,
-                        symlink_state: None,
-                        symlink_target: None,
+        {
+            if indexed_mtime == current_mtime {
+                let mut entries: Vec<fsops::Entry> = indexed_entries
+                    .into_iter()
+                    .map(|entry| map_indexed_entry(entry, video_enabled))
+                    .collect();
+                if entries.is_empty() && offset == 0 {
+                    let _ = state.db.mark_index_stale(&real_path).await;
+                } else {
+                    if query.sizes.unwrap_or(false) {
+                        let (enriched, _) =
+                            enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
+                        entries = enriched;
                     }
-                })
-                .collect();
-            if entries.is_empty() && offset == 0 {
-                let _ = state.db.mark_index_stale(&real_path).await;
-            } else {
-                if query.sizes.unwrap_or(false) {
-                    let (enriched, _) =
-                        enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
-                    entries = enriched;
+                    return Ok(Json(json!({
+                        "root": root_json(&resolved.root),
+                        "path": resolved.relative,
+                        "read_only": read_only_reason.is_some(),
+                        "read_only_reason": read_only_reason,
+                        "entries": entries,
+                        "next_cursor": has_more.then(|| (offset + limit).to_string()),
+                    })));
                 }
-                return Ok(Json(json!({
-                    "root": root_json(&resolved.root),
-                    "path": resolved.relative,
-                    "read_only": read_only_reason.is_some(),
-                    "read_only_reason": read_only_reason,
-                    "entries": entries,
-                    "next_cursor": has_more.then(|| (offset + limit).to_string()),
-                })));
+            } else {
+                let _ = state.db.mark_index_stale(&real_path).await;
             }
-        } else {
-            let _ = state.db.mark_index_stale(&real_path).await;
         }
     }
 
@@ -187,7 +252,19 @@ pub async fn list(
         }
         enqueue_unknown_dir_sizes(&state, current.user.id, &resolved.absolute, unknown);
         let total = entries.len();
-        let entries: Vec<fsops::Entry> = entries.into_iter().skip(offset).take(limit).collect();
+        let (page_start, focus_index) = if let Some(focus_name) = focus.as_deref() {
+            let index = entries
+                .iter()
+                .position(|entry| entry.name == focus_name)
+                .ok_or(AppError::NotFound)?;
+            let start = index
+                .saturating_sub(limit / 2)
+                .min(total.saturating_sub(limit));
+            (start, Some(index - start))
+        } else {
+            (offset, None)
+        };
+        let entries: Vec<fsops::Entry> = entries.into_iter().skip(page_start).take(limit).collect();
         if settings.settings.index.auto_index_on_browse {
             schedule_browse_index(
                 &state,
@@ -198,14 +275,70 @@ pub async fn list(
             )
             .await;
         }
+        let mut payload = json!({
+            "root": root_json(&resolved.root),
+            "path": resolved.relative,
+            "read_only": read_only_reason.is_some(),
+            "read_only_reason": read_only_reason,
+            "entries": entries,
+            "next_cursor": (page_start.saturating_add(limit) < total)
+                .then(|| (page_start + limit).to_string()),
+        });
+        if let Some(focus_index) = focus_index {
+            payload["focus_index"] = json!(focus_index);
+            payload["focus_offset"] = json!(page_start + focus_index);
+            payload["total"] = json!(total);
+        }
+        return Ok(Json(payload));
+    }
+
+    if let Some(focus_name) = focus.as_deref() {
+        if !show_hidden {
+            all_entries.retain(|entry| !entry.name.starts_with('.'));
+        }
+        let total = all_entries.len();
+        let focus_offset = all_entries
+            .iter()
+            .position(|entry| entry.name == focus_name)
+            .ok_or(AppError::NotFound)?;
+        let page_start = focus_offset
+            .saturating_sub(limit / 2)
+            .min(total.saturating_sub(limit));
+        let mut entries: Vec<fsops::Entry> = all_entries
+            .into_iter()
+            .skip(page_start)
+            .take(limit)
+            .collect();
+        for entry in &mut entries {
+            entry.has_preview =
+                !entry.is_dir && crate::thumbs::can_preview(&entry.name, video_enabled);
+        }
+        if query.sizes.unwrap_or(false) {
+            let (enriched, _) = enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
+            entries = enriched;
+        }
+        if settings.settings.index.auto_index_on_browse {
+            schedule_browse_index(
+                &state,
+                current.user.id,
+                resolved.root.clone(),
+                resolved.relative.clone(),
+                real_path.clone(),
+            )
+            .await;
+        }
+        let focus_index = focus_offset - page_start;
         return Ok(Json(json!({
             "root": root_json(&resolved.root),
             "path": resolved.relative,
             "read_only": read_only_reason.is_some(),
-        "read_only_reason": read_only_reason,
+            "read_only_reason": read_only_reason,
             "entries": entries,
-            "next_cursor": (offset.saturating_add(limit) < total)
-                .then(|| (offset + limit).to_string()),
+            "next_cursor": (page_start.saturating_add(limit) < total)
+                .then(|| (page_start + limit).to_string()),
+            "focus_index": focus_index,
+            "focus_offset": focus_offset,
+            "total": total,
         })));
     }
 
@@ -437,7 +570,7 @@ pub(crate) async fn serve_file(
         return Ok(StatusCode::NOT_MODIFIED.into_response());
     }
 
-    let file = tokio::fs::File::open(absolute)
+    let mut file = tokio::fs::File::open(absolute)
         .await
         .map_err(fsops::io_error)?;
     let filename = absolute
@@ -446,6 +579,20 @@ pub(crate) async fn serve_file(
         .unwrap_or("download");
     let mime = mime_guess::from_path(absolute).first_or_octet_stream();
     let is_pdf = filename.to_ascii_lowercase().ends_with(".pdf");
+    // Some recorders (notably WeChat) prepend a tiny primer ADTS frame that
+    // Chrome treats as a fatal decode error. Inline playback skips it while
+    // downloads keep the original bytes untouched.
+    let aac_skip = if inline && filename.to_ascii_lowercase().ends_with(".aac") {
+        let mut head = [0_u8; 15];
+        let read = file
+            .read(&mut head)
+            .await
+            .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+        aac_primer_skip(&head[..read]).unwrap_or(0)
+    } else {
+        0
+    };
+    let effective_size = info.size.saturating_sub(aac_skip);
     // `image/svg+xml` reports its subtype as "svg", not "svg+xml". SVG must
     // never be served inline: opening the URL directly would render the
     // document and any embedded script in this origin.
@@ -463,7 +610,7 @@ pub(crate) async fn serve_file(
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| parse_range(value, info.size));
+        .and_then(|value| parse_range(value, effective_size));
 
     let content_type = if is_pdf {
         "application/pdf"
@@ -479,8 +626,7 @@ pub(crate) async fn serve_file(
 
     let response = if let Some((start, end)) = range {
         let length = end - start + 1;
-        let mut file = file;
-        file.seek(SeekFrom::Start(start))
+        file.seek(SeekFrom::Start(aac_skip + start))
             .await
             .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
         let reader = file.take(length);
@@ -488,7 +634,7 @@ pub(crate) async fn serve_file(
             .status(StatusCode::PARTIAL_CONTENT)
             .header(
                 header::CONTENT_RANGE,
-                format!("bytes {start}-{end}/{}", info.size),
+                format!("bytes {start}-{end}/{effective_size}"),
             )
             .header(header::CONTENT_LENGTH, length.to_string());
         builder
@@ -497,11 +643,14 @@ pub(crate) async fn serve_file(
     } else if headers.get(header::RANGE).is_some() {
         return Ok((
             StatusCode::RANGE_NOT_SATISFIABLE,
-            [(header::CONTENT_RANGE, format!("bytes */{}", info.size))],
+            [(header::CONTENT_RANGE, format!("bytes */{effective_size}"))],
         )
             .into_response());
     } else {
-        builder = builder.header(header::CONTENT_LENGTH, info.size.to_string());
+        file.seek(SeekFrom::Start(aac_skip))
+            .await
+            .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+        builder = builder.header(header::CONTENT_LENGTH, effective_size.to_string());
         builder
             .body(Body::from_stream(ReaderStream::new(file)))
             .map_err(|err| AppError::internal(anyhow::Error::from(err)))?
@@ -1316,6 +1465,29 @@ fn root_json(root: &Root) -> Value {
         "alias": root.alias,
         "read_only": root.read_only,
     })
+}
+
+/// Detects a tiny leading ADTS frame with no meaningful audio payload, as
+/// produced by some WeChat recordings. Returns the number of bytes to skip.
+fn aac_primer_skip(head: &[u8]) -> Option<u64> {
+    if head.len() < 9 || head[0] != 0xFF || (head[1] & 0xF0) != 0xF0 {
+        return None;
+    }
+    // ADTS layer bits must be 00.
+    if head[1] & 0x06 != 0 {
+        return None;
+    }
+    let header_len = if head[1] & 1 == 1 { 7 } else { 9 };
+    let frame_len =
+        (((head[3] & 3) as usize) << 11) | ((head[4] as usize) << 3) | ((head[5] as usize) >> 5);
+    if frame_len <= header_len || frame_len > header_len + 4 {
+        return None;
+    }
+    let next = frame_len;
+    if head.len() < next + 2 || head[next] != 0xFF || (head[next + 1] & 0xF0) != 0xF0 {
+        return None;
+    }
+    Some(frame_len as u64)
 }
 
 fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
@@ -2254,5 +2426,35 @@ fn join_relative(base: &str, name: &str) -> String {
         name.to_owned()
     } else {
         format!("{base}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aac_primer_skip;
+
+    #[test]
+    fn detects_wechat_aac_primer() {
+        let mut head = [0_u8; 15];
+        head[..9].copy_from_slice(&[0xFF, 0xF9, 0x60, 0x80, 0x01, 0x3F, 0xFC, 0x00, 0x00]);
+        head[9..11].copy_from_slice(&[0xFF, 0xF1]);
+        assert_eq!(aac_primer_skip(&head), Some(9));
+    }
+
+    #[test]
+    fn ignores_normal_aac_and_garbage() {
+        let mut head = [0_u8; 15];
+        head[..7].copy_from_slice(&[0xFF, 0xF1, 0x60, 0x40, 0x0D, 0x1F, 0xFC]);
+        assert_eq!(aac_primer_skip(&head), None);
+        assert_eq!(aac_primer_skip(&[0_u8; 4]), None);
+        assert_eq!(aac_primer_skip(b"not aac data"), None);
+    }
+
+    #[test]
+    fn requires_a_valid_following_frame() {
+        let mut head = [0_u8; 15];
+        head[..9].copy_from_slice(&[0xFF, 0xF9, 0x60, 0x80, 0x01, 0x3F, 0xFC, 0x00, 0x00]);
+        head[9..11].copy_from_slice(b"xx");
+        assert_eq!(aac_primer_skip(&head), None);
     }
 }

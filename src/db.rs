@@ -347,6 +347,34 @@ fn name_bigrams(name: &str) -> Vec<String> {
     grams
 }
 
+#[allow(clippy::too_many_arguments)]
+fn locate_child_offset(
+    connection: &Connection,
+    dir_id: i64,
+    show_hidden: bool,
+    is_dir: i64,
+    key_column: &str,
+    comparison: &str,
+    key_value: rusqlite::types::Value,
+    target_name: &str,
+    total: i64,
+    mtime_ns: i64,
+) -> rusqlite::Result<Option<(i64, usize, usize)>> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM index_entries \
+         WHERE dir_id = ?1 AND (?2 = 1 OR name NOT LIKE '.%') AND (\
+           is_dir > ?3 \
+           OR (is_dir = ?3 AND {key_column} {comparison} ?4) \
+           OR (is_dir = ?3 AND {key_column} = ?4 AND name COLLATE NOCASE {comparison} ?5))"
+    );
+    let offset: i64 = connection.query_row(
+        &sql,
+        params![dir_id, show_hidden as i64, is_dir, key_value, target_name],
+        |row| row.get(0),
+    )?;
+    Ok(Some((mtime_ns, offset as usize, total as usize)))
+}
+
 #[derive(Debug, Clone)]
 pub struct DbStats {
     pub page_count: i64,
@@ -2661,6 +2689,90 @@ impl Db {
             })?;
             let entries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(Some((mtime_ns, entries)))
+        })
+        .await
+    }
+
+    /// Returns `(mtime_ns, offset, total)` for a named child in a fresh
+    /// indexed directory, using the same ordering as [`Self::indexed_children_page`].
+    pub async fn locate_indexed_child(
+        &self,
+        dir_path: &str,
+        name: &str,
+        sort: &str,
+        order: &str,
+        show_hidden: bool,
+    ) -> anyhow::Result<Option<(i64, usize, usize)>> {
+        let dir_path = dir_path.to_owned();
+        let name = name.to_owned();
+        let sort = sort.to_owned();
+        let order = order.to_owned();
+        self.call(move |connection| {
+            let dir = connection
+                .query_row(
+                    "SELECT id, mtime_ns FROM indexed_dirs WHERE real_path = ?1 AND status = 'ready'",
+                    params![dir_path],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((dir_id, mtime_ns)) = dir else {
+                return Ok(None);
+            };
+            let target = connection
+                .query_row(
+                    "SELECT is_dir, size, mtime, name FROM index_entries \
+                     WHERE dir_id = ?1 AND name = ?2 AND (?3 = 1 OR name NOT LIKE '.%')",
+                    params![dir_id, name, show_hidden as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((is_dir, size, mtime, target_name)) = target else {
+                return Ok(None);
+            };
+            let total: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM index_entries \
+                 WHERE dir_id = ?1 AND (?2 = 1 OR name NOT LIKE '.%')",
+                params![dir_id, show_hidden as i64],
+                |row| row.get(0),
+            )?;
+            let reverse = if order.eq_ignore_ascii_case("desc") {
+                ">"
+            } else {
+                "<"
+            };
+            let (key_column, key_value) = match sort.as_str() {
+                "size" => (
+                    "size",
+                    rusqlite::types::Value::Integer(size),
+                ),
+                "modified" => (
+                    "mtime",
+                    rusqlite::types::Value::Integer(mtime),
+                ),
+                _ => (
+                    "name COLLATE NOCASE",
+                    rusqlite::types::Value::Text(target_name.clone()),
+                ),
+            };
+            locate_child_offset(
+                connection,
+                dir_id,
+                show_hidden,
+                is_dir,
+                key_column,
+                reverse,
+                key_value,
+                &target_name,
+                total,
+                mtime_ns,
+            )
         })
         .await
     }

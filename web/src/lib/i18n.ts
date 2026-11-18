@@ -676,6 +676,10 @@ const en: Record<string, string> = {
     'The server process does not have access (filesystem permissions)',
   操作被拒绝: 'Operation denied',
   '已跳过 {count} 张过大的图片': 'Skipped {count} oversized image(s)',
+  '已定位到第 {index} 项，共 {total} 项': 'Located item {index} of {total}',
+  回到目录开头: 'Back to start',
+  '文件可能已被移动或删除，已刷新目录':
+    'The file may have been moved or deleted; the directory was refreshed',
   '目录已设为只读': 'This folder is configured as read-only',
   '目录已设为只读，无法保存': 'This folder is configured as read-only; saving is disabled',
 };

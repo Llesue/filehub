@@ -1019,3 +1019,121 @@ async fn two_character_chinese_search_uses_bigrams() {
         .unwrap();
     assert!(entries.iter().any(|entry| entry.name.contains("手机照片")));
 }
+
+#[tokio::test]
+async fn list_focus_returns_the_page_containing_the_file() {
+    let app = setup_app().await;
+    let big = app.home.join("big");
+    std::fs::create_dir_all(big.join("aaa-dir")).unwrap();
+    for index in 0..450 {
+        std::fs::write(big.join(format!("file-{index:04}.txt")), b"x").unwrap();
+    }
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/api/v1/list?root={}&path=big&sort=name&focus=file-0325.txt&limit=100",
+            app.root_id
+        ),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let focus_index = body["focus_index"].as_u64().unwrap() as usize;
+    assert_eq!(body["focus_offset"], 326);
+    assert_eq!(body["total"], 451);
+    assert_eq!(body["entries"][focus_index]["name"], "file-0325.txt");
+    assert!(focus_index < 100);
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/api/v1/list?root={}&path=big&sort=name&order=desc&focus=file-0325.txt&limit=100",
+            app.root_id
+        ),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let focus_index = body["focus_index"].as_u64().unwrap() as usize;
+    assert_eq!(body["focus_offset"], 125);
+    assert_eq!(body["entries"][focus_index]["name"], "file-0325.txt");
+
+    // Size sorting bypasses the index and must locate on the filesystem.
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/api/v1/list?root={}&path=big&sort=size&focus=file-0325.txt&limit=100",
+            app.root_id
+        ),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let focus_index = body["focus_index"].as_u64().unwrap() as usize;
+    assert_eq!(body["entries"][focus_index]["name"], "file-0325.txt");
+}
+
+#[tokio::test]
+async fn list_focus_missing_file_returns_404() {
+    let app = setup_app().await;
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/list?root={}&path=&focus=missing.txt", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn inline_aac_skips_wechat_primer_frame_and_maps_ranges() {
+    let app = setup_app().await;
+    let mut data = vec![0xFF, 0xF9, 0x60, 0x80, 0x01, 0x3F, 0xFC, 0x00, 0x00];
+    data.extend_from_slice(&[0xFF, 0xF1, 0x60, 0x40, 0x0D, 0x1F, 0xFC]);
+    data.extend_from_slice(b"abcdefghij");
+    std::fs::write(app.home.join("wechat.aac"), &data).unwrap();
+    let uri = format!(
+        "/api/v1/download?root={}&path=wechat.aac&inline=true",
+        app.root_id
+    );
+
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/aac");
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "17");
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(&body[..], &data[9..]);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(&uri)
+        .header(header::COOKIE, &app.cookie)
+        .header(header::RANGE, "bytes=0-3")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 0-3/17");
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(&body[..], &data[9..13]);
+
+    let plain = format!("/api/v1/download?root={}&path=wechat.aac", app.root_id);
+    let response = send(&app.router, Method::GET, &plain, Some(&app.cookie), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(&body[..], &data[..]);
+}
