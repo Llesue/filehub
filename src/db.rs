@@ -54,6 +54,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         24,
         include_str!("../migrations/0024_search_and_cache_indexes.sql"),
     ),
+    (
+        25,
+        include_str!("../migrations/0025_drop_short_search_index.sql"),
+    ),
 ];
 
 pub fn unix_now() -> i64 {
@@ -881,6 +885,56 @@ impl Db {
                 })
             })?;
             rows.collect()
+        })
+        .await
+    }
+
+    pub async fn prune_audit_batch(
+        &self,
+        retention_days: u64,
+        max_rows: u64,
+        limit: usize,
+    ) -> anyhow::Result<usize> {
+        let limit = limit.clamp(1, 5000) as i64;
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let mut removed = 0_usize;
+            if retention_days > 0 {
+                let cutoff = unix_now() - (retention_days.min(36_500) as i64) * 86_400;
+                removed += transaction.execute(
+                    "DELETE FROM audit_logs WHERE id IN (\
+                       SELECT id FROM audit_logs WHERE created_at < ?1 LIMIT ?2)",
+                    params![cutoff, limit],
+                )?;
+            }
+            if max_rows > 0 && removed < limit as usize {
+                let remaining = limit - removed as i64;
+                removed += transaction.execute(
+                    "DELETE FROM audit_logs WHERE id IN (\
+                       SELECT id FROM audit_logs WHERE id <= (\
+                         SELECT id FROM audit_logs ORDER BY id DESC LIMIT 1 OFFSET ?1\
+                       ) LIMIT ?2)",
+                    params![max_rows.min(i64::MAX as u64) as i64, remaining],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn prune_directory_sizes_batch(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> anyhow::Result<usize> {
+        let limit = limit.clamp(1, 5000) as i64;
+        self.call(move |connection| {
+            connection.execute(
+                "DELETE FROM directory_sizes WHERE rowid IN (\
+                   SELECT rowid FROM directory_sizes WHERE updated_at < ?1 LIMIT ?2)",
+                params![before, limit],
+            )
         })
         .await
     }
@@ -2717,11 +2771,11 @@ impl Db {
                     entries.push(entry?);
                 }
             } else {
-                // FTS trigram needs at least three characters. For shorter
-                // queries use a case-insensitive prefix so the dedicated name
-                // index can serve the request instead of scanning every row.
+                // FTS trigram needs at least three characters. Keep substring
+                // semantics for short queries; a prefix-only fallback silently
+                // missed matches that were not at the start of the name.
                 let pattern = format!(
-                    "{}%",
+                    "%{}%",
                     query
                         .replace('\\', "\\\\")
                         .replace('%', "\\%")

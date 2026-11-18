@@ -968,6 +968,19 @@ export const api = {
     }).then((value) => value.jobs);
   },
 
+  cancelThumbScope(
+    root: number,
+    path: string,
+    scope: 'dir' | 'file',
+    csrf: string,
+  ): Promise<{ cancelled: number }> {
+    return request<{ cancelled: number }>(
+      '/thumb/cancel',
+      { method: 'POST', body: JSON.stringify({ root, path, scope }) },
+      csrf,
+    );
+  },
+
   imageInfo(
     root: number,
     path: string,

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { api, type AdminRoot, type ServerPath, type SettingsResponse, type User } from '../api';
   import { branding, brandMark, loadBranding } from '../branding';
@@ -41,6 +41,7 @@
   let editingPathAlias = $state('');
   let editingPathOriginal = $state('');
   let savingPathId = $state<number | null>(null);
+  let pathAliasInput = $state<HTMLInputElement | null>(null);
 
   function password(): string {
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%';
@@ -217,10 +218,13 @@
     onRootsChanged?.();
   }
 
-  function beginPathAlias(path: ServerPath): void {
+  async function beginPathAlias(path: ServerPath): Promise<void> {
     editingPathId = path.id;
     editingPathAlias = path.alias;
     editingPathOriginal = path.alias;
+    await tick();
+    pathAliasInput?.focus();
+    pathAliasInput?.select();
   }
 
   async function finishPathAlias(): Promise<void> {
@@ -402,7 +406,10 @@
       markSettingState(key, 'error', t($language, '数值超出允许范围'));
       return;
     }
-    queueSetting(key, Math.round(value * scale));
+    const next = Math.round(value * scale);
+    const current = Number(setting(key));
+    if (Number.isFinite(current) && current === next) return;
+    queueSetting(key, next);
   }
 
   let defaultQuotaGb = $state(15);
@@ -735,6 +742,7 @@
           {#if editingPathId === path.id}
             <div class="path-alias-form">
               <input
+                bind:this={pathAliasInput}
                 bind:value={editingPathAlias}
                 aria-label={t($language, '外部路径别名')}
                 onblur={() => void finishPathAlias()}

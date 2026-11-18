@@ -90,6 +90,8 @@
   let currentPath = $state('');
   let currentReadOnly = $state(false);
   let currentReadOnlyReason = $state<'policy' | 'filesystem' | null>(null);
+  let viewRootId = $state<number | null>(null);
+  let viewPath = $state('');
   let pathElement = $state<HTMLElement | null>(null);
   let clock = $state(Date.now());
   let entries = $state<Entry[]>([]);
@@ -133,6 +135,8 @@
   let searchResults = $state<SearchEntry[]>([]);
   let searchActive = $state(false);
   let searchIndexing = $state(false);
+  let searchLoading = $state(false);
+  let searchTooShort = $state(false);
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   let searchInput = $state<HTMLInputElement | null>(null);
   let searchFiltersOpen = $state(false);
@@ -800,6 +804,8 @@
       roots = [];
       entries = [];
       currentPath = '';
+      viewRootId = null;
+      viewPath = '';
       currentReadOnly = false;
       selected = [];
       activeRootId = null;
@@ -818,6 +824,8 @@
       if (!next) {
         activeRootId = null;
         currentPath = '';
+        viewRootId = null;
+        viewPath = '';
         currentReadOnly = false;
         currentReadOnlyReason = null;
         entries = [];
@@ -852,6 +860,16 @@
     }
   }
 
+  function cancelThumbScope(
+    rootId: number,
+    path: string,
+    scope: 'dir' | 'file',
+  ): void {
+    void api.cancelThumbScope(rootId, path, scope, csrf).catch((error) => {
+      console.warn('cancel thumbnail scope failed', error);
+    });
+  }
+
   async function loadList(rootId: number, path: string): Promise<void> {
     const generation = ++listGeneration;
     listAbort?.abort();
@@ -860,6 +878,12 @@
     dirSizeGeneration += 1;
     const controller = new AbortController();
     listAbort = controller;
+    if (
+      viewRootId !== null &&
+      (viewRootId !== rootId || viewPath !== path)
+    ) {
+      cancelThumbScope(viewRootId, viewPath, 'dir');
+    }
     const refreshing = activeRootId === rootId && currentPath === path && entries.length > 0;
     filesLoading = !refreshing;
     filesRefreshing = refreshing;
@@ -899,6 +923,8 @@
       if (generation !== listGeneration || controller.signal.aborted) return;
       activeRootId = result.root.id;
       currentPath = result.path;
+      viewRootId = result.root.id;
+      viewPath = result.path;
       currentReadOnly = result.read_only;
       currentReadOnlyReason = result.read_only
         ? (result.read_only_reason ?? 'policy')
@@ -1352,9 +1378,26 @@
     const query = searchQuery.trim();
     if (!query || activeRootId === null) {
       searchActive = false;
+      searchLoading = false;
+      searchTooShort = false;
       searchResults = [];
       return;
     }
+    const length = Array.from(query).length;
+    const asciiOnly = Array.from(query).every((character) => (character.codePointAt(0) ?? 0) < 128);
+    if (length < 2 || (asciiOnly && length < 3)) {
+      searchAbort?.abort();
+      searchActive = true;
+      searchLoading = false;
+      searchIndexing = false;
+      searchTooShort = true;
+      searchResults = [];
+      return;
+    }
+    searchTooShort = false;
+    searchActive = true;
+    searchLoading = true;
+    searchResults = [];
 
     searchTimer = setTimeout(() => {
       void runSearch(query);
@@ -1432,6 +1475,7 @@
     searchAbort?.abort();
     const controller = new AbortController();
     searchAbort = controller;
+    searchLoading = true;
 
     const collect = async (): Promise<SearchEntry[]> => {
       const indexing: Promise<void>[] = [];
@@ -1472,7 +1516,9 @@
       if (token !== searchToken || controller.signal.aborted) return;
       searchResults = results.slice(0, 200);
       searchActive = true;
+      searchLoading = false;
     } catch (error) {
+      if (token === searchToken) searchLoading = false;
       if (token === searchToken && !isAbortError(error)) handleFilesError(error);
     }
   }
@@ -1482,6 +1528,7 @@
     if (root === null) return;
 
     searchActive = false;
+    searchLoading = false;
     searchQuery = '';
     searchResults = [];
 
@@ -1533,6 +1580,7 @@
     searchAbort?.abort();
     if (searchTimer) clearTimeout(searchTimer);
     searchActive = false;
+    searchLoading = false;
     searchQuery = '';
     searchResults = [];
     searchIndexing = false;
@@ -3329,6 +3377,9 @@
                 <div class="search-header">
                   <span>{t($language, '搜索')} “{searchQuery}”</span>
                   <div class="search-header-actions">
+                    {#if searchLoading}
+                      <span class="muted">{t($language, '搜索中…')}</span>
+                    {/if}
                     {#if searchIndexing}
                       <span class="muted">{t($language, '索引中…')}</span>
                     {/if}
@@ -3392,7 +3443,13 @@
                   </div>
                 {/if}
                 {#if searchResults.length === 0}
-                  <div class="files-state">{t($language, '没有找到匹配的文件')}</div>
+                  <div class="files-state">
+                    {searchLoading
+                      ? t($language, '搜索中…')
+                      : searchTooShort
+                        ? t($language, '请输入至少 2 个字符（纯英文至少 3 个）')
+                        : t($language, '没有找到匹配的文件')}
+                  </div>
                 {:else}
                   <div class="search-results">
                     {#each searchResults as result (result.path)}
@@ -4116,8 +4173,20 @@
       {currentPath}
       items={preview.items}
       index={preview.index}
-      onClose={() => (preview = null)}
-      onIndexChange={(index) => (preview = preview ? { ...preview, index } : null)}
+      onClose={() => {
+        const entry = preview ? preview.items[preview.index] : undefined;
+        if (entry && activeRootId !== null) {
+          cancelThumbScope(activeRootId, joinPath(currentPath, entry.name), 'file');
+        }
+        preview = null;
+      }}
+      onIndexChange={(index) => {
+        const previous = preview ? preview.items[preview.index] : undefined;
+        if (previous && activeRootId !== null) {
+          cancelThumbScope(activeRootId, joinPath(currentPath, previous.name), 'file');
+        }
+        preview = preview ? { ...preview, index } : null;
+      }}
       previewEdge={systemFeatures.preview_edge ?? 2048}
       onEditSource={(entry) => {
         preview = null;

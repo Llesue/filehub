@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
@@ -156,28 +157,45 @@ pub async fn status(
     let jobs = state.jobs.summary();
     let status_started = std::time::Instant::now();
     let started = std::time::Instant::now();
-    let job_counts = state.db.job_counts().await.map_err(AppError::internal)?;
+    let job_counts = tokio::time::timeout(Duration::from_millis(300), state.db.job_counts())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
     let jobs_ms = started.elapsed().as_millis();
     let directory_sizes = state.cached_directory_size_counts();
     state.schedule_directory_size_counts_refresh();
     let sizes_ms = 0_u128;
     let started = std::time::Instant::now();
-    let stats = state.db.stats().await.map_err(AppError::internal)?;
+    let stats = tokio::time::timeout(Duration::from_millis(300), state.db.stats())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(crate::db::DbStats {
+            page_count: 0,
+            page_size: 0,
+            freelist_count: 0,
+            wal_bytes: 0,
+        });
     let stats_ms = started.elapsed().as_millis();
     let slow_requests = state.recent_slow_requests();
     let settings = state.settings();
-    let last_quick_scan = state
-        .db
-        .runtime_state_get("index.last_quick_scan")
-        .await
-        .ok()
-        .flatten();
-    let last_full_scan = state
-        .db
-        .runtime_state_get("index.last_full_scan")
-        .await
-        .ok()
-        .flatten();
+    let last_quick_scan = tokio::time::timeout(
+        Duration::from_millis(300),
+        state.db.runtime_state_get("index.last_quick_scan"),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten();
+    let last_full_scan = tokio::time::timeout(
+        Duration::from_millis(300),
+        state.db.runtime_state_get("index.last_full_scan"),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten();
     let total_ms = status_started.elapsed().as_millis();
     if total_ms >= 500 {
         tracing::warn!(jobs_ms, sizes_ms, stats_ms, "slow admin status queries");

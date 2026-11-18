@@ -59,6 +59,8 @@ pub struct Job {
     pub kind: String,
     #[serde(skip)]
     key: String,
+    #[serde(skip)]
+    cancel_scope: Option<String>,
     pub status: String,
     pub progress: usize,
     pub total: usize,
@@ -73,11 +75,20 @@ pub struct Job {
 
 impl Job {
     pub(crate) fn from_record(record: JobRecord) -> Self {
+        let cancel_scope = serde_json::from_str::<Value>(&record.payload)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("cancel_scope")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
         Self {
             id: record.id,
             user_id: record.user_id,
             kind: record.kind,
             key: record.job_key,
+            cancel_scope,
             status: record.status,
             progress: record.progress.max(0) as usize,
             total: record.total.max(0) as usize,
@@ -743,6 +754,34 @@ impl JobManager {
                     .unwrap_or_else(|| Job::from_record(record))
             })
             .collect())
+    }
+
+    /// Cancels queued thumbnail jobs for a view scope (and optionally running
+    /// preview jobs). Thumbnails are cache artifacts; dropping a queued job is
+    /// safe and lets a newly opened directory take the workers immediately.
+    pub fn cancel_thumbnail_scope(&self, scope: &str, include_running: bool) -> usize {
+        let targets: Vec<(String, String, String)> = {
+            let inner = self.inner.lock();
+            inner
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.kind == JobKind::Thumbnail.as_str()
+                        && job.cancel_scope.as_deref() == Some(scope)
+                        && (job.status == "queued" || (include_running && job.status == "running"))
+                })
+                .map(|job| (job.id.clone(), job.key.clone(), job.status.clone()))
+                .collect()
+        };
+        let count = targets.len();
+        for (id, key, _status) in targets {
+            let token = self.inner.lock().cancel.get(&id).cloned();
+            if let Some(token) = token {
+                token.cancel();
+            }
+            self.remove_active(&id, JobKind::Thumbnail, &key);
+        }
+        count
     }
 
     pub async fn cancel(&self, id: &str, user_id: i64, is_admin: bool) -> Result<Job, AppError> {

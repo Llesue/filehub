@@ -88,6 +88,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/fs/image-info", get(crate::thumbs::image_info))
         .route("/thumb/status", get(crate::thumbs::status))
         .route("/thumb/retry", post(crate::thumbs::retry))
+        .route("/thumb/cancel", post(crate::thumbs::cancel_scope))
         .route("/cmd", post(crate::cmdrunner::run))
         .route("/terminal/ws", get(crate::terminal_ws::websocket))
         .route(

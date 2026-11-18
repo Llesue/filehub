@@ -191,11 +191,22 @@ pub(crate) async fn thumbnail_response(
         let job_ffmpeg = state.ffmpeg.clone();
         let job_key = cache_key.clone();
         let job_log_source = job_source.clone();
+        let cancel_scope = scope.as_ref().and_then(|scope| {
+            let root_id = scope.root_id?;
+            let path = scope.path.replace('\\', "/");
+            if width >= 1024 {
+                Some(format!("file:{root_id}:{path}"))
+            } else {
+                let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+                Some(format!("dir:{root_id}:{dir}"))
+            }
+        });
         let payload = json!({
             "source": source.to_string_lossy(),
             "width": width,
             "fit": fit.as_str(),
             "edge": edge,
+            "cancel_scope": cancel_scope,
         });
         let outcome = state
             .jobs
@@ -1187,6 +1198,48 @@ pub struct ThumbRetryRequest {
     w: Option<u32>,
     edge: Option<u32>,
     fit: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ThumbCancelRequest {
+    root: i64,
+    path: String,
+    scope: String,
+}
+
+/// Drops queued list-thumbnail jobs when the browser leaves a directory, or
+/// cancels the running preview job when the lightbox closes. Copy/move/upload
+/// and index jobs are never touched here.
+pub async fn cancel_scope(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<ThumbCancelRequest>,
+) -> Result<axum::Json<serde_json::Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    let root = state
+        .db
+        .find_root(request.root, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let path = request
+        .path
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string();
+    if path.len() > 4096 || path.contains('\0') {
+        return Err(AppError::invalid_path("invalid thumbnail scope"));
+    }
+    let scope = match request.scope.as_str() {
+        "dir" => format!("dir:{}:{path}", root.id),
+        "file" if !path.is_empty() => format!("file:{}:{path}", root.id),
+        "file" => return Err(AppError::invalid_path("thumbnail file path is empty")),
+        _ => return Err(AppError::bad_request("scope must be dir or file")),
+    };
+    let include_running = request.scope == "file";
+    let cancelled = state.jobs.cancel_thumbnail_scope(&scope, include_running);
+    Ok(axum::Json(json!({ "cancelled": cancelled })))
 }
 
 pub async fn retry(

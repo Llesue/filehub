@@ -500,6 +500,32 @@ paths:
             X-FileHub-Thumb-State:
               schema: { type: string, enum: [pending] }
         '404': { $ref: '#/components/responses/Error' }
+  /api/v1/thumb/cancel:
+    post:
+      tags: [files]
+      summary: 取消某个目录排队中的缩略图任务，或关闭灯箱时取消当前预览任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, path, scope]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string, description: '相对 root 的目录（scope=dir）或文件（scope=file）路径' }
+                scope: { type: string, enum: [dir, file] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled: { type: integer }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
   /api/v1/file/probe:
     get:
       tags: [files]

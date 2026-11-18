@@ -195,6 +195,7 @@ pub async fn search(
         }
         _ => None,
     };
+    let started = std::time::Instant::now();
     let entries = state
         .db
         .search_entries(
@@ -237,6 +238,14 @@ pub async fn search(
         .take(query.limit.unwrap_or(100).clamp(1, 500) as usize)
         .collect();
 
+    if started.elapsed().as_millis() >= 500 {
+        tracing::warn!(
+            root_id = root.id,
+            query_len = query_text.chars().count(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            "slow search"
+        );
+    }
     Ok(Json(json!({ "entries": results })))
 }
 

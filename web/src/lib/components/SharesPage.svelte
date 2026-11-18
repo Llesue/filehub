@@ -185,15 +185,17 @@
                   }}>{share.has_password ? t($language, '有密码') : t($language, '无密码')}</button
                 >
               {/if}
-              <select
-                value={share.read_only ? 'read' : 'write'}
-                aria-label={t($language, '权限')}
-                onchange={(event) =>
-                  void update(share, { read_only: event.currentTarget.value === 'read' })}
-              >
-                <option value="write">{t($language, '读写')}</option>
-                <option value="read">{t($language, '只读')}</option>
-              </select>
+              {#if share.is_dir}
+                <select
+                  value={share.read_only ? 'read' : 'write'}
+                  aria-label={t($language, '权限')}
+                  onchange={(event) =>
+                    void update(share, { read_only: event.currentTarget.value === 'read' })}
+                >
+                  <option value="write">{t($language, '读写')}</option>
+                  <option value="read">{t($language, '只读')}</option>
+                </select>
+              {/if}
               <select
                 value={expiryDays(share)}
                 aria-label={t($language, '过期时间')}

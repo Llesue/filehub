@@ -667,14 +667,26 @@ impl AppState {
         let settings = self.settings();
         let jobs = &settings.settings.jobs;
         let now = unix_now();
-        match self
-            .db
-            .prune_audit(jobs.audit_retention_days, jobs.audit_max_rows)
-            .await
-        {
-            Ok(0) => {}
-            Ok(removed) => tracing::info!(removed, "pruned audit log"),
-            Err(error) => tracing::warn!(%error, "failed to prune audit log"),
+        let mut audit_removed = 0_usize;
+        loop {
+            match self
+                .db
+                .prune_audit_batch(jobs.audit_retention_days, jobs.audit_max_rows, 500)
+                .await
+            {
+                Ok(0) => break,
+                Ok(removed) => {
+                    audit_removed += removed;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to prune audit log");
+                    break;
+                }
+            }
+        }
+        if audit_removed > 0 {
+            tracing::info!(removed = audit_removed, "pruned audit log");
         }
         let job_cutoff = now - (jobs.job_retention_days.min(3650) as i64) * 86_400;
         match self.db.prune_jobs(job_cutoff).await {
@@ -682,10 +694,26 @@ impl AppState {
             Ok(removed) => tracing::info!(removed, "pruned finished jobs"),
             Err(error) => tracing::warn!(%error, "failed to prune jobs"),
         }
-        match self.db.prune_directory_sizes(now - 30 * 86_400).await {
-            Ok(0) => {}
-            Ok(removed) => tracing::info!(removed, "pruned stale directory sizes"),
-            Err(error) => tracing::warn!(%error, "failed to prune directory sizes"),
+        let mut sizes_removed = 0_usize;
+        loop {
+            match self
+                .db
+                .prune_directory_sizes_batch(now - 30 * 86_400, 500)
+                .await
+            {
+                Ok(0) => break,
+                Ok(removed) => {
+                    sizes_removed += removed;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to prune directory sizes");
+                    break;
+                }
+            }
+        }
+        if sizes_removed > 0 {
+            tracing::info!(removed = sizes_removed, "pruned stale directory sizes");
         }
         match self.db.prune_expired_sessions(now).await {
             Ok(0) => {}
