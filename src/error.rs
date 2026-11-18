@@ -17,6 +17,8 @@ pub enum AppError {
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
+    #[error("permission denied")]
+    PermissionDenied,
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("confirmation required")]
@@ -63,6 +65,31 @@ impl AppError {
     pub fn internal(err: impl Into<anyhow::Error>) -> Self {
         Self::Internal(err.into())
     }
+
+    /// Stable machine-readable code shared by HTTP errors and job failures.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::BadRequest(_) => "BAD_REQUEST",
+            Self::InvalidPath(_) => "INVALID_PATH",
+            Self::TooLarge(_) => "TOO_LARGE",
+            Self::QuotaExceeded => "QUOTA_EXCEEDED",
+            Self::Unauthorized => "UNAUTHORIZED",
+            Self::Forbidden => "FORBIDDEN",
+            Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::Conflict(_) => "CONFLICT",
+            Self::ConfirmRequired => "CONFIRM_REQUIRED",
+            Self::PreconditionFailed => "PRECONDITION_FAILED",
+            Self::UnsupportedMedia(_) => "UNSUPPORTED_MEDIA",
+            Self::SetupRequired => "SETUP_REQUIRED",
+            Self::TooManyRequests => "RATE_LIMITED",
+            Self::QueueFull => "QUEUE_FULL",
+            Self::Cancelled => "CANCELLED",
+            Self::NotFound => "NOT_FOUND",
+            Self::ShareRevoked => "SHARE_REVOKED",
+            Self::ShareExpired => "SHARE_EXPIRED",
+            Self::Internal(_) => "INTERNAL_ERROR",
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -86,6 +113,11 @@ impl IntoResponse for AppError {
                 "Authentication required".to_owned(),
             ),
             Self::Forbidden => (StatusCode::FORBIDDEN, "FORBIDDEN", "Forbidden".to_owned()),
+            Self::PermissionDenied => (
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "The server process does not have permission to access this path".to_owned(),
+            ),
             Self::Conflict(message) => (StatusCode::CONFLICT, "CONFLICT", message.clone()),
             Self::ConfirmRequired => (
                 StatusCode::CONFLICT,

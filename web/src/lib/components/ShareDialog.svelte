@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api, ApiError } from '../api';
   import Icon from './Icon.svelte';
+  import FileName from './FileName.svelte';
   import { copyText } from '../clipboard';
   import { language, t } from '../i18n';
   import { overlayGuard } from '../overlayGuard';
@@ -70,7 +71,7 @@
     <header>
       <div>
         <h2 id="share-title">{t($language, '分享')}</h2>
-        <span>{name}</span>
+        <span class="share-name"><FileName name={name} isDir={isDir} /></span>
       </div>
       <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}>
         <Icon name="close" size={20} />
@@ -157,7 +158,18 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
+    gap: 12px;
     margin-bottom: 18px;
+  }
+
+  header > div {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .share-name {
+    display: flex;
+    min-width: 0;
   }
 
   h2 {

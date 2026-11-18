@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth;
 use crate::authz;
 use crate::error::AppError;
+use crate::fsops;
 use crate::jobs::{JobKind, JobOutcome};
 use crate::state::AppState;
 
@@ -40,6 +41,31 @@ pub struct ThumbQuery {
     wait: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fit {
+    Width,
+    Short,
+    Long,
+}
+
+impl Fit {
+    pub(crate) fn from_query(value: Option<&str>) -> Self {
+        match value {
+            Some("short") => Self::Short,
+            Some("long") => Self::Long,
+            _ => Self::Width,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Width => "width",
+            Self::Short => "short",
+            Self::Long => "long",
+        }
+    }
+}
+
 pub async fn thumb(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -54,17 +80,18 @@ pub async fn thumb(
         .ok_or(AppError::NotFound)?;
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
     let source = resolved.absolute.clone();
-    let fit_short = query.fit.as_deref() == Some("short");
+    let fit = Fit::from_query(query.fit.as_deref());
+    let preview_edge = settings_edge(&state);
     let edge = query
         .edge
         .unwrap_or_else(|| query.w.unwrap_or(256))
-        .clamp(16, 2048);
+        .clamp(16, preview_edge);
     thumbnail_response(
         &state,
         source,
         edge,
         edge,
-        fit_short,
+        fit,
         current.user.id,
         &headers,
         Some(ThumbScope {
@@ -88,7 +115,7 @@ pub(crate) async fn thumbnail_response(
     source: PathBuf,
     width: u32,
     edge: u32,
-    fit_short: bool,
+    fit: Fit,
     user_id: i64,
     headers: &HeaderMap,
     scope: Option<ThumbScope>,
@@ -99,8 +126,7 @@ pub(crate) async fn thumbnail_response(
         return Err(AppError::NotFound);
     }
     let cache_dir = settings.settings.cache_dir.join("thumbs");
-    let (cache_key, cache_path, failure_path) =
-        thumb_paths(&cache_dir, &source, width, fit_short, edge)?;
+    let (cache_key, cache_path, failure_path) = thumb_paths(&cache_dir, &source, width, fit, edge)?;
 
     if matches_etag(headers, &cache_key) {
         return not_modified(&cache_key);
@@ -111,6 +137,37 @@ pub(crate) async fn thumbnail_response(
         return image_response(bytes, &cache_key);
     }
     if tokio::fs::metadata(&failure_path).await.is_ok() {
+        let stale = tokio::fs::read(&failure_path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+            .map(|version| version < 4)
+            .unwrap_or(true);
+        if stale {
+            let _ = tokio::fs::remove_file(&failure_path).await;
+        } else {
+            return Err(AppError::NotFound);
+        }
+    }
+
+    // Grid thumbnails are only a visual aid. Huge camera/design files would
+    // burn minutes of CPU for a 320px image, so skip them and let the grid use
+    // the type icon. Full-size previews are generated on demand separately.
+    if width < 1024
+        && !is_video_extension(&source)
+        && let Some(header) = inspect_image(&source)
+        && header.width as u64 * header.height as u64 > 100_000_000
+    {
+        write_failure_record(
+            &failure_path,
+            "too_large_thumb",
+            &format!(
+                "source is {}x{}; grid thumbnails are skipped above 100MP",
+                header.width, header.height
+            ),
+        )
+        .await;
         return Err(AppError::NotFound);
     }
 
@@ -136,7 +193,7 @@ pub(crate) async fn thumbnail_response(
         let payload = json!({
             "source": source.to_string_lossy(),
             "width": width,
-            "fit_short": fit_short,
+            "fit": fit.as_str(),
             "edge": edge,
         });
         let outcome = state
@@ -167,7 +224,7 @@ pub(crate) async fn thumbnail_response(
                         generate_thumbnail(
                             &job_source,
                             width,
-                            fit_short,
+                            fit,
                             max_source,
                             max_pixels,
                             jpeg_max_pixels,
@@ -209,7 +266,7 @@ pub(crate) async fn thumbnail_response(
                             let record = json!({
                                 "reason": reason,
                                 "message": message,
-                                "version": 3,
+                                "version": 4,
                                 "at": crate::db::unix_now(),
                             });
                             let _ = std::fs::write(&job_failure_path, record.to_string());
@@ -450,7 +507,7 @@ fn is_video_extension(path: &Path) -> bool {
 fn generate_thumbnail(
     source: &Path,
     width: u32,
-    fit_short: bool,
+    fit: Fit,
     max_source: u64,
     max_pixels: u64,
     jpeg_max_pixels: u64,
@@ -490,7 +547,7 @@ fn generate_thumbnail(
         .and_then(|reader| reader.with_guessed_format().ok())
         .and_then(|reader| reader.format());
     let image = if guessed == Some(image::ImageFormat::Jpeg) {
-        decode_jpeg(source, width, fit_short, jpeg_max_pixels, max_pixels)?
+        decode_jpeg(source, width, fit, jpeg_max_pixels, max_pixels)?
     } else if guessed.is_some() {
         decode_image(source, max_pixels)?
     } else {
@@ -525,10 +582,10 @@ fn generate_thumbnail(
     // an absurdly large intermediate image (e.g. 10240x2048 for 5:1).
     const MAX_EDGE: f64 = 4096.0;
     let (source_width, source_height) = image.dimensions();
-    let base = if fit_short {
-        width as f64 / source_width.min(source_height).max(1) as f64
-    } else {
-        width as f64 / source_width.max(1) as f64
+    let base = match fit {
+        Fit::Short => width as f64 / source_width.min(source_height).max(1) as f64,
+        Fit::Long => width as f64 / source_width.max(source_height).max(1) as f64,
+        Fit::Width => width as f64 / source_width.max(1) as f64,
     };
     let scale = base
         .min(1.0)
@@ -603,7 +660,7 @@ fn decode_image(source: &Path, max_pixels: u64) -> Result<image::DynamicImage, T
 fn decode_jpeg(
     source: &Path,
     width: u32,
-    fit_short: bool,
+    fit: Fit,
     jpeg_max_pixels: u64,
     fallback_max_pixels: u64,
 ) -> Result<image::DynamicImage, ThumbError> {
@@ -641,10 +698,11 @@ fn decode_jpeg(
     let original_width = info.width as f64;
     let original_height = info.height as f64;
     let short_edge = original_width.min(original_height);
-    let scale = if fit_short {
-        (width as f64 / short_edge).min(1.0)
-    } else {
-        (width as f64 / original_width).min(1.0)
+    let long_edge = original_width.max(original_height);
+    let scale = match fit {
+        Fit::Short => (width as f64 / short_edge).min(1.0),
+        Fit::Long => (width as f64 / long_edge).min(1.0),
+        Fit::Width => (width as f64 / original_width).min(1.0),
     };
     let (output_width, output_height) = if scale < 1.0 {
         let requested_width =
@@ -891,7 +949,94 @@ pub fn detect_ffmpeg() -> Option<PathBuf> {
     output.status.success().then(|| PathBuf::from("ffmpeg"))
 }
 
-fn cache_key(path: &Path, width: u32, fit_short: bool, edge: u32) -> Result<String, AppError> {
+pub(crate) struct ImageHeader {
+    pub width: u32,
+    pub height: u32,
+    pub jpeg: bool,
+    pub cmyk: bool,
+}
+
+/// Reads only the image header. Used by grid-thumbnail gating and the
+/// pre-open preview check; never decodes pixel data.
+pub(crate) fn inspect_image(path: &Path) -> Option<ImageHeader> {
+    let format = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .format()?;
+    if format == image::ImageFormat::Jpeg {
+        let file = std::fs::File::open(path).ok()?;
+        let mut decoder = jpeg_decoder::Decoder::new(file);
+        decoder.read_info().ok()?;
+        let info = decoder.info()?;
+        return Some(ImageHeader {
+            width: info.width as u32,
+            height: info.height as u32,
+            jpeg: true,
+            cmyk: info.pixel_format == jpeg_decoder::PixelFormat::CMYK32,
+        });
+    }
+    let (width, height) = image::image_dimensions(path).ok()?;
+    Some(ImageHeader {
+        width,
+        height,
+        jpeg: false,
+        cmyk: false,
+    })
+}
+
+/// Drops cached failure records so a raised pixel/byte limit takes effect
+/// immediately instead of being blocked by an old `too_large` record.
+pub(crate) async fn clear_failure_records(cache_dir: &Path) {
+    let root = cache_dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(file_type) if file_type.is_dir() => stack.push(path),
+                    Ok(file_type)
+                        if file_type.is_file()
+                            && path.extension().and_then(|value| value.to_str())
+                                == Some("fail") =>
+                    {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await;
+}
+
+async fn write_failure_record(path: &Path, reason: &str, message: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let record = json!({
+        "reason": reason,
+        "message": message,
+        "version": 4,
+        "at": crate::db::unix_now(),
+    });
+    let _ = tokio::fs::write(path, record.to_string()).await;
+}
+
+fn settings_edge(state: &AppState) -> u32 {
+    state
+        .settings()
+        .settings
+        .thumbnails
+        .preview_edge
+        .clamp(512, 4096)
+}
+
+fn cache_key(path: &Path, width: u32, fit: Fit, edge: u32) -> Result<String, AppError> {
     let metadata = std::fs::metadata(path).map_err(io_error)?;
     let mtime = metadata
         .modified()
@@ -905,7 +1050,7 @@ fn cache_key(path: &Path, width: u32, fit_short: bool, edge: u32) -> Result<Stri
     hasher.update(mtime.to_le_bytes());
     hasher.update(width.to_le_bytes());
     hasher.update(edge.to_le_bytes());
-    hasher.update(if fit_short { b"short" } else { b"width" });
+    hasher.update(fit.as_str().as_bytes());
     hasher.update(b"thumb-v4");
     Ok(hasher
         .finalize()
@@ -918,16 +1063,81 @@ fn thumb_paths(
     cache_dir: &Path,
     source: &Path,
     width: u32,
-    fit_short: bool,
+    fit: Fit,
     edge: u32,
 ) -> Result<(String, PathBuf, PathBuf), AppError> {
-    let key = cache_key(source, width, fit_short, edge)?;
+    let key = cache_key(source, width, fit, edge)?;
     let cache_path = cache_dir
         .join(&key[0..2])
         .join(&key[2..4])
         .join(format!("{key}.jpg"));
     let failure_path = cache_path.with_extension("fail");
     Ok((key, cache_path, failure_path))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageInfoQuery {
+    root: i64,
+    path: String,
+}
+
+/// Header-only preview feasibility check. The lightbox calls this before it
+/// opens so an over-limit image never reaches the browser decoder.
+pub async fn image_info(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ImageInfoQuery>,
+) -> Result<axum::Json<serde_json::Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let root = state
+        .db
+        .find_root(query.root, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
+    let metadata = tokio::fs::metadata(&resolved.absolute)
+        .await
+        .map_err(fsops::io_error)?;
+    if !metadata.is_file() {
+        return Err(AppError::NotFound);
+    }
+    let settings = state.settings();
+    let source = resolved.absolute.clone();
+    let header = tokio::task::spawn_blocking(move || inspect_image(&source))
+        .await
+        .map_err(|err| AppError::internal(anyhow::anyhow!("image header task failed: {err}")))?;
+    let Some(header) = header else {
+        return Ok(axum::Json(json!({
+            "width": null,
+            "height": null,
+            "pixels": null,
+            "limit": null,
+            "previewable": false,
+            "reason": "unsupported",
+        })));
+    };
+    let pixels = header.width as u64 * header.height as u64;
+    let limit = if header.jpeg && !header.cmyk {
+        settings.settings.thumbnails.jpeg_max_pixels
+    } else {
+        settings.settings.thumbnails.max_pixels
+    };
+    let (previewable, reason) = if metadata.len() > settings.settings.thumbnails.max_source_bytes {
+        (false, Some("max_source"))
+    } else if pixels > limit {
+        (false, Some("too_large"))
+    } else {
+        (true, None)
+    };
+    Ok(axum::Json(json!({
+        "width": header.width,
+        "height": header.height,
+        "pixels": pixels,
+        "limit": limit,
+        "previewable": previewable,
+        "reason": reason,
+    })))
 }
 
 pub async fn status(
@@ -947,14 +1157,14 @@ pub async fn status(
         return Err(AppError::NotFound);
     }
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
-    let fit_short = query.fit.as_deref() == Some("short");
+    let fit = Fit::from_query(query.fit.as_deref());
     let edge = query
         .edge
         .unwrap_or_else(|| query.w.unwrap_or(256))
-        .clamp(16, 2048);
+        .clamp(16, settings_edge(&state));
     let cache_dir = settings.settings.cache_dir.join("thumbs");
     let (_key, cache_path, failure_path) =
-        thumb_paths(&cache_dir, &resolved.absolute, edge, fit_short, edge)?;
+        thumb_paths(&cache_dir, &resolved.absolute, edge, fit, edge)?;
     if tokio::fs::metadata(&cache_path).await.is_ok() {
         return Ok(axum::Json(json!({ "state": "ready" })));
     }
@@ -996,7 +1206,7 @@ pub async fn retry(
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
     let resolved = authz::resolve(&state, current.user.id, root.id, &request.path, false).await?;
-    let fit_short = request.fit.as_deref() == Some("short");
+    let fit = Fit::from_query(request.fit.as_deref());
     let edge = request
         .edge
         .unwrap_or_else(|| request.w.unwrap_or(320))
@@ -1009,7 +1219,7 @@ pub async fn retry(
     }
     for width in widths {
         let (_key, cache_path, failure_path) =
-            thumb_paths(&cache_dir, &resolved.absolute, width, fit_short, width)?;
+            thumb_paths(&cache_dir, &resolved.absolute, width, fit, width)?;
         if tokio::fs::remove_file(&cache_path).await.is_ok() {
             cleared += 1;
         }

@@ -19,6 +19,7 @@ fn system_json(state: &Arc<AppState>) -> Value {
     let settings = state.settings();
     json!({
         "thumbnails": settings.settings.thumbnails.enabled,
+        "preview_edge": settings.settings.thumbnails.preview_edge,
         "editor": settings.settings.editor.enabled,
         "terminal": settings.settings.terminal_enabled,
     })

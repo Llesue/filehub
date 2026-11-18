@@ -13,6 +13,7 @@ export interface UserPreferences {
 
 export interface SystemFeatures {
   thumbnails: boolean;
+  preview_edge?: number;
   editor: boolean;
   terminal: boolean;
 }
@@ -73,6 +74,7 @@ export interface ListResponse {
   root: Root;
   path: string;
   read_only: boolean;
+  read_only_reason?: 'policy' | 'filesystem' | null;
   entries: Entry[];
   next_cursor: string | null;
 }
@@ -207,6 +209,9 @@ export interface FileContent {
   etag: string;
   size: number;
   modified: number;
+  line_ending?: 'lf' | 'crlf' | 'mixed';
+  writable?: boolean;
+  read_only_reason?: 'file' | 'directory' | null;
 }
 
 export interface ShareEntry {
@@ -370,7 +375,12 @@ export const api = {
     return request<SetupStatus>('/setup/status');
   },
 
-  setup(payload: { token: string; username: string; password: string }): Promise<AuthResponse> {
+  setup(payload: {
+    token: string;
+    username: string;
+    password: string;
+    language?: 'zh-CN' | 'en';
+  }): Promise<AuthResponse> {
     return request<AuthResponse>('/setup', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -952,11 +962,27 @@ export const api = {
     }).then((value) => value.jobs);
   },
 
+  imageInfo(
+    root: number,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<{
+    width: number | null;
+    height: number | null;
+    pixels: number | null;
+    limit: number | null;
+    previewable: boolean;
+    reason: 'unsupported' | 'too_large' | 'max_source' | null;
+  }> {
+    const query = new URLSearchParams({ root: String(root), path });
+    return request(`/fs/image-info?${query.toString()}`, { signal });
+  },
+
   previewThumbUrl(root: number, path: string, edge = 2048): string {
     const query = new URLSearchParams({
       root: String(root),
       path,
-      fit: 'short',
+      fit: 'long',
       edge: String(edge),
       // The lightbox has no per-image SSE reload hook, so keep its thumbnail
       // request synchronous instead of showing the async placeholder.

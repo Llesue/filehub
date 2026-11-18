@@ -144,6 +144,33 @@ struct Inner {
     waiters: HashMap<String, Vec<tokio::sync::oneshot::Sender<Job>>>,
 }
 
+fn job_label(kind: JobKind, payload: &Value) -> String {
+    let text = |key: &str| payload.get(key).and_then(Value::as_str);
+    match kind {
+        JobKind::Copy | JobKind::Move => {
+            let paths = payload.get("paths").and_then(Value::as_array);
+            match paths {
+                Some(paths) if paths.len() == 1 => paths[0].as_str().unwrap_or_default().to_owned(),
+                Some(paths) if !paths.is_empty() => {
+                    format!(
+                        "{} (+{} 项)",
+                        paths[0].as_str().unwrap_or_default(),
+                        paths.len() - 1
+                    )
+                }
+                _ => String::new(),
+            }
+        }
+        JobKind::Index => text("path")
+            .filter(|value| !value.is_empty())
+            .or_else(|| text("real_path"))
+            .unwrap_or_default()
+            .to_owned(),
+        JobKind::DirSize => text("real_path").unwrap_or_default().to_owned(),
+        JobKind::Thumbnail => text("source").unwrap_or_default().to_owned(),
+    }
+}
+
 fn clear_active(inner: &mut Inner, kind: &str, key: &str, id: &str) {
     let map_key = (kind.to_owned(), key.to_owned());
     if inner
@@ -245,6 +272,9 @@ impl JobManager {
             }
         }
 
+        let label = job_label(kind, &payload);
+        let notify_failure = matches!(kind, JobKind::Copy | JobKind::Move | JobKind::Index)
+            && payload.get("auto").and_then(Value::as_bool) != Some(true);
         let id = format!("job_{}", crate::auth::random_token(12));
         let now = unix_now();
         let record = JobRecord {
@@ -298,11 +328,14 @@ impl JobManager {
         );
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.execute(id, kind, key, user_id, token, run).await;
+            manager
+                .execute(id, kind, key, user_id, token, label, notify_failure, run)
+                .await;
         });
         Ok(SubmitOutcome { job, created })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute<F, Fut>(
         self: Arc<Self>,
         id: String,
@@ -310,6 +343,8 @@ impl JobManager {
         key: String,
         user_id: i64,
         token: CancellationToken,
+        label: String,
+        notify_failure: bool,
         run: F,
     ) where
         F: FnOnce(JobContext) -> Fut + Send + 'static,
@@ -381,21 +416,39 @@ impl JobManager {
         drop(permit);
         let elapsed_ms = started.elapsed().as_millis();
 
-        let (status, progress, total, bytes_done, bytes_total, result, error) = match &outcome {
-            Ok(value) => (
-                "completed",
-                value.progress,
-                value.total,
-                value.bytes_done,
-                value.bytes_total,
-                Some(value.result.to_string()),
-                None,
-            ),
-            Err(AppError::Cancelled) => {
-                ("cancelled", 0, 0, 0, 0, None, Some("cancelled".to_owned()))
-            }
-            Err(err) => ("failed", 0, 0, 0, 0, None, Some(err.to_string())),
-        };
+        let (status, progress, total, bytes_done, bytes_total, result, error, error_code) =
+            match &outcome {
+                Ok(value) => (
+                    "completed",
+                    value.progress,
+                    value.total,
+                    value.bytes_done,
+                    value.bytes_total,
+                    Some(value.result.to_string()),
+                    None,
+                    None,
+                ),
+                Err(AppError::Cancelled) => (
+                    "cancelled",
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    Some("cancelled".to_owned()),
+                    None,
+                ),
+                Err(err) => (
+                    "failed",
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    Some(err.to_string()),
+                    Some(err.code()),
+                ),
+            };
         let was_cancelled = {
             let mut inner = self.inner.lock();
             let already = inner
@@ -448,6 +501,7 @@ impl JobManager {
             tracing::warn!(job_id = %id, error = %write_error, "failed to persist job result");
         }
         if status == "failed"
+            && notify_failure
             && let Some(error_text) = error.as_deref()
         {
             self.events.publish(
@@ -455,6 +509,11 @@ impl JobManager {
                 Some(user_id),
                 serde_json::json!({
                     "kind": "job_failed",
+                    "job_kind": kind.as_str(),
+                    "job_id": id,
+                    "code": error_code.unwrap_or("INTERNAL_ERROR"),
+                    "label": label,
+                    "path": label,
                     "message": error_text,
                 }),
             );

@@ -248,8 +248,10 @@
     <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v18H6.5A2.5 2.5 0 0 1 4 18.5z" />
     <path d="M4 17.5h16M8 7h8M8 10h6" />
   {:else if category === 'design'}
-    <path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10z" />
-    <path d="m14.5 7.5 2 2" />
+    <path d="M12 3.5 18.5 10 12 20.5 5.5 10Z" />
+    <path d="M12 10v6.5" />
+    <circle cx="12" cy="9.5" r="1.3" />
+    <path d="M3 20c3.5-.5 6-2.5 8-5.5" />
   {:else if category === 'database'}
     <ellipse cx="12" cy="6" rx="7" ry="3" />
     <path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3" />

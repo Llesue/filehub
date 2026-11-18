@@ -62,6 +62,7 @@
     type User,
   } from './lib/api';
   import { applyTheme, resolveTheme, type Theme, type ThemePreference } from './lib/theme';
+  import { splitFileName } from './lib/filename';
 
   let theme = $state<Theme>('light');
   function storedView(): 'list' | 'thumb' | 'tile' {
@@ -88,6 +89,8 @@
   let activeRootId = $state<number | null>(null);
   let currentPath = $state('');
   let currentReadOnly = $state(false);
+  let currentReadOnlyReason = $state<'policy' | 'filesystem' | null>(null);
+  let pathElement = $state<HTMLElement | null>(null);
   let clock = $state(Date.now());
   let entries = $state<Entry[]>([]);
   let selected = $state<string[]>([]);
@@ -95,6 +98,7 @@
   let dirSizeErrors = $state<Record<string, string | null>>({});
   let selectionAnchor = $state<string | null>(null);
   let filesLoading = $state(false);
+  let filesRefreshing = $state(false);
   let filesLoadingMore = $state(false);
   let listGeneration = 0;
   let listAbort: AbortController | null = null;
@@ -147,6 +151,9 @@
   let editorError = $state('');
   let editorSaving = $state(false);
   let editorPreview = $state(false);
+  let editorReadOnly = $state(false);
+  let editorReadOnlyReason = $state<'file' | 'directory' | 'policy' | null>(null);
+  let editorLineEnding = $state<'lf' | 'crlf' | 'mixed'>('lf');
   let thumbVersions = $state<Record<string, number>>({});
   let thumbFailures = $state<Record<string, boolean>>({});
   let remoteEditors = $state<Record<string, Record<string, number>>>({});
@@ -179,6 +186,13 @@
   let contextMenuElement = $state<HTMLElement | null>(null);
   let contextMenuLeft = $state(false);
   let contextMenuUp = $state(false);
+  let sortMenuOpen = $state(false);
+  let uploadBatchStarted = 0;
+  let uploadBatchBytes = 0;
+  let uploadBatchCount = 0;
+  let uploadBatchRoot: number | null = null;
+  let uploadBatchPath = '';
+  const shareNotifySeen = new SvelteMap<string, number>();
   let blankMenu = $state<{ x: number; y: number } | null>(null);
   let blankMenuElement = $state<HTMLElement | null>(null);
   let blankMenuLeft = $state(false);
@@ -213,6 +227,7 @@
   let confirmState = $state<{
     title: string;
     message: string;
+    items?: { name: string; isDir: boolean }[];
     requireText: string | null;
     action: (value: string) => void;
   } | null>(null);
@@ -228,6 +243,18 @@
   );
   let previewHtml = $derived(
     editorPreview ? DOMPurify.sanitize(String(marked.parse(editorContent))) : '',
+  );
+  let menuTargets = $derived(
+    contextMenu
+      ? selected.includes(contextMenu.entry.name) && selected.length > 1
+        ? entries.filter((entry) => selected.includes(entry.name))
+        : [contextMenu.entry]
+      : [],
+  );
+  let menuMedia = $derived(
+    menuTargets.filter(
+      (entry) => !entry.is_dir && (isImageName(entry.name) || isVideoName(entry.name)),
+    ),
   );
 
   let activeRoot = $derived(roots.find((root) => root.id === activeRootId) ?? null);
@@ -353,17 +380,28 @@
         handlePresenceEvent(event.data);
       }
       if (event.type === 'notification') {
-        const message = String(event.data.message ?? '');
+        const kind = String(event.data.kind ?? 'notice');
+        const message =
+          kind === 'job_failed' && event.data.job_kind
+            ? jobFailureMessage(event.data)
+            : String(event.data.message ?? '');
         if (message) {
-          addNotification(String(event.data.kind ?? 'notice'), message);
+          addNotification(kind, message);
           showToast(message);
         }
+      }
+      if (
+        event.type === 'share.visited' ||
+        event.type === 'share.downloaded' ||
+        event.type === 'share.uploaded'
+      ) {
+        notifyShareActivity(event.type, event.data);
       }
     });
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('resize', updateVirtualRange);
     const autoSaveTimer = window.setInterval(() => {
-      if (editorOpen && editorDirty && !editorSaving) {
+      if (editorOpen && editorDirty && !editorSaving && !editorReadOnly) {
         void saveEditor(true);
       }
     }, 30_000);
@@ -580,6 +618,75 @@
     }
   }
 
+  function jobFailureMessage(data: Record<string, unknown>): string {
+    const kind = jobKindLabel(String(data.job_kind ?? ''));
+    const label = String(data.label ?? data.path ?? '');
+    const code = String(data.code ?? '');
+    const reason =
+      code === 'NOT_FOUND'
+        ? t($language, '不存在或已被删除')
+        : code === 'PERMISSION_DENIED'
+          ? t($language, '无写入权限')
+          : code === 'FORBIDDEN'
+            ? t($language, '目标只读')
+            : code === 'CONFLICT'
+              ? t($language, '目标已存在')
+              : code === 'TOO_LARGE'
+                ? t($language, '文件过大')
+                : String(data.message ?? t($language, '操作失败'));
+    return label
+      ? t($language, '{kind}失败：{label}（{reason}）', { kind, label, reason })
+      : t($language, '{kind}失败：{reason}', { kind, reason });
+  }
+
+  function shareNotifyEnabled(): boolean {
+    try {
+      return localStorage.getItem('filehub.notify.share_activity') !== '0';
+    } catch {
+      return true;
+    }
+  }
+
+  function notifyShareActivity(type: string, data: Record<string, unknown>): void {
+    if (!shareNotifyEnabled()) return;
+    const id = String(data.id ?? '');
+    const name = String(data.name || t($language, '文件合集'));
+    const item = String(data.path ?? data.name ?? '');
+    const windowMs = type === 'share.visited' ? 10 * 60_000 : 5 * 60_000;
+    const key = type === 'share.visited' ? `visit:${id}` : `${type}:${id}:${item}`;
+    const now = Date.now();
+    const last = shareNotifySeen.get(key);
+    if (last !== undefined && now - last < windowMs) return;
+    shareNotifySeen.set(key, now);
+    if (shareNotifySeen.size > 500) {
+      for (const [entryKey, at] of shareNotifySeen) {
+        if (now - at > 60 * 60_000) shareNotifySeen.delete(entryKey);
+      }
+    }
+    const message =
+      type === 'share.visited'
+        ? t($language, '分享「{name}」被访问', { name })
+        : type === 'share.downloaded'
+          ? t($language, '分享「{name}」被下载：{item}', { name, item })
+          : t($language, '分享「{name}」收到上传：{item}', { name, item });
+    addNotification('share_activity', message);
+  }
+
+  function shouldNotifyLong(started: number, bytes: number, count: number, left: boolean): boolean {
+    return (
+      left ||
+      (typeof document !== 'undefined' && document.hidden) ||
+      Date.now() - started >= 3000 ||
+      bytes >= 100 * 1024 * 1024 ||
+      count >= 50
+    );
+  }
+
+  function notifyLongCompletion(message: string, left: boolean): void {
+    addNotification('job_completed', message);
+    if (left || (typeof document !== 'undefined' && document.hidden)) showToast(message);
+  }
+
   function jobKindLabel(kind: string): string {
     if (kind === 'copy') return t($language, '复制');
     if (kind === 'move') return t($language, '移动');
@@ -598,7 +705,30 @@
         }
       },
       onNotice: (message, kind) => showNotice(message, kind),
-      onAllDone: () => showToast(t($language, '上传完成')),
+      onAllDone: () => {
+        showToast(t($language, '上传完成'));
+        if (
+          shouldNotifyLong(
+            uploadBatchStarted,
+            uploadBatchBytes,
+            uploadBatchCount,
+            activeRootId !== uploadBatchRoot || currentPath !== uploadBatchPath,
+          )
+        ) {
+          notifyLongCompletion(
+            t($language, '上传完成：{count} 项 · {size}', {
+              count: uploadBatchCount,
+              size: formatSize(uploadBatchBytes),
+            }),
+            activeRootId !== uploadBatchRoot || currentPath !== uploadBatchPath,
+          );
+        }
+        uploadBatchStarted = 0;
+        uploadBatchBytes = 0;
+        uploadBatchCount = 0;
+        uploadBatchRoot = null;
+        uploadBatchPath = '';
+      },
     });
     if (uploadManager.pendingCount > 0) {
       showNoticeAction(
@@ -687,6 +817,7 @@
         activeRootId = null;
         currentPath = '';
         currentReadOnly = false;
+        currentReadOnlyReason = null;
         entries = [];
         filesError = t($language, '当前账号还没有可访问的目录');
         return;
@@ -708,6 +839,7 @@
         activeRootId = null;
         currentPath = '';
         currentReadOnly = false;
+        currentReadOnlyReason = null;
         entries = [];
         filesError = t($language, '当前账号还没有可访问的目录');
         return;
@@ -726,7 +858,9 @@
     dirSizeGeneration += 1;
     const controller = new AbortController();
     listAbort = controller;
-    filesLoading = true;
+    const refreshing = activeRootId === rootId && currentPath === path && entries.length > 0;
+    filesLoading = !refreshing;
+    filesRefreshing = refreshing;
     filesError = '';
     thumbFailures = {};
     nextCursor = null;
@@ -764,6 +898,9 @@
       activeRootId = result.root.id;
       currentPath = result.path;
       currentReadOnly = result.read_only;
+      currentReadOnlyReason = result.read_only
+        ? (result.read_only_reason ?? 'policy')
+        : null;
       entries = result.entries;
       nextCursor = result.next_cursor;
       loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration, true);
@@ -803,12 +940,15 @@
         console.warn('could not persist view preference', error);
       }
       void loadUsage();
+      await tick();
+      if (pathElement) pathElement.scrollLeft = pathElement.scrollWidth;
     } catch (error) {
       if (isAbortError(error)) return;
       handleFilesError(error);
     } finally {
       if (generation === listGeneration) {
         filesLoading = false;
+        filesRefreshing = false;
         stopFilesSlowHint();
       }
     }
@@ -1091,11 +1231,40 @@
     return error instanceof DOMException && error.name === 'AbortError';
   }
 
+  function readOnlyMessage(): string {
+    return currentReadOnlyReason === 'filesystem'
+      ? t($language, '当前目录只读（文件系统权限不足）')
+      : t($language, '当前目录只读');
+  }
+
   function handleFilesError(error: unknown): void {
     if (error instanceof ApiError && error.status === 401) {
       uploadManager.detach();
       user = null;
       csrf = '';
+      return;
+    }
+    if (error instanceof ApiError && error.status === 403) {
+      showNotice(
+        error.code === 'PERMISSION_DENIED'
+          ? t($language, '服务进程没有访问权限（文件系统权限不足）')
+          : t($language, '当前目录只读'),
+        'error',
+        t($language, '操作被拒绝'),
+      );
+      return;
+    }
+    if (error instanceof ApiError && error.status === 404 && appView === 'files') {
+      const parent = currentPath.includes('/')
+        ? currentPath.slice(0, currentPath.lastIndexOf('/'))
+        : '';
+      showNoticeAction(
+        t($language, '目录不存在或已被删除：{path}', { path: currentPath || '/' }),
+        t($language, '目录不可用'),
+        t($language, '返回上级'),
+        () => navigate(parent),
+        'warning',
+      );
       return;
     }
     showNotice(error instanceof Error ? error.message : t($language, '文件列表加载失败'));
@@ -1376,7 +1545,7 @@
     } else if (isPdfName(entry.name)) {
       openPdf(entry);
     } else if (isLightboxPreview(entry.name)) {
-      openPreview(entry);
+      void openPreview(entry);
     } else {
       showUnsupported(entry);
     }
@@ -1394,14 +1563,6 @@
 
   function isLightboxPreview(name: string): boolean {
     return isImageName(name) || isVideoName(name) || isAudioName(name);
-  }
-
-  function isPreviewable(name: string): boolean {
-    return isLightboxPreview(name) || isPdfName(name);
-  }
-
-  function canPreviewEntry(entry: Entry): boolean {
-    return !entry.is_dir && (isTextFile(entry.name) || isPreviewable(entry.name));
   }
 
   function openPdf(entry: Entry): void {
@@ -1580,7 +1741,32 @@
     contextMenu = { ...menuPosition(event.clientX, event.clientY), entry };
   }
 
-  function openPreview(entry: Entry): void {
+  async function openPreview(entry: Entry): Promise<void> {
+    if (activeRootId === null) return;
+    if (isRasterImageName(entry.name)) {
+      try {
+        const info = await api.imageInfo(activeRootId, joinPath(currentPath, entry.name));
+        if (!info.previewable) {
+          const size =
+            info.width && info.height
+              ? `${info.width}×${info.height}`
+              : t($language, '未知尺寸');
+          showNoticeAction(
+            info.reason === 'max_source'
+              ? t($language, '文件过大，无法预览')
+              : t($language, '图片过大 {size}，无法预览', { size }),
+            t($language, '无法预览'),
+            t($language, '下载文件'),
+            () => downloadEntry(entry),
+            'info',
+          );
+          return;
+        }
+      } catch (error) {
+        handleFilesError(error);
+        return;
+      }
+    }
     const items = entries.filter(
       (item) => !item.is_dir && (isImageName(item.name) || isVideoName(item.name)),
     );
@@ -1588,6 +1774,31 @@
     if (index >= 0) {
       preview = { items, index };
     }
+  }
+
+  async function openPreviewMany(items: Entry[]): Promise<void> {
+    if (activeRootId === null) return;
+    const allowed: Entry[] = [];
+    let skipped = 0;
+    for (const item of items) {
+      if (isRasterImageName(item.name)) {
+        try {
+          const info = await api.imageInfo(activeRootId, joinPath(currentPath, item.name));
+          if (!info.previewable) {
+            skipped += 1;
+            continue;
+          }
+        } catch {
+          skipped += 1;
+          continue;
+        }
+      }
+      allowed.push(item);
+    }
+    if (skipped > 0) {
+      showToast(t($language, '已跳过 {count} 张过大的图片', { count: skipped }));
+    }
+    if (allowed.length > 0) preview = { items: allowed, index: 0 };
   }
 
   function previewEntry(entry: Entry): void {
@@ -1599,7 +1810,7 @@
     } else if (isPdfName(entry.name)) {
       openPdf(entry);
     } else if (isLightboxPreview(entry.name)) {
-      openPreview(entry);
+      void openPreview(entry);
     } else {
       showUnsupported(entry);
     }
@@ -1615,7 +1826,8 @@
       | 'move-to'
       | 'delete'
       | 'play'
-      | 'properties',
+      | 'properties'
+      | 'edit-source',
   ): void {
     const entry = contextMenu?.entry;
     contextMenu = null;
@@ -1628,8 +1840,23 @@
       selected.includes(entry.name) && selected.length > 1
         ? entries.filter((item) => selected.includes(item.name))
         : [entry];
-    if (action === 'preview') previewEntry(entry);
-    if (action === 'download') downloadEntry(entry);
+    if (action === 'preview') {
+      if (targets.length > 1) {
+        const media = targets.filter(
+          (item) => !item.is_dir && (isImageName(item.name) || isVideoName(item.name)),
+        );
+        if (media.length > 0) void openPreviewMany(media);
+      } else {
+        previewEntry(entry);
+      }
+    }
+    if (action === 'download') {
+      if (targets.length > 1) void downloadZipEntries(targets);
+      else downloadEntry(entry);
+    }
+    if (action === 'edit-source' && isSvgName(entry.name)) {
+      void openEditor(entry);
+    }
     if (action === 'share') {
       if (targets.length > 1 && targets.some((item) => item.is_dir)) {
         showToast(t($language, '目录请单独分享'));
@@ -1637,7 +1864,7 @@
       }
       shareTargets = targets;
     }
-    if (action === 'rename') {
+    if (action === 'rename' && targets.length === 1) {
       nameDialog = {
         mode: 'rename',
         entry,
@@ -1789,6 +2016,10 @@
     event.stopPropagation();
     dragOverKey = null;
     dragOverValid = true;
+    if (destRoot === activeRootId && destPath === currentPath && currentReadOnly) {
+      showToast(readOnlyMessage());
+      return;
+    }
     if (event.dataTransfer?.types.includes('Files')) {
       const candidates = await collectDroppedFiles(event.dataTransfer);
       if (candidates.length > 0) enqueueUploads(candidates, destPath);
@@ -1830,6 +2061,8 @@
     if (!pending || activeRootId === null) return;
     const rootId = activeRootId;
     const sourcePath = currentPath;
+    const startedAt = Date.now();
+    const totalBytes = pending.entries.reduce((sum, entry) => sum + entry.size, 0);
     startProgress(
       pending.mode === 'copy' ? t($language, '复制文件') : t($language, '移动文件'),
       pending.entries.length,
@@ -1843,10 +2076,29 @@
         destPath,
         csrf,
       );
-      await waitForTransferJob(job.job_id);
+      const result = await waitForTransferJob(job.job_id);
       updateProgress(100, t($language, '完成'), 100);
       const viewingSource = activeRootId === rootId && currentPath === sourcePath;
       const viewingDestination = activeRootId === destRoot && currentPath === destPath;
+      const left = !viewingSource && !viewingDestination;
+      if (shouldNotifyLong(startedAt, totalBytes, pending.entries.length, left)) {
+        const kind = pending.mode === 'copy' ? t($language, '复制') : t($language, '移动');
+        const failed = result?.failed ?? 0;
+        const message =
+          failed > 0
+            ? t($language, '{kind}完成：{success} 项成功，{failed} 项失败', {
+                kind,
+                success: pending.entries.length - failed,
+                failed,
+              })
+            : t($language, '{kind}完成：{count} 项 · {size} → {dest}', {
+                kind,
+                count: pending.entries.length,
+                size: formatSize(totalBytes),
+                dest: destPath || t($language, '根目录'),
+              });
+        notifyLongCompletion(message, left);
+      }
       if (viewingSource) {
         clearDirSizeCache();
         await loadList(rootId, currentPath);
@@ -1885,6 +2137,7 @@
       'tif',
       'tiff',
       'avif',
+      'svg',
       'heic',
       'heif',
       'mp4',
@@ -2074,7 +2327,7 @@
   function uploadClick(): void {
     if (!activeRoot) return;
     if (currentReadOnly) {
-      showToast(t($language, '当前目录只读'));
+      showToast(readOnlyMessage());
       return;
     }
     fileInput?.click();
@@ -2102,7 +2355,7 @@
   function folderUploadClick(): void {
     if (!activeRoot) return;
     if (currentReadOnly) {
-      showToast(t($language, '当前目录只读'));
+      showToast(readOnlyMessage());
       return;
     }
     folderInput?.click();
@@ -2114,10 +2367,19 @@
   ): void {
     if (activeRootId === null || candidates.length === 0) return;
     if (currentReadOnly) {
-      showToast(t($language, '当前目录只读'));
+      showToast(readOnlyMessage());
       return;
     }
     filesError = '';
+    if (uploadBatchCount === 0) {
+      uploadBatchStarted = Date.now();
+      uploadBatchBytes = 0;
+      uploadBatchCount = 0;
+      uploadBatchRoot = activeRootId;
+      uploadBatchPath = basePath;
+    }
+    uploadBatchCount += candidates.length;
+    uploadBatchBytes += candidates.reduce((sum, candidate) => sum + candidate.file.size, 0);
     uploadManager.enqueue(candidates, activeRootId, basePath);
   }
 
@@ -2167,6 +2429,10 @@
   async function handleAppDrop(event: DragEvent): Promise<void> {
     event.preventDefault();
     if (!event.dataTransfer) return;
+    if (currentReadOnly) {
+      showToast(readOnlyMessage());
+      return;
+    }
     const candidates = await collectDroppedFiles(event.dataTransfer);
     enqueueUploads(candidates);
   }
@@ -2189,7 +2455,7 @@
       return;
     }
     if (currentReadOnly) {
-      showToast(t($language, '当前目录只读'));
+      showToast(readOnlyMessage());
       return;
     }
 
@@ -2202,20 +2468,14 @@
       const totalSize = items.reduce((sum, entry) => sum + entry.size, 0);
       const needsCode =
         items.some((entry) => entry.is_dir) || items.length > 5 || totalSize > 10 * 1024 * 1024;
-      const list = items
-        .slice(0, 12)
-        .map((entry) => `× ${entry.name}${entry.is_dir ? '/' : ''}`)
-        .join('\n');
-      const more =
-        items.length > 12
-          ? '\n' + t($language, '…以及另外 {count} 项', { count: items.length - 12 })
-          : '';
       confirmState = {
         title: t($language, '永久删除'),
-        message: t($language, '以下文件将被永久删除：\n{list}{more}', { list, more }),
+        message: t($language, '以下文件将被永久删除：'),
+        items: items.map((entry) => ({ name: entry.name, isDir: entry.is_dir })),
         requireText: needsCode ? result.confirm_code : null,
         action: (value) => {
           void (async () => {
+            const startedAt = Date.now();
             startProgress(t($language, '删除文件'), items.length, t($language, '正在删除…'));
             try {
               await api.deletePaths(result.token, undefined, csrf, needsCode ? value : undefined);
@@ -2227,6 +2487,15 @@
                 (deleted) =>
                   currentPath === deleted || currentPath.startsWith(`${deleted}/`),
               );
+              if (shouldNotifyLong(startedAt, totalSize, items.length, !stillHere)) {
+                notifyLongCompletion(
+                  t($language, '删除完成：{count} 项 · {size}', {
+                    count: items.length,
+                    size: formatSize(totalSize),
+                  }),
+                  !stillHere,
+                );
+              }
               if (stillHere || insideDeleted) {
                 clearDirSizeCache();
                 await loadList(rootId, path);
@@ -2253,7 +2522,7 @@
       sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
     } else {
       sortField = field;
-      sortOrder = 'asc';
+      sortOrder = field === 'name' ? 'asc' : 'desc';
     }
     if (activeRootId !== null) {
       localStorage.setItem(`sort:${activeRootId}:${currentPath}`, `${sortField}:${sortOrder}`);
@@ -2393,7 +2662,20 @@
     void sendPresence('close', root, path, keepalive);
   }
 
-  function closeEditor(): void {
+  function closeEditor(force = false): void {
+    if (editorSaving && !force) return;
+    if (!force && editorDirty && !editorReadOnly) {
+      confirmState = {
+        title: t($language, '关闭编辑器'),
+        message: t($language, '有未保存修改，确定关闭？'),
+        requireText: null,
+        action: () => {
+          confirmState = null;
+          closeEditor(true);
+        },
+      };
+      return;
+    }
     endEditPresence();
     editorOpen = false;
   }
@@ -2404,7 +2686,16 @@
     try {
       const probe = await api.probeFile(activeRootId, path);
       if (!probe.is_text) {
-        showUnsupported(entry);
+        const tooLarge = probe.reason === 'too_large';
+        showNoticeAction(
+          tooLarge
+            ? t($language, '文件超过 2MB，无法在编辑器中打开')
+            : t($language, '不是 UTF-8 文本，无法编辑'),
+          t($language, '无法编辑'),
+          t($language, '下载文件'),
+          () => downloadEntry(entry),
+          'info',
+        );
         return;
       }
       const file = await api.getFile(activeRootId, path);
@@ -2415,8 +2706,15 @@
       editorEtag = file.etag;
       editorError = '';
       editorPreview = false;
+      editorReadOnly = file.writable === false || currentReadOnly;
+      editorReadOnlyReason = file.writable === false
+        ? (file.read_only_reason ?? 'file')
+        : currentReadOnly
+          ? 'policy'
+          : null;
+      editorLineEnding = file.line_ending ?? 'lf';
       editorOpen = true;
-      beginEditPresence(activeRootId, path);
+      if (!editorReadOnly) beginEditPresence(activeRootId, path);
     } catch (error) {
       if (error instanceof ApiError && (error.status === 400 || error.status === 415)) {
         showUnsupported(entry);
@@ -2426,20 +2724,41 @@
     }
   }
 
+  function contentForSave(): string {
+    if (editorLineEnding !== 'crlf') return editorContent;
+    return editorContent.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+  }
+
   async function saveEditor(auto = false): Promise<void> {
-    if (activeRootId === null || !editorOpen) return;
+    if (activeRootId === null || !editorOpen || editorReadOnly || currentReadOnly) return;
     editorSaving = true;
     editorError = '';
     try {
-      const saved = await api.saveFile(activeRootId, editorPath, editorContent, editorEtag, csrf);
+      const saved = await api.saveFile(
+        activeRootId,
+        editorPath,
+        contentForSave(),
+        editorEtag,
+        csrf,
+      );
       editorEtag = saved.etag;
       editorOriginalContent = editorContent;
-      if (!auto) closeEditor();
+      if (!auto) closeEditor(true);
       clearDirSizeCache();
       await loadList(activeRootId, currentPath);
     } catch (error) {
       if (error instanceof ApiError && error.status === 412) {
         editorError = t($language, '文件已被其他操作修改，请关闭后重新打开。');
+      } else if (error instanceof ApiError && error.code === 'PERMISSION_DENIED') {
+        editorReadOnly = true;
+        editorReadOnlyReason = editorReadOnlyReason ?? 'file';
+        endEditPresence();
+        editorError = t($language, '文件已不可写（系统权限），内容仍可复制');
+      } else if (error instanceof ApiError && error.code === 'FORBIDDEN') {
+        editorReadOnly = true;
+        editorReadOnlyReason = 'policy';
+        endEditPresence();
+        editorError = t($language, '目录已设为只读，无法保存');
       } else {
         editorError = error instanceof Error ? error.message : t($language, '保存失败');
       }
@@ -2449,10 +2768,14 @@
   }
 
   async function downloadSelectedZip(): Promise<void> {
-    if (activeRootId === null || selected.length === 0) return;
+    await downloadZipEntries(entries.filter((entry) => selected.includes(entry.name)));
+  }
+
+  async function downloadZipEntries(items: Entry[]): Promise<void> {
+    if (activeRootId === null || items.length === 0) return;
 
     try {
-      const paths = selected.map((name) => joinPath(currentPath, name));
+      const paths = items.map((entry) => joinPath(currentPath, entry.name));
       const blob = await api.downloadZip(activeRootId, paths, csrf);
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
@@ -2465,12 +2788,6 @@
     }
   }
 
-  function splitFileName(name: string): { stem: string; ext: string } {
-    const dot = name.lastIndexOf('.');
-    if (dot <= 0) return { stem: name, ext: '' };
-    return { stem: name.slice(0, dot), ext: name.slice(dot) };
-  }
-
   function formatSize(size: number): string {
     if (size < 1024) return `${size} B`;
     if (size < 1024 ** 2) return `${(size / 1024).toFixed(1)} KB`;
@@ -2480,7 +2797,15 @@
   }
 
   function isImageName(name: string): boolean {
+    return /\.(jpe?g|png|gif|webp|bmp|tiff?|svg)$/i.test(name);
+  }
+
+  function isRasterImageName(name: string): boolean {
     return /\.(jpe?g|png|gif|webp|bmp|tiff?)$/i.test(name);
+  }
+
+  function isSvgName(name: string): boolean {
+    return /\.svg$/i.test(name);
   }
 
   function hideBrokenThumb(event: Event, key: string): void {
@@ -2526,6 +2851,7 @@
   onclick={() => {
     contextMenu = null;
     blankMenu = null;
+    sortMenuOpen = false;
   }}
   onscroll={() => {
     contextMenu = null;
@@ -2610,7 +2936,7 @@
               title={t($language, '缩略图视图')}
               onclick={() => setView('thumb')}
             >
-              <Icon name="image" size={18} />
+              <Icon name="grid" size={18} />
             </button>
             <button
               type="button"
@@ -2620,9 +2946,55 @@
               title={t($language, '平铺视图')}
               onclick={() => setView('tile')}
             >
-              <Icon name="grid" size={18} />
+              <Icon name="tile" size={18} />
             </button>
           </div>
+          {#if view !== 'list'}
+            <div class="sort-control">
+              <button
+                type="button"
+                class="sort-trigger"
+                aria-label={t($language, '排序方式')}
+                onclick={(event) => {
+                  event.stopPropagation();
+                  sortMenuOpen = !sortMenuOpen;
+                }}
+              >
+                {sortField === 'name'
+                  ? t($language, '名称')
+                  : sortField === 'size'
+                    ? t($language, '大小')
+                    : t($language, '修改时间')}{sortOrder === 'asc' ? ' ↑' : ' ↓'}
+              </button>
+              {#if sortMenuOpen}
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <div
+                  class="sort-popup"
+                  role="menu"
+                  tabindex="-1"
+                  onclick={(event) => event.stopPropagation()}
+                >
+                  {#each [
+                    ['name', t($language, '名称')],
+                    ['size', t($language, '大小')],
+                    ['modified', t($language, '修改时间')],
+                  ] as [field, label] (field)}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      class:active={sortField === field}
+                      onclick={() => {
+                        setSort(field as 'name' | 'size' | 'modified');
+                        sortMenuOpen = false;
+                      }}
+                    >
+                      {label}{sortField === field ? (sortOrder === 'asc' ? ' ↑' : ' ↓') : ''}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
         {/if}
 
         <NotificationCenter />
@@ -2645,7 +3017,7 @@
             class="upload-top"
             class:inactive={currentReadOnly}
             aria-disabled={!activeRoot || currentReadOnly}
-            title={currentReadOnly ? t($language, '当前目录只读') : t($language, '上传文件')}
+            title={currentReadOnly ? readOnlyMessage() : t($language, '上传文件')}
             aria-label={t($language, '上传')}
             onclick={uploadClick}
           >
@@ -2678,6 +3050,7 @@
               type="button"
               class:active={appView === 'files' && root.id === activeRootId}
               class="nav-item"
+              title={rootLabel(root.alias)}
               onclick={() => {
                 appView = 'files';
                 activeRootId = root.id;
@@ -2685,7 +3058,12 @@
               }}
             >
               <Icon name="folder" size={18} />
-              <span>{rootLabel(root.alias)}</span>
+              <span class="nav-label">{rootLabel(root.alias)}</span>
+              {#if root.read_only}
+                <span class="nav-readonly" title={t($language, '目录已设为只读')}
+                  >{t($language, '只读')}</span
+                >
+              {/if}
             </button>
           {/each}
           {#if roots.length === 0}
@@ -2701,7 +3079,7 @@
               onclick={() => (terminalOpen = true)}
             >
               <Icon name="terminal" size={18} />
-              <span>{t($language, '终端')}</span>
+              <span class="nav-label">{t($language, '终端')}</span>
             </button>
           {/if}
           <button
@@ -2711,7 +3089,7 @@
             onclick={() => (appView = 'shares')}
           >
             <Icon name="share" size={18} />
-            <span>{t($language, '分享管理')}</span>
+            <span class="nav-label">{t($language, '分享管理')}</span>
           </button>
         </nav>
 
@@ -2773,11 +3151,21 @@
       <div class="main">
         {#if appView === 'files'}
           <div class="pathbar">
-            <div class="path">
+            <div class="path-static">
               <Icon name="folder" size={15} />
               {#if currentReadOnly}
-                <span class="readonly-tag">{t($language, '只读')}</span>
+                <span
+                  class="readonly-tag"
+                  title={currentReadOnlyReason === 'filesystem'
+                    ? t($language, '服务进程没有文件系统写入权限')
+                    : t($language, '目录已设为只读')}
+                  >{currentReadOnlyReason === 'filesystem'
+                    ? t($language, '只读（系统）')
+                    : t($language, '只读')}</span
+                >
               {/if}
+            </div>
+            <div class="path" bind:this={pathElement}>
               <button type="button" class="path-link" onclick={() => navigate('')}>
                 {activeRoot ? rootLabel(activeRoot.alias) : t($language, '文件')}
               </button>
@@ -2815,28 +3203,30 @@
                 >
                   <Icon name="copy" size={16} />
                 </button>
-                <button
-                  type="button"
-                  class="icon-button"
-                  aria-label={t($language, '移动到')}
-                  title={t($language, '移动到')}
-                  onclick={() =>
-                    (transfer = {
-                      mode: 'move',
-                      entries: entries.filter((entry) => selected.includes(entry.name)),
-                    })}
-                >
-                  <Icon name="move" size={16} />
-                </button>
-                <button
-                  type="button"
-                  class="icon-button danger"
-                  aria-label={t($language, '删除')}
-                  title={t($language, '删除')}
-                  onclick={() => void deleteSelected()}
-                >
-                  <Icon name="trash" size={16} />
-                </button>
+                {#if !currentReadOnly}
+                  <button
+                    type="button"
+                    class="icon-button"
+                    aria-label={t($language, '移动到')}
+                    title={t($language, '移动到')}
+                    onclick={() =>
+                      (transfer = {
+                        mode: 'move',
+                        entries: entries.filter((entry) => selected.includes(entry.name)),
+                      })}
+                  >
+                    <Icon name="move" size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    class="icon-button danger"
+                    aria-label={t($language, '删除')}
+                    title={t($language, '删除')}
+                    onclick={() => void deleteSelected()}
+                  >
+                    <Icon name="trash" size={16} />
+                  </button>
+                {/if}
                 <button
                   type="button"
                   class="icon-button"
@@ -3027,12 +3417,13 @@
                     </button>
                   </section>
                 {:else if view === 'list'}
-                  <div class="browser">
+                  <div class="browser" class:refreshing={filesRefreshing}>
                     <table class="file-table" bind:this={fileTable}>
                       <thead>
                         <tr>
                           <th class="check"></th>
                           <th
+                            class:active={sortField === 'name'}
                             aria-sort={sortField === 'name'
                               ? sortOrder === 'asc'
                                 ? 'ascending'
@@ -3487,26 +3878,37 @@
       onclick={(event) => event.stopPropagation()}
       onkeydown={menuKeydown}
     >
-      {#if canPreviewEntry(contextMenu.entry)}
+      {#if menuMedia.length > 0}
         <button type="button" role="menuitem" onclick={() => runContextAction('preview')}
-          >{t($language, '预览')}</button
+          >{menuTargets.length > 1
+            ? t($language, '预览所选（{count} 项）', { count: menuMedia.length })
+            : t($language, '预览')}</button
         >
       {/if}
-      {#if !contextMenu.entry.is_dir && isAudioName(contextMenu.entry.name)}
+      {#if menuTargets.length === 1 && isSvgName(contextMenu.entry.name)}
+        <button type="button" role="menuitem" onclick={() => runContextAction('edit-source')}
+          >{t($language, '编辑源码')}</button
+        >
+      {/if}
+      {#if menuTargets.length === 1 && !contextMenu.entry.is_dir && isAudioName(contextMenu.entry.name)}
         <button type="button" role="menuitem" onclick={() => runContextAction('play')}
           >{t($language, '播放')}</button
         >
       {/if}
-      <button type="button" role="menuitem" onclick={() => runContextAction('properties')}
-        >{t($language, '详情')}</button
-      >
+      {#if menuTargets.length === 1}
+        <button type="button" role="menuitem" onclick={() => runContextAction('properties')}
+          >{t($language, '详情')}</button
+        >
+      {/if}
       <button type="button" role="menuitem" onclick={() => runContextAction('download')}
-        >{t($language, '下载')}</button
+        >{menuTargets.length > 1
+          ? t($language, '下载（ZIP）')
+          : t($language, '下载')}</button
       >
       <button type="button" role="menuitem" onclick={() => runContextAction('share')}
         >{t($language, '分享')}</button
       >
-      {#if !currentReadOnly}
+      {#if !currentReadOnly && menuTargets.length === 1}
         <button type="button" role="menuitem" onclick={() => runContextAction('rename')}
           >{t($language, '重命名')}</button
         >
@@ -3659,6 +4061,7 @@
       open
       title={confirmState.title}
       message={confirmState.message}
+      items={confirmState.items}
       confirmLabel={t($language, '删除')}
       danger
       requireText={confirmState.requireText}
@@ -3679,6 +4082,11 @@
       index={preview.index}
       onClose={() => (preview = null)}
       onIndexChange={(index) => (preview = preview ? { ...preview, index } : null)}
+      previewEdge={systemFeatures.preview_edge ?? 2048}
+      onEditSource={(entry) => {
+        preview = null;
+        void openEditor(entry);
+      }}
     />
   {/if}
 
@@ -3754,6 +4162,17 @@
       >
         <header class="editor-header">
           <strong id="editor-title">{editorName}</strong>
+          {#if editorReadOnly}
+            <span
+              class="editor-readonly"
+              title={editorReadOnlyReason === 'policy'
+                ? t($language, '目录已设为只读')
+                : editorReadOnlyReason === 'directory'
+                  ? t($language, '所在目录不可写（原子保存需要目录写权限）')
+                  : t($language, '文件本身不可写')}
+              >{t($language, '只读')}</span
+            >
+          {/if}
           {#if editorPeerEditing}
             <span class="editor-peer" role="status">
               {t($language, '另一个标签页正在编辑')}
@@ -3788,6 +4207,8 @@
             <textarea
               bind:value={editorContent}
               spellcheck="false"
+              readonly={editorReadOnly}
+              wrap="off"
               onscroll={(event) => {
                 if (lineNumbersElement) {
                   lineNumbersElement.scrollTop = event.currentTarget.scrollTop;
@@ -3801,22 +4222,31 @@
         {/if}
 
         <footer class="editor-footer">
-          <span
-            >{editorDirty ? t($language, '有未保存修改') : t($language, '已保存')} · UTF-8 ·
-            {editorContent.length} chars</span
-          >
+          <span>
+            {#if editorReadOnly}
+              {t($language, '只读')} ·
+            {:else}
+              {editorDirty ? t($language, '有未保存修改') : t($language, '已保存')} ·
+            {/if}
+            UTF-8 · {editorContent.length} chars
+            {#if editorLineEnding === 'mixed'}
+              · {t($language, '原文件混合换行，保存后统一为 LF')}
+            {/if}
+          </span>
           <div>
             <button type="button" class="ghost" onclick={() => closeEditor()}
-              >{t($language, '取消')}</button
+              >{editorReadOnly ? t($language, '关闭') : t($language, '取消')}</button
             >
-            <button
-              type="button"
-              class="primary"
-              disabled={editorSaving}
-              onclick={() => void saveEditor()}
-            >
-              {editorSaving ? t($language, '保存中…') : t($language, '保存')}
-            </button>
+            {#if !editorReadOnly}
+              <button
+                type="button"
+                class="primary"
+                disabled={editorSaving}
+                onclick={() => void saveEditor()}
+              >
+                {editorSaving ? t($language, '保存中…') : t($language, '保存')}
+              </button>
+            {/if}
           </div>
         </footer>
       </dialog>
@@ -4026,7 +4456,28 @@
   }
 
   .nav-item :global(svg) {
+    flex: 0 0 auto;
     stroke-width: 2.1;
+  }
+
+  .nav-label {
+    overflow: hidden;
+    flex: 0 1 auto;
+    min-width: 0;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .nav-readonly {
+    flex: 0 0 auto;
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-2);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.4;
+    white-space: nowrap;
   }
 
   .nav-item:hover:not(:disabled) {
@@ -4039,7 +4490,7 @@
     font-weight: 700;
   }
 
-  .nav-item.active span {
+  .nav-item.active .nav-label {
     font-weight: 700;
   }
 
@@ -4192,6 +4643,58 @@
     color: var(--text);
   }
 
+  .file-table th.active {
+    color: var(--text);
+  }
+
+  .file-table th.active .sort-button {
+    font-weight: 700;
+  }
+
+  .sort-control {
+    position: relative;
+  }
+
+  .sort-trigger {
+    height: 30px;
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 12.5px;
+    white-space: nowrap;
+  }
+
+  .sort-popup {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 40;
+    display: grid;
+    min-width: 140px;
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    box-shadow: var(--shadow-2);
+  }
+
+  .sort-popup button {
+    padding: 7px 10px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text);
+    font-size: 13px;
+    text-align: left;
+  }
+
+  .sort-popup button:hover,
+  .sort-popup button.active {
+    background: var(--hover);
+  }
+
   .top-actions {
     display: flex;
     align-items: center;
@@ -4270,13 +4773,22 @@
     background: transparent;
   }
 
+  .path-static {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-2);
+  }
+
   .path {
     display: flex;
     min-width: 0;
     flex: 1;
     align-items: center;
     gap: 8px;
-    overflow: auto;
+    overflow-x: auto;
+    overflow-y: hidden;
     color: var(--text-2);
     font-family: var(--font-mono);
     font-size: 14px;
@@ -4328,6 +4840,11 @@
 
   .browser {
     width: 100%;
+  }
+  .browser.refreshing {
+    pointer-events: none;
+    opacity: 0.55;
+    transition: opacity 120ms linear;
   }
 
   .file-table {
@@ -5023,6 +5540,17 @@
     line-height: 1.6;
     text-align: right;
     user-select: none;
+  }
+
+  .editor-readonly {
+    flex: 0 0 auto;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-2);
+    font-size: 11.5px;
+    font-weight: 500;
+    white-space: nowrap;
   }
 
   .editor-panel textarea {

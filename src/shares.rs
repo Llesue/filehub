@@ -701,16 +701,22 @@ pub async fn public_meta(
             .increment_share_visit(share.id)
             .await
             .map_err(AppError::internal)?;
-        state.events.publish(
-            "share.visited",
-            Some(share.creator_id),
-            json!({ "id": share.id }),
-        );
-        state.events.publish_share(
-            "share.visited",
-            share.id,
-            json!({ "id": share.id, "path": path, "at": unix_now() }),
-        );
+        let activity = json!({
+            "id": share.id,
+            "name": if share.kind == "collection" {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(share_name(&share))
+            },
+            "path": path,
+            "at": unix_now(),
+        });
+        state
+            .events
+            .publish("share.visited", Some(share.creator_id), activity.clone());
+        state
+            .events
+            .publish_share("share.visited", share.id, activity);
     }
     let video_enabled = {
         let settings = state.settings();
@@ -844,11 +850,22 @@ pub async fn public_meta(
         })
         .collect();
 
+    let filesystem_read_only = if share.read_only {
+        false
+    } else {
+        let path = resolved.absolute.clone();
+        tokio::task::spawn_blocking(move || fsops::directory_writable(&path))
+            .await
+            .ok()
+            .flatten()
+            == Some(false)
+    };
+
     Ok(Json(json!({
         "name": resolved.absolute.file_name().and_then(|name| name.to_str()).unwrap_or("分享"),
         "path": resolved.relative,
         "is_dir": true,
-        "read_only": share.read_only,
+        "read_only": share.read_only || filesystem_read_only,
         "entries": entries,
         "next_cursor": (offset.saturating_add(limit) < total)
             .then(|| (offset + limit).to_string()),
@@ -1073,7 +1090,7 @@ pub async fn thumb(
         if item.is_dir {
             return Err(AppError::NotFound);
         }
-        let fit_short = query.fit.as_deref() == Some("short");
+        let fit = crate::thumbs::Fit::from_query(query.fit.as_deref());
         let edge = query
             .edge
             .unwrap_or_else(|| query.w.unwrap_or(256))
@@ -1083,7 +1100,7 @@ pub async fn thumb(
             PathBuf::from(&item.real_path),
             edge,
             edge,
-            fit_short,
+            fit,
             share.creator_id,
             &headers,
             Some(crate::thumbs::ThumbScope {
@@ -1121,7 +1138,7 @@ pub async fn thumb(
     if resolved.absolute.is_dir() {
         return Err(AppError::NotFound);
     }
-    let fit_short = query.fit.as_deref() == Some("short");
+    let fit = crate::thumbs::Fit::from_query(query.fit.as_deref());
     let edge = query
         .edge
         .unwrap_or_else(|| query.w.unwrap_or(256))
@@ -1132,7 +1149,7 @@ pub async fn thumb(
         resolved.absolute,
         edge,
         edge,
-        fit_short,
+        fit,
         share.creator_id,
         &headers,
         Some(crate::thumbs::ThumbScope {
@@ -1337,6 +1354,20 @@ async fn public_zip_response(
     check_public_rate(&state, &share, headers)?;
     let (selected, filename) = resolve_zip_selection(&state, &share, path, paths, item_ids).await?;
     let entries = collect_public_zip_entries(&state, &share, selected).await?;
+    let activity = json!({
+        "id": share.id,
+        "name": filename,
+        "path": filename,
+        "items": entries.len(),
+        "bytes": entries.iter().map(|entry| entry.size).sum::<u64>(),
+        "zip": true,
+    });
+    state
+        .events
+        .publish("share.downloaded", Some(share.creator_id), activity.clone());
+    state
+        .events
+        .publish_share("share.downloaded", share.id, activity);
     crate::files::zip_response(&state, entries, &filename)
 }
 

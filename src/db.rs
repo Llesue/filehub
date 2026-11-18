@@ -2507,7 +2507,7 @@ impl Db {
              FROM index_entries e JOIN indexed_dirs d ON d.id = e.dir_id \
              WHERE d.real_path = ?1 AND d.status = 'ready' \
                AND (?4 = 1 OR e.name NOT LIKE '.%') \
-             ORDER BY e.is_dir DESC, {order_column} {direction}, e.name COLLATE NOCASE \
+             ORDER BY e.is_dir DESC, {order_column} {direction}, e.name COLLATE NOCASE {direction} \
              LIMIT ?2 OFFSET ?3"
         );
         self.call(move |connection| {

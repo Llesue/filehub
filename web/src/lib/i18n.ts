@@ -616,6 +616,63 @@ const en: Record<string, string> = {
   实时更新未连接: 'Live updates disconnected',
   上一项: 'Previous',
   下一项: 'Next',
+  '无法显示该图片': 'Unable to display this image',
+  编辑源码: 'Edit source',
+  '只读（系统）': 'Read-only (system)',
+  服务进程没有文件系统写入权限: 'The server process cannot write to this directory',
+  目标目录不可写: 'Destination folder is not writable',
+  '文件超过 2MB，无法在编辑器中打开':
+    'File is larger than 2 MB and cannot be opened in the editor',
+  '不是 UTF-8 文本，无法编辑': 'Not UTF-8 text; editing is unavailable',
+  无法编辑: 'Cannot edit',
+  '有未保存修改，确定关闭？': 'You have unsaved changes. Close anyway?',
+  '文件已不可写（系统权限），内容仍可复制':
+    'The file is no longer writable (filesystem permissions); you can still copy the text',
+  '所在目录不可写（原子保存需要目录写权限）':
+    'The containing folder is not writable (atomic saves need folder write access)',
+  文件本身不可写: 'The file itself is not writable',
+  '原文件混合换行，保存后统一为 LF':
+    'Original file mixed line endings; saving will normalize to LF',
+  '图片过大 {size}，无法预览': 'Image is too large ({size}) to preview',
+  未知尺寸: 'unknown size',
+  '预览所选（{count} 项）': 'Preview selected ({count})',
+  '下载（ZIP）': 'Download (ZIP)',
+  '当前目录只读（文件系统权限不足）':
+    'Current folder is read-only (insufficient filesystem permissions)',
+  无写入权限: 'No write permission',
+  分享访问通知: 'Share activity notifications',
+  '目录不存在或已被删除：{path}': 'Folder does not exist or was deleted: {path}',
+  目录不可用: 'Folder unavailable',
+  返回上级: 'Go to parent',
+  不存在或已被删除: 'does not exist or was deleted',
+  目标只读: 'destination is read-only',
+  目标已存在: 'destination already exists',
+  文件过大: 'File is too large',
+  '{kind}失败：{label}（{reason}）': '{kind} failed: {label} ({reason})',
+  '{kind}失败：{reason}': '{kind} failed: {reason}',
+  '{kind}完成：{count} 项 · {size} → {dest}':
+    '{kind} finished: {count} items · {size} → {dest}',
+  '{kind}完成：{success} 项成功，{failed} 项失败':
+    '{kind} finished: {success} succeeded, {failed} failed',
+  '上传完成：{count} 项 · {size}': 'Upload finished: {count} items · {size}',
+  '删除完成：{count} 项 · {size}': 'Delete finished: {count} items · {size}',
+  文件合集: 'file collection',
+  '分享「{name}」被访问': 'Share "{name}" was visited',
+  '分享「{name}」被下载：{item}': 'Share "{name}" was downloaded: {item}',
+  '分享「{name}」收到上传：{item}': 'Share "{name}" received an upload: {item}',
+  缩略图与预览: 'Thumbnails and previews',
+  其他图片像素上限: 'Other image pixel limit',
+  源文件大小上限: 'Source size limit',
+  '预览长边范围 512–4096；像素上限按百万像素（MP）计。':
+    'Preview long edge is 512–4096; pixel limits are in megapixels (MP).',
+  默认值: 'Default',
+  配置文件: 'Config file',
+  '服务进程没有访问权限（文件系统权限不足）':
+    'The server process does not have access (filesystem permissions)',
+  操作被拒绝: 'Operation denied',
+  '已跳过 {count} 张过大的图片': 'Skipped {count} oversized image(s)',
+  '目录已设为只读': 'This folder is configured as read-only',
+  '目录已设为只读，无法保存': 'This folder is configured as read-only; saving is disabled',
 };
 
 export function t(lang: Lang, key: string, vars?: Record<string, string | number>): string {

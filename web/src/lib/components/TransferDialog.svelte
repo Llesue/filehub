@@ -4,6 +4,7 @@
   import { api, type Entry, type Root } from '../api';
   import { language, rootAlias, t } from '../i18n';
   import Icon from './Icon.svelte';
+  import FileName from './FileName.svelte';
 
   let {
     open,
@@ -30,6 +31,7 @@
   let directories = $state<Entry[]>([]);
   let loading = $state(false);
   let error = $state('');
+  let targetReadOnly = $state(false);
   let overlayPressed = false;
 
   onMount(() => {
@@ -44,9 +46,11 @@
     error = '';
     try {
       const result = await api.list(rootId, path, 'name', 'asc', false);
+      targetReadOnly = result.read_only;
       directories = result.entries.filter((entry) => entry.is_dir);
     } catch (err) {
       error = err instanceof Error ? err.message : t($language, '目录加载失败');
+      targetReadOnly = false;
       directories = [];
     } finally {
       loading = false;
@@ -71,7 +75,7 @@
 
   function submit(event: SubmitEvent): void {
     event.preventDefault();
-    if (rootId) onConfirm(rootId, path);
+    if (rootId && !targetReadOnly) onConfirm(rootId, path);
   }
 </script>
 
@@ -150,15 +154,18 @@
               onclick={() => enter(directory)}
             >
               <Icon name="folder" size={18} />
-              <span>{directory.name}</span>
+              <FileName name={directory.name} isDir />
             </button>
           {/each}
         {/if}
       </div>
       <p class="hint">{t($language, '目标目录：')}<strong>/{path}</strong></p>
+      {#if targetReadOnly}
+        <p class="readonly-hint">{t($language, '目标目录不可写')}</p>
+      {/if}
       <div class="dialog-actions">
         <button type="button" class="ghost" onclick={onClose}>{t($language, '取消')}</button>
-        <button type="submit"
+        <button type="submit" disabled={targetReadOnly || loading}
           >{mode === 'copy' ? t($language, '复制到这里') : t($language, '移动到这里')}</button
         >
       </div>
@@ -264,6 +271,21 @@
 
   .directory-row:hover {
     background: var(--hover);
+  }
+
+  .directory-row :global(svg) {
+    flex: 0 0 auto;
+  }
+
+  .directory-row :global(.file-name) {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .readonly-hint {
+    margin: 0;
+    color: var(--danger);
+    font-size: 13px;
   }
 
   .error {

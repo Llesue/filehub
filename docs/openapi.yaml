@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: FileHub API
-  version: 0.1.7
+  version: 0.1.8
   description: FileHub 自托管文件管理器 API。所有业务接口前缀 /api/v1。
 servers:
   - url: /
@@ -49,8 +49,11 @@ paths:
                 token: { type: string }
                 username: { type: string }
                 password: { type: string }
+                language:
+                  { type: string, enum: [zh-CN, en], description: 首个管理员偏好语言；缺省用 ui.default_locale }
       responses:
         '200': { $ref: '#/components/responses/AuthResponse' }
+        '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
   /api/v1/login:
@@ -202,7 +205,8 @@ paths:
     get:
       tags: [files]
       summary: 目录列表
-      description: 响应包含 `read_only`，表示当前目录（含嵌套只读根和可信链接）是否只读。
+      description: |
+        响应包含 `read_only` 与 `read_only_reason`。`read_only_reason` 为 `policy`（root 或可信链接配置只读）或 `filesystem`（服务进程没有当前目录的写权限），两者皆无时为 `null`。写入只读目录返回 `403 PERMISSION_DENIED`（文件系统）或 `403 FORBIDDEN`（策略）。
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, schema: { type: string, default: '' } }
@@ -211,6 +215,31 @@ paths:
       responses:
         '200': { description: OK }
         '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/fs/image-info:
+    get:
+      tags: [files]
+      summary: 图片头信息与预览可行性预检
+      description: 只读图片头，不解码像素。超过 JPEG/其他图片像素上限或源文件大小上限时 `previewable=false`，客户端不应打开灯箱。
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  width: { type: integer, nullable: true }
+                  height: { type: integer, nullable: true }
+                  pixels: { type: integer, format: int64, nullable: true }
+                  limit: { type: integer, format: int64, nullable: true }
+                  previewable: { type: boolean }
+                  reason: { type: string, nullable: true, enum: [too_large, max_source, unsupported, null] }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/properties:
     get:
@@ -460,7 +489,9 @@ paths:
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, required: true, schema: { type: string } }
-        - { name: w, in: query, schema: { type: integer, minimum: 16, maximum: 2048, default: 256 } }
+        - { name: w, in: query, schema: { type: integer, minimum: 16, maximum: 4096, default: 256 } }
+        - { name: edge, in: query, schema: { type: integer, minimum: 16, maximum: 4096, description: 长边上限受 thumbnails.preview_edge 限制 } }
+        - { name: fit, in: query, schema: { type: string, enum: [width, short, long], default: width } }
         - { name: wait, in: query, schema: { type: integer, enum: [0, 1], default: 0 } }
       responses:
         '200':
@@ -492,11 +523,27 @@ paths:
     get:
       tags: [files]
       summary: 读取文本文件
+      description: '响应包含 `line_ending`（lf/crlf/mixed）、`writable` 与 `read_only_reason`（file/directory）。保存需要文件与父目录都可写。'
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, required: true, schema: { type: string } }
       responses:
-        '200': { description: OK }
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [content, etag, size, modified, line_ending, writable, read_only_reason]
+                properties:
+                  content: { type: string }
+                  etag: { type: string }
+                  size: { type: integer, format: int64 }
+                  modified: { type: integer, format: int64 }
+                  line_ending: { type: string, enum: [lf, crlf, mixed] }
+                  writable: { type: boolean }
+                  read_only_reason: { type: string, nullable: true, enum: [file, directory, null] }
+        '403': { $ref: '#/components/responses/Error' }
         '415': { $ref: '#/components/responses/Error' }
     put:
       tags: [files]

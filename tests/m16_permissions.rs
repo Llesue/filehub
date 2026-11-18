@@ -1,0 +1,334 @@
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, Response, StatusCode, header};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+struct TestApp {
+    _dir: tempfile::TempDir,
+    home: std::path::PathBuf,
+    router: Router,
+    cookie: String,
+    csrf: String,
+    user_id: i64,
+    root_id: i64,
+}
+
+async fn setup_app() -> TestApp {
+    let dir = tempfile::tempdir().unwrap();
+    let state = filehub::state::AppState::new_test(dir.path(), "test-token")
+        .await
+        .unwrap();
+    let router = filehub::app::router(state);
+    let setup = send_json(
+        &router,
+        Method::POST,
+        "/api/v1/setup",
+        None,
+        None,
+        json!({"token":"test-token","username":"admin","password":"correct horse"}),
+    )
+    .await;
+    assert_eq!(setup.status(), StatusCode::OK);
+    let cookie = session_cookie(&setup);
+    let body = json_body(setup).await;
+    let csrf = body["csrf_token"].as_str().unwrap().to_owned();
+    let user_id = body["user"]["id"].as_i64().unwrap();
+    let roots = send(&router, Method::GET, "/api/v1/roots", Some(&cookie), None).await;
+    let root_id = json_body(roots).await["roots"][0]["id"].as_i64().unwrap();
+    TestApp {
+        home: dir.path().join("users/admin"),
+        _dir: dir,
+        router,
+        cookie,
+        csrf,
+        user_id,
+        root_id,
+    }
+}
+
+async fn send(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+) -> Response<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn send_json(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+    body: Value,
+) -> Response<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+fn session_cookie(response: &Response<Body>) -> String {
+    response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+async fn json_body(response: Response<Body>) -> Value {
+    let body = to_bytes(response.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        rustix::process::geteuid().as_raw() == 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[tokio::test]
+async fn policy_read_only_is_reported_separately() {
+    let app = setup_app().await;
+    let update = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/admin/users/{}/roots/{}", app.user_id, app.root_id),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"alias":"我的文件","read_only":true,"sort_order":0}),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let list = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/list?root={}&path=", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = json_body(list).await;
+    assert_eq!(body["read_only"], true);
+    assert_eq!(body["read_only_reason"], "policy");
+
+    let mkdir = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root":app.root_id,"path":"","name":"blocked"}),
+    )
+    .await;
+    assert_eq!(mkdir.status(), StatusCode::FORBIDDEN);
+    let body = json_body(mkdir).await;
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+}
+
+#[tokio::test]
+async fn filesystem_read_only_and_file_writability() {
+    if is_root() {
+        // Root bypasses mode bits, so this assertion only makes sense for the
+        // unprivileged service account used in production.
+        return;
+    }
+    let app = setup_app().await;
+    let locked = app.home.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("a.txt"), "hello").unwrap();
+    let read_only_file = locked.join("readonly.txt");
+    std::fs::write(&read_only_file, "hello").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(&read_only_file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    let list = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/list?root={}&path=locked", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = json_body(list).await;
+    assert_eq!(body["read_only"], true);
+    assert_eq!(body["read_only_reason"], "filesystem");
+
+    let mkdir = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root":app.root_id,"path":"locked","name":"x"}),
+    )
+    .await;
+    assert_eq!(mkdir.status(), StatusCode::FORBIDDEN);
+    let body = json_body(mkdir).await;
+    assert_eq!(body["error"]["code"], "PERMISSION_DENIED");
+
+    let file = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/file?root={}&path=locked/readonly.txt", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(file.status(), StatusCode::OK);
+    let body = json_body(file).await;
+    assert_eq!(body["writable"], false);
+    assert_eq!(body["read_only_reason"], "file");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn svg_is_never_served_inline() {
+    let app = setup_app().await;
+    std::fs::write(
+        app.home.join("icon.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>",
+    )
+    .unwrap();
+    std::fs::write(
+        app.home.join("pixel.png"),
+        [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+    )
+    .unwrap();
+
+    let svg = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/api/v1/download?root={}&path=icon.svg&inline=true",
+            app.root_id
+        ),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(svg.status(), StatusCode::OK);
+    let disposition = svg
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(disposition.starts_with("attachment"));
+
+    let png = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/api/v1/download?root={}&path=pixel.png&inline=true",
+            app.root_id
+        ),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(png.status(), StatusCode::OK);
+    let disposition = png
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(disposition.starts_with("inline"));
+}
+
+#[tokio::test]
+async fn setup_language_becomes_admin_preference() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = filehub::state::AppState::new_test(dir.path(), "test-token")
+        .await
+        .unwrap();
+    let router = filehub::app::router(state);
+    let setup = send_json(
+        &router,
+        Method::POST,
+        "/api/v1/setup",
+        None,
+        None,
+        json!({"token":"test-token","username":"admin","password":"correct horse","language":"en"}),
+    )
+    .await;
+    assert_eq!(setup.status(), StatusCode::OK);
+    let cookie = session_cookie(&setup);
+    let preferences = send(
+        &router,
+        Method::GET,
+        "/api/v1/me/preferences",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(preferences.status(), StatusCode::OK);
+    let body = json_body(preferences).await;
+    assert_eq!(body["preferences"]["language"], "en");
+
+    let invalid_dir = tempfile::tempdir().unwrap();
+    let invalid_state = filehub::state::AppState::new_test(invalid_dir.path(), "test-token")
+        .await
+        .unwrap();
+    let invalid_router = filehub::app::router(invalid_state);
+    let invalid = send_json(
+        &invalid_router,
+        Method::POST,
+        "/api/v1/setup",
+        None,
+        None,
+        json!({"token":"test-token","username":"admin","password":"correct horse","language":"fr"}),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}

@@ -79,6 +79,12 @@ function isRetryable(error: unknown): boolean {
 }
 
 function errorText(error: unknown): string {
+  if (error instanceof ApiError && error.code === 'PERMISSION_DENIED') {
+    return t(get(language), '无写入权限');
+  }
+  if (error instanceof ApiError && error.code === 'FORBIDDEN') {
+    return t(get(language), '当前目录只读');
+  }
   if (error instanceof Error && error.message) return error.message;
   return t(get(language), '上传失败');
 }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { api, type User, type UserPreferences } from '../api';
   import { language, t, type Lang } from '../i18n';
   import { showNotice } from '../notices';
@@ -24,6 +25,24 @@
   let avatarInput = $state<HTMLInputElement | null>(null);
   let avatarCropSrc = $state('');
   let saving = $state(false);
+  let shareActivityNotify = $state(true);
+
+  onMount(() => {
+    try {
+      shareActivityNotify = localStorage.getItem('filehub.notify.share_activity') !== '0';
+    } catch {
+      shareActivityNotify = true;
+    }
+  });
+
+  function setShareActivityNotify(enabled: boolean): void {
+    shareActivityNotify = enabled;
+    try {
+      localStorage.setItem('filehub.notify.share_activity', enabled ? '1' : '0');
+    } catch {
+      // localStorage may be unavailable; the in-memory toggle still applies.
+    }
+  }
 
   async function persist(patch: Parameters<typeof api.updatePreferences>[0]): Promise<void> {
     saving = true;
@@ -167,6 +186,14 @@
         />
       </div>
     {/if}
+    <div class="pref-row">
+      <span>{t($language, '分享访问通知')}</span>
+      <input
+        type="checkbox"
+        checked={shareActivityNotify}
+        onchange={(event) => setShareActivityNotify(event.currentTarget.checked)}
+      />
+    </div>
     <label class="pref-row">
       <span>{t($language, '上传同名文件')}</span>
       <select

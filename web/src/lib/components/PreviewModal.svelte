@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { api, type Entry } from '../api';
   import { audioState, setAudioPlaying } from '../audio';
   import Icon from './Icon.svelte';
+  import FileName from './FileName.svelte';
   import { language, t } from '../i18n';
 
   let {
@@ -15,6 +16,8 @@
     srcFor,
     thumbSrcFor,
     downloadHref,
+    previewEdge = 2048,
+    onEditSource,
   }: {
     root: number;
     currentPath: string;
@@ -25,6 +28,8 @@
     srcFor?: (entry: Entry) => string;
     thumbSrcFor?: (entry: Entry) => string;
     downloadHref?: (entry: Entry) => string;
+    previewEdge?: number;
+    onEditSource?: (entry: Entry) => void;
   } = $props();
 
   let current = $derived(items[index]);
@@ -34,11 +39,25 @@
   let showOriginal = $state(false);
   let imageFallback = $state(false);
   let previewFailed = $state(false);
+  let failureText = $state('');
   let hiResLoaded = $state(false);
-  let blurVisible = $state(true);
+  let blurPhase = $state<'visible' | 'fading' | 'hidden'>('visible');
   let frameRatio = $state(1);
   let frameReady = $state(false);
+  let naturalWidth = $state(0);
+  let blurCanvas = $state<HTMLCanvasElement | null>(null);
+  let blurImageLoaded = $state(false);
+  let sizeResolved = $state(false);
+  let blurFallback = $state(false);
+  let prepareToken = 0;
+  let sizeTimer: ReturnType<typeof setTimeout> | null = null;
+  let blurSourceImage: HTMLImageElement | null = null;
+  let infoWidth = 0;
+  let infoHeight = 0;
+  let fadeBlurTimer: ReturnType<typeof setTimeout> | null = null;
   let hideBlurTimer: ReturnType<typeof setTimeout> | null = null;
+  let svgUrl = $state('');
+  let svgAbort: AbortController | null = null;
   let dragging = false;
   let dragged = false;
   let dragStart = { x: 0, y: 0, offsetX: 0, offsetY: 0 };
@@ -90,12 +109,18 @@
   });
 
   onDestroy(() => {
-    clearBlurTimer();
+    prepareToken += 1;
+    clearSizeTimer();
+    clearBlurTimers();
+    clearSvg();
+    blurSourceImage = null;
     if (resumeAudio) setAudioPlaying(true);
   });
   let entryPath = $derived(
     current ? (currentPath ? `${currentPath}/${current.name}` : current.name) : '',
   );
+  let isSvgPreview = $derived(current ? isSvgName(current.name) : false);
+  let isGifPreview = $derived(current ? /\.gif$/i.test(current.name) : false);
   let url = $derived(current ? (srcFor ? srcFor(current) : api.previewUrl(root, entryPath)) : '');
   let lowResUrl = $derived(
     current
@@ -106,58 +131,310 @@
   );
   let previewSrc = $derived(
     current
-      ? showOriginal || imageFallback
-        ? url
-        : thumbSrcFor
-          ? thumbSrcFor(current)
-          : api.previewThumbUrl(root, entryPath, 2048)
+      ? isSvgPreview
+        ? svgUrl
+        : showOriginal || imageFallback || isGifPreview
+          ? url
+          : thumbSrcFor
+            ? thumbSrcFor(current)
+            : api.previewThumbUrl(root, entryPath, previewEdge)
       : '',
   );
 
-  function clearBlurTimer(): void {
+  $effect(() => {
+    const entry = current;
+    untrack(() => {
+      if (!entry || !isSvgName(entry.name)) {
+        clearSvg();
+        return;
+      }
+      if (entry.size > 10 * 1024 * 1024) {
+        clearSvg();
+        previewFailed = true;
+        failureText = t($language, '文件过大，无法预览');
+        return;
+      }
+      loadSvg();
+    });
+  });
+
+  $effect(() => {
+    const entry = current;
+    untrack(() => preparePreview(entry));
+  });
+
+  function clearSizeTimer(): void {
+    if (sizeTimer !== null) {
+      clearTimeout(sizeTimer);
+      sizeTimer = null;
+    }
+  }
+
+  function clearBlurTimers(): void {
+    if (fadeBlurTimer !== null) {
+      clearTimeout(fadeBlurTimer);
+      fadeBlurTimer = null;
+    }
     if (hideBlurTimer !== null) {
       clearTimeout(hideBlurTimer);
       hideBlurTimer = null;
     }
   }
 
-  function noteAspect(event: Event): void {
-    const image = event.currentTarget as HTMLImageElement;
-    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
-      frameRatio = image.naturalWidth / image.naturalHeight;
-      frameReady = true;
+  function preparePreview(entry: Entry | undefined): void {
+    prepareToken += 1;
+    const token = prepareToken;
+    clearSizeTimer();
+    clearBlurTimers();
+    blurSourceImage = null;
+    blurImageLoaded = false;
+    sizeResolved = false;
+    frameReady = false;
+    blurFallback = false;
+    naturalWidth = 0;
+    frameRatio = 1;
+    infoWidth = 0;
+    infoHeight = 0;
+    if (!entry) return;
+    if (isSvgPreview || isVideo(entry.name) || isAudio(entry.name) || isPdf(entry.name)) {
+      sizeResolved = true;
+      return;
+    }
+
+    const image = new Image();
+    image.decoding = 'async';
+    image.onload = () => {
+      if (token !== prepareToken) return;
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        frameRatio = image.naturalWidth / image.naturalHeight;
+      }
+      blurSourceImage = image;
+      blurImageLoaded = true;
+      maybeRevealFrame();
+    };
+    image.onerror = () => {
+      if (token !== prepareToken) return;
+      blurImageLoaded = true;
+      maybeRevealFrame();
+    };
+    image.src = lowResUrl;
+
+    const finishSize = (): void => {
+      if (token !== prepareToken) return;
+      clearSizeTimer();
+      sizeResolved = true;
+      maybeRevealFrame();
+    };
+    if (root > 0) {
+      api
+        .imageInfo(root, entryPath)
+        .then((info) => {
+          if (token !== prepareToken) return;
+          infoWidth = info.width ?? 0;
+          infoHeight = info.height ?? 0;
+          finishSize();
+        })
+        .catch(() => finishSize());
+      sizeTimer = setTimeout(finishSize, 200);
+    } else {
+      finishSize();
     }
   }
 
+  function maybeRevealFrame(): void {
+    if (frameReady || !blurImageLoaded || !sizeResolved) return;
+    if (infoWidth > 0 && infoHeight > 0) {
+      const infoRatio = infoWidth / infoHeight;
+      // EXIF rotation can make the header ratio differ from the rendered
+      // thumbnail. Only apply the natural-size cap when both agree.
+      naturalWidth = Math.abs(infoRatio / frameRatio - 1) <= 0.02 ? infoWidth : 0;
+    }
+    if (blurSourceImage) drawBlurredThumb(blurSourceImage);
+    frameReady = true;
+  }
+
+  function drawBlurredThumb(image: HTMLImageElement): void {
+    const canvas = blurCanvas;
+    const sourceWidth = image.naturalWidth;
+    const sourceHeight = image.naturalHeight;
+    if (!canvas || sourceWidth <= 0 || sourceHeight <= 0) return;
+    const ratio = sourceWidth / sourceHeight;
+    const cap = naturalWidth > 0 ? naturalWidth : Number.POSITIVE_INFINITY;
+    const displayWidth = Math.max(
+      1,
+      Math.min(window.innerWidth * 0.92, window.innerHeight * 0.78 * ratio, cap),
+    );
+    // Blur a bounded-size copy: the layer is only visible for ~300ms and is
+    // stretched to the frame, so a 2048px source adds no visible quality.
+    const baseWidth = Math.min(sourceWidth, 512);
+    const baseHeight = Math.max(1, Math.round((sourceHeight * baseWidth) / sourceWidth));
+    const radius = Math.min(48, Math.max(2, (18 * baseWidth) / displayWidth));
+    const pad = Math.ceil(radius * 3);
+
+    const padded = document.createElement('canvas');
+    padded.width = baseWidth + pad * 2;
+    padded.height = baseHeight + pad * 2;
+    const paddedContext = padded.getContext('2d');
+    if (!paddedContext) return;
+    paddedContext.drawImage(image, pad, pad, baseWidth, baseHeight);
+    paddedContext.drawImage(image, 0, 0, 1, sourceHeight, 0, pad, pad, baseHeight);
+    paddedContext.drawImage(
+      image,
+      sourceWidth - 1,
+      0,
+      1,
+      sourceHeight,
+      pad + baseWidth,
+      pad,
+      pad,
+      baseHeight,
+    );
+    paddedContext.drawImage(image, 0, 0, sourceWidth, 1, pad, 0, baseWidth, pad);
+    paddedContext.drawImage(
+      image,
+      0,
+      sourceHeight - 1,
+      sourceWidth,
+      1,
+      pad,
+      pad + baseHeight,
+      baseWidth,
+      pad,
+    );
+    paddedContext.drawImage(image, 0, 0, 1, 1, 0, 0, pad, pad);
+    paddedContext.drawImage(image, sourceWidth - 1, 0, 1, 1, pad + baseWidth, 0, pad, pad);
+    paddedContext.drawImage(
+      image,
+      0,
+      sourceHeight - 1,
+      1,
+      1,
+      0,
+      pad + baseHeight,
+      pad,
+      pad,
+    );
+    paddedContext.drawImage(
+      image,
+      sourceWidth - 1,
+      sourceHeight - 1,
+      1,
+      1,
+      pad + baseWidth,
+      pad + baseHeight,
+      pad,
+      pad,
+    );
+
+    canvas.width = baseWidth;
+    canvas.height = baseHeight;
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.filter = `blur(${radius}px)`;
+    if (!context.filter.includes('blur')) {
+      blurFallback = true;
+      return;
+    }
+    context.drawImage(padded, -pad, -pad);
+    context.filter = 'none';
+  }
+
   function handleHiResLoad(event: Event): void {
-    noteAspect(event);
+    const image = event.currentTarget as HTMLImageElement;
+    if (isSvgPreview) {
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        frameRatio = image.naturalWidth / image.naturalHeight;
+      }
+      frameReady = true;
+    } else if (!blurImageLoaded && image.naturalWidth > 0 && image.naturalHeight > 0) {
+      frameRatio = image.naturalWidth / image.naturalHeight;
+    }
     hiResLoaded = true;
-    clearBlurTimer();
-    // Keep the blurred layer under the 80ms fade, then remove it completely.
-    hideBlurTimer = setTimeout(() => {
-      blurVisible = false;
-      hideBlurTimer = null;
+    clearBlurTimers();
+    if (isSvgPreview) {
+      blurPhase = 'hidden';
+      return;
+    }
+    // Keep the blurred layer under the 80ms fade, then fade it out. The node
+    // stays mounted so removing it can never re-present a stale blur frame.
+    fadeBlurTimer = setTimeout(() => {
+      blurPhase = 'fading';
+      fadeBlurTimer = null;
     }, 100);
+    hideBlurTimer = setTimeout(() => {
+      blurPhase = 'hidden';
+      hideBlurTimer = null;
+    }, 220);
   }
 
   function handleHiResError(): void {
-    clearBlurTimer();
+    clearBlurTimers();
     hiResLoaded = false;
-    blurVisible = true;
-    if (showOriginal || imageFallback) previewFailed = true;
-    else imageFallback = true;
+    blurPhase = 'visible';
+    if (showOriginal || imageFallback || isSvgPreview) {
+      previewFailed = true;
+      failureText = t($language, '无法显示该图片');
+    } else {
+      imageFallback = true;
+    }
   }
 
   function resetView(): void {
-    clearBlurTimer();
+    clearBlurTimers();
     zoom = 1;
     offsetX = 0;
     offsetY = 0;
     showOriginal = false;
     imageFallback = false;
     previewFailed = false;
+    failureText = '';
     hiResLoaded = false;
-    blurVisible = true;
+    blurPhase = 'visible';
+    naturalWidth = 0;
+    frameReady = false;
+  }
+
+  function toggleOriginal(): void {
+    showOriginal = !showOriginal;
+    hiResLoaded = false;
+    previewFailed = false;
+    failureText = '';
+    naturalWidth = 0;
+    clearBlurTimers();
+    blurPhase = showOriginal ? 'hidden' : 'visible';
+  }
+
+  function clearSvg(): void {
+    if (svgAbort) {
+      svgAbort.abort();
+      svgAbort = null;
+    }
+    if (svgUrl) {
+      URL.revokeObjectURL(svgUrl);
+      svgUrl = '';
+    }
+  }
+
+  function loadSvg(): void {
+    clearSvg();
+    const controller = new AbortController();
+    svgAbort = controller;
+    fetch(url, { signal: controller.signal, credentials: 'same-origin' })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.blob();
+      })
+      .then((blob) => {
+        if (controller.signal.aborted) return;
+        svgUrl = URL.createObjectURL(blob);
+        svgAbort = null;
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        svgAbort = null;
+        previewFailed = true;
+        failureText = t($language, '无法显示该图片');
+      });
   }
 
   function previous(): void {
@@ -217,29 +494,32 @@
   function isPdf(name: string): boolean {
     return /\.pdf$/i.test(name);
   }
+
+  function isSvgName(name: string): boolean {
+    return /\.svg$/i.test(name);
+  }
 </script>
 
 <svelte:window onkeydown={onKeydown} onpointermove={drag} onpointerup={endDrag} />
 
 <div class="lightbox" role="presentation" onclick={onClose}>
   <header class="lightbox-bar" role="presentation" onclick={(event) => event.stopPropagation()}>
-    <strong>{current?.name ?? ''}</strong>
+    <strong><FileName name={current?.name ?? ''} /></strong>
     <div class="lightbox-actions">
       {#if current && !isVideo(current.name) && !isAudio(current.name) && !isPdf(current.name)}
         <button type="button" onclick={() => (zoom = Math.max(0.2, zoom - 0.2))}>−</button>
         <span>{Math.round(zoom * 100)}%</span>
         <button type="button" onclick={() => (zoom = Math.min(8, zoom + 0.2))}>+</button>
         <button type="button" onclick={() => resetView()}>{t($language, '复位')}</button>
-        <button
-          type="button"
-          onclick={() => {
-            showOriginal = !showOriginal;
-            hiResLoaded = false;
-            blurVisible = false;
-            clearBlurTimer();
-          }}
-        >
-          {showOriginal ? t($language, '显示预览图') : t($language, '显示原图')}
+        {#if !isSvgPreview && !isGifPreview}
+          <button type="button" onclick={toggleOriginal}>
+            {showOriginal ? t($language, '显示预览图') : t($language, '显示原图')}
+          </button>
+        {/if}
+      {/if}
+      {#if current && isSvgPreview && onEditSource}
+        <button type="button" onclick={() => onEditSource(current)}>
+          {t($language, '编辑源码')}
         </button>
       {/if}
       <button
@@ -284,7 +564,7 @@
         <iframe class="lightbox-document" src={url} title={current.name}></iframe>
       {:else if previewFailed}
         <div class="preview-failure" role="alert" onclick={(event) => event.stopPropagation()}>
-          <p>{t($language, '图片过大，无法预览')}</p>
+          <p>{failureText || t($language, '图片过大，无法预览')}</p>
           <a href={downloadHref ? downloadHref(current) : api.downloadUrl(root, entryPath)} download
             >{t($language, '下载原图')}</a
           >
@@ -293,33 +573,36 @@
         <div
           class="preview-frame"
           class:ready={frameReady}
-          class:clipping={blurVisible}
-          style={`--ratio:${frameRatio};transform:translate(${offsetX}px, ${offsetY}px) scale(${zoom})`}
+          class:natural={naturalWidth > 0 && !isSvgPreview}
+          style={`--ratio:${frameRatio};--natural:${naturalWidth}px;transform:translate(${offsetX}px, ${offsetY}px) scale(${zoom})`}
         >
-          {#if blurVisible}
-            <img
+          {#if !isSvgPreview}
+            <canvas
+              bind:this={blurCanvas}
               class="preview-blur"
-              src={lowResUrl}
-              alt=""
+              class:fallback-blur={blurFallback}
+              class:fading={blurPhase === 'fading'}
+              class:hidden-blur={blurPhase === 'hidden'}
               aria-hidden="true"
-              onload={noteAspect}
+            ></canvas>
+          {/if}
+          {#if previewSrc}
+            <img
+              class="preview-hi"
+              class:loaded={hiResLoaded}
+              src={previewSrc}
+              alt={current.name}
+              onclick={(event) => {
+                if (dragged) dragged = false;
+                event.stopPropagation();
+              }}
+              onpointerdown={startDrag}
+              onpointerup={endDrag}
+              onpointercancel={endDrag}
+              onload={handleHiResLoad}
+              onerror={handleHiResError}
             />
           {/if}
-          <img
-            class="preview-hi"
-            class:loaded={hiResLoaded}
-            src={previewSrc}
-            alt={current.name}
-            onclick={(event) => {
-              if (dragged) dragged = false;
-              event.stopPropagation();
-            }}
-            onpointerdown={startDrag}
-            onpointerup={endDrag}
-            onpointercancel={endDrag}
-            onload={handleHiResLoad}
-            onerror={handleHiResError}
-          />
         </div>
       {/if}
     {/if}
@@ -436,36 +719,57 @@
     max-width: 92vw;
     max-height: 78vh;
     aspect-ratio: var(--ratio, 1);
+    overflow: hidden;
     cursor: grab;
     transform-origin: center;
     visibility: hidden;
+  }
+
+  .preview-frame.natural {
+    width: min(92vw, calc(78vh * var(--ratio, 1)), var(--natural, 100vw));
   }
 
   .preview-frame.ready {
     visibility: visible;
   }
 
-  .preview-frame.clipping {
-    overflow: hidden;
-  }
-
   .preview-frame:active {
     cursor: grabbing;
   }
 
+  /* The sharp image must paint above the persistent blur node. Without the
+     explicit z-index the absolutely positioned blur canvas paints over the
+     static img, so the compositor can flash a blur-only frame mid-fade. */
   .preview-frame .preview-blur {
     position: absolute;
-    inset: -72px;
-    width: calc(100% + 144px);
-    height: calc(100% + 144px);
+    inset: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
     max-width: none;
     max-height: none;
-    object-fit: fill;
     pointer-events: none;
+    opacity: 1;
+  }
+
+  .preview-frame .preview-blur.fallback-blur {
     filter: blur(18px);
   }
 
+  .preview-frame .preview-blur.fading {
+    opacity: 0;
+    transition: opacity 120ms linear;
+  }
+
+  .preview-frame .preview-blur.hidden-blur {
+    opacity: 0;
+    visibility: hidden;
+  }
+
   .preview-frame .preview-hi {
+    position: relative;
+    z-index: 1;
     display: block;
     width: 100%;
     height: 100%;

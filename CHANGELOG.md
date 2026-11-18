@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.1.8 - 2026-11-18
+
+### Added
+
+- `GET /api/v1/fs/image-info` header-only preview check; over-limit images show the dimensions and a download link without opening the lightbox.
+- `thumbnails.preview_edge` (512–4096, default 2048) with an admin setting; preview thumbnails now use the long edge instead of the short edge.
+- Admin settings for `thumbnails.jpeg_max_pixels`, `max_pixels`, and `max_source_bytes`, including source display and override reset.
+- Structured job failure notifications with job kind, object label, and stable error code.
+- Completion notifications for long copy/move/delete/upload operations, with thresholds and deduplication.
+- Share visit/download/upload notifications for the creator, throttled per share/item with a local preference toggle.
+- Setup accepts an optional `language` and stores it as the first admin's preference.
+- `read_only_reason` on directory listings (`policy` / `filesystem`) and `writable` / `read_only_reason` / `line_ending` on `GET /file`.
+- `FileName` component: single-line names with the extension always visible, used by delete, transfer, share, properties, and preview dialogs.
+
+### Changed
+
+- The preview blur layer stays mounted for the whole lightbox lifetime and fades to `visibility: hidden`; it no longer gets removed mid-fade.
+- The blur layer uses a pre-blurred canvas with edge-pixel replication at the same size as the sharp image, removing the previous ~15% zoom and feathered edges. The sharp image is explicitly stacked above the persistent blur node so a compositor reorder cannot flash a blur-only frame.
+- Animated GIFs use the original file as the sharp preview, so they play immediately; the preview/original toggle is hidden for GIFs and SVGs.
+- Small images are capped at their natural width at 100% zoom; large images still fit the viewport.
+- Double-clicking an SVG opens the image lightbox; "Edit source" is available from the lightbox and context menu. SVG payloads are rendered through a blob URL and are never served inline.
+- Filesystem read-only directories are detected with `W_OK|X_OK` plus read-only mount checks; writes return `403 PERMISSION_DENIED`, while policy read-only keeps `403 FORBIDDEN`.
+- Read-only directories and files open the editor in read-only mode, with save hidden, `Ctrl/Cmd+S` inert, and no editing-presence report.
+- Copy/move target pickers disable confirmation when the destination is not writable.
+- The editor confirms before closing unsaved changes, preserves CRLF on save, uses `wrap="off"` so line numbers stay aligned, and reports `too_large`/`not_utf8`/`binary` separately.
+- Sorting uses per-column default directions, refreshes in place without unmounting the list, and highlights the active column; grid/tile views gained a sort menu.
+- Live and indexed sorting now agree: directories always come first and the name secondary key follows the primary direction.
+- The multi-select context menu only shows batch-capable actions: preview selected media, download as ZIP, share, copy, move, delete. Rename/play/properties are hidden for multi-select.
+- View icons are now list, thumbnail (four tiles), and tile (two stacked tiles).
+- Long names in the sidebar and transfer dialog use single-line ellipsis; the breadcrumb scrolls to the current directory and keeps the read-only tag visible.
+- Thumbnail and background scan failures no longer produce user notifications; file-list 404s name the missing directory.
+
+### Fixed
+
+- `download?inline=true` returned `Content-Disposition: inline` for SVG because the subtype check compared against `svg+xml`; SVG is now always an attachment.
+- JPEG pixel limit raised to 1 GP; images above 100 MP skip the 320px grid thumbnail and stale `too_large` failure records are invalidated when limits change.
+- `PermissionDenied` IO errors were mapped to 500 and now map to 403 `PERMISSION_DENIED` across list, download, editor, and upload paths.
+- Preview thumbnails no longer generate a 6–7.5MP image for 16:9 or 3:2 photos by default.
+- Sort direction reset on column changes and stale-name ordering inconsistencies.
+- Editor long lines, CRLF rewrites, silent close, and generic “cannot preview” messages.
+- Delete confirmations wrapped long filenames and pushed the extension onto a second line.
+
+### Verification
+
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets`.
+- `pnpm lint`, `pnpm check`, `pnpm test`, `pnpm build`.
+- Non-root filesystem permission tests also run as `nobody`.
+
+
 ## v0.1.7 - 2026-11-17
 
 ### Added

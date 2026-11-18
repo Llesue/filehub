@@ -14,6 +14,29 @@ sudo chown -R filehub:filehub /home/filehub
 
 使用专用非 root 用户运行，确保 `users_root`、`db_path` 父目录、`cache_dir` 可写。这些目录缺失时会在启动或 `reload_settings` 时自动创建（Unix 下 `users_root`/`cache_dir` 会收紧到 `0700`），但属主仍需提前配置；外部存储根不会被自动创建。
 
+### 外部目录权限
+
+FileHub 的“可写”是应用层判断（root 配置、用户授权）和**服务进程的系统权限**取交集。非 root 运行时，外部目录必须对服务账号可写，否则列表会直接显示“只读（系统）”，写操作返回 `403 PERMISSION_DENIED`。
+
+推荐用属组或 ACL 授权，而不是 `chmod 777`：
+
+```bash
+# 属组方式
+sudo chgrp -R filehub /mnt/media/photos
+sudo chmod -R g+rwX /mnt/media/photos
+sudo find /mnt/media/photos -type d -exec chmod g+s {} +
+
+# ACL 方式（不改变原属组）
+sudo setfacl -R -m u:filehub:rwX /mnt/media/photos
+sudo setfacl -R -d -m u:filehub:rwX /mnt/media/photos
+```
+
+目录需要同时具备 `w` 和 `x` 才能在内部创建、删除、重命名条目；只读目录用 `chmod 0555` 即可。FileHub 每次列目录都会探测当前目录，权限变更无需重启即可生效；父列表不会逐个探测子目录，进入子目录后才判定。
+
+**root 运行**：`access(W_OK)` 对 `0555` 目录也会返回可写（root 确实能写），文件系统只读探测基本失效；只读挂载仍能通过 `statvfs` 识别。应用层只读仍然有效，但没有任何系统权限兜底，误删风险由 root 自己承担。保留 `ProtectSystem=strict` + `ReadWritePaths` 限制可写范围，并且不要把 `/`、`/etc`、`/root` 整体添加为读写目录。
+
+**Windows**：无法可靠探测目录 ACL 写权限，列表只反映应用层只读；写失败时统一返回 `403 PERMISSION_DENIED`。以 LocalSystem 运行时同样只挂载必要的数据目录。
+
 ## systemd
 
 ```ini

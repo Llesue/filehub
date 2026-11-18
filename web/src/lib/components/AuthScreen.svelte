@@ -30,7 +30,7 @@
     try {
       const auth =
         mode === 'setup'
-          ? await api.setup({ token, username, password })
+          ? await api.setup({ token, username, password, language: $language })
           : await api.login({ username, password });
       onSuccess(auth);
     } catch (err) {

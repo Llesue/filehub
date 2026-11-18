@@ -3,6 +3,7 @@
   import { focusTrap } from '../focusTrap';
   import type { FileProperties } from '../api';
   import Icon from './Icon.svelte';
+  import FileName from './FileName.svelte';
 
   let {
     data,
@@ -86,7 +87,7 @@
     {:else if data}
       <dl>
         <dt>{t($language, '名称')}</dt>
-        <dd>{data.name}</dd>
+        <dd><FileName name={data.name} isDir={data.is_dir} /></dd>
         <dt>{t($language, '路径')}</dt>
         <dd class="mono">{data.path || '/'}</dd>
         <dt>{t($language, '类型')}</dt>
@@ -164,6 +165,10 @@
     align-items: center;
     justify-content: space-between;
     margin-bottom: 12px;
+  }
+
+  dd {
+    min-width: 0;
   }
 
   h2 {

@@ -129,12 +129,14 @@ pub fn list_dir(resolved: &ResolvedPath, sort: &str, order: &str) -> Result<Vec<
             "modified" => left.modified.cmp(&right.modified),
             _ => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
         };
-        let ordered = right.is_dir.cmp(&left.is_dir).then(primary);
-        if descending {
-            ordered.reverse()
+        let primary = if descending {
+            primary.reverse()
         } else {
-            ordered
-        }
+            primary
+        };
+        let name = left.name.to_lowercase().cmp(&right.name.to_lowercase());
+        let name = if descending { name.reverse() } else { name };
+        right.is_dir.cmp(&left.is_dir).then(primary).then(name)
     });
 
     Ok(entries)
@@ -460,7 +462,7 @@ pub fn canonical_directory(path: &str) -> Result<PathBuf, AppError> {
         std::io::ErrorKind::NotFound => {
             AppError::bad_request("directory does not exist on the server")
         }
-        std::io::ErrorKind::PermissionDenied => AppError::Forbidden,
+        std::io::ErrorKind::PermissionDenied => AppError::PermissionDenied,
         _ => io_error(error),
     })?;
     if !canonical.is_dir() {
@@ -697,8 +699,60 @@ fn walk_usage(
     Ok(())
 }
 
-fn io_error(error: std::io::Error) -> AppError {
-    AppError::internal(anyhow::Error::from(error))
+pub(crate) fn io_error(error: std::io::Error) -> AppError {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => AppError::PermissionDenied,
+        _ => AppError::internal(anyhow::Error::from(error)),
+    }
+}
+
+/// Whether the service process can create, rename or delete entries in `path`.
+///
+/// `None` means the platform cannot probe reliably (Windows); callers then
+/// fall back to the configured/policy value.
+#[cfg(unix)]
+pub fn directory_writable(path: &Path) -> Option<bool> {
+    use rustix::fs::{Access, AtFlags, CWD, StatVfsMountFlags, accessat, statvfs};
+
+    match accessat(
+        CWD,
+        path,
+        Access::WRITE_OK | Access::EXEC_OK,
+        AtFlags::EACCESS,
+    ) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS | rustix::io::Errno::PERM) => {
+            return Some(false);
+        }
+        Err(_) => return None,
+    }
+    match statvfs(path) {
+        Ok(stats) => Some(!stats.f_flag.contains(StatVfsMountFlags::RDONLY)),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn directory_writable(_path: &Path) -> Option<bool> {
+    None
+}
+
+#[cfg(unix)]
+pub fn file_writable(path: &Path) -> Option<bool> {
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+
+    match accessat(CWD, path, Access::WRITE_OK, AtFlags::EACCESS) {
+        Ok(()) => Some(true),
+        Err(rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS | rustix::io::Errno::PERM) => {
+            Some(false)
+        }
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn file_writable(_path: &Path) -> Option<bool> {
+    None
 }
 
 pub fn path_size(path: &Path) -> Result<u64, AppError> {

@@ -69,6 +69,24 @@ pub async fn list(
     let root = load_root(&state, current.user.id, query.root).await?;
     let path = query.path.unwrap_or_default();
     let resolved = authz::resolve(&state, current.user.id, root.id, &path, false).await?;
+    let policy_read_only = resolved.access_read_only;
+    let probe_path = resolved.absolute.clone();
+    let filesystem_read_only = if policy_read_only {
+        false
+    } else {
+        tokio::task::spawn_blocking(move || fsops::directory_writable(&probe_path))
+            .await
+            .ok()
+            .flatten()
+            == Some(false)
+    };
+    let read_only_reason = if policy_read_only {
+        Some("policy")
+    } else if filesystem_read_only {
+        Some("filesystem")
+    } else {
+        None
+    };
     let sort = query.sort.unwrap_or_else(|| "name".to_owned());
     let order = query.order.unwrap_or_else(|| "asc".to_owned());
     let sort_by_size = sort == "size";
@@ -130,7 +148,8 @@ pub async fn list(
                 return Ok(Json(json!({
                     "root": root_json(&resolved.root),
                     "path": resolved.relative,
-                    "read_only": resolved.access_read_only,
+                    "read_only": read_only_reason.is_some(),
+                    "read_only_reason": read_only_reason,
                     "entries": entries,
                     "next_cursor": has_more.then(|| (offset + limit).to_string()),
                 })));
@@ -175,7 +194,8 @@ pub async fn list(
         return Ok(Json(json!({
             "root": root_json(&resolved.root),
             "path": resolved.relative,
-            "read_only": resolved.access_read_only,
+            "read_only": read_only_reason.is_some(),
+        "read_only_reason": read_only_reason,
             "entries": entries,
             "next_cursor": (offset.saturating_add(limit) < total)
                 .then(|| (offset + limit).to_string()),
@@ -214,7 +234,8 @@ pub async fn list(
     Ok(Json(json!({
         "root": root_json(&resolved.root),
         "path": resolved.relative,
-        "read_only": resolved.access_read_only,
+        "read_only": read_only_reason.is_some(),
+        "read_only_reason": read_only_reason,
         "entries": entries,
         "next_cursor": has_more.then(|| (offset + limit).to_string()),
     })))
@@ -338,10 +359,9 @@ fn sort_entries_by_size(entries: &mut [fsops::Entry], order: &str) {
             (true, std::cmp::Ordering::Greater) => std::cmp::Ordering::Less,
             (_, ordering) => ordering,
         };
-        dirs_first
-            .then(known_first)
-            .then(size)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        let name = left.name.to_lowercase().cmp(&right.name.to_lowercase());
+        let name = if descending { name.reverse() } else { name };
+        dirs_first.then(known_first).then(size).then(name)
     });
 }
 
@@ -412,16 +432,19 @@ pub(crate) async fn serve_file(
 
     let file = tokio::fs::File::open(absolute)
         .await
-        .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+        .map_err(fsops::io_error)?;
     let filename = absolute
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("download");
     let mime = mime_guess::from_path(absolute).first_or_octet_stream();
     let is_pdf = filename.to_ascii_lowercase().ends_with(".pdf");
-    let safe_inline = is_pdf
-        || ((matches!(mime.type_().as_str(), "image" | "video" | "audio"))
-            && mime.subtype().as_str() != "svg+xml");
+    // `image/svg+xml` reports its subtype as "svg", not "svg+xml". SVG must
+    // never be served inline: opening the URL directly would render the
+    // document and any embedded script in this origin.
+    let is_svg = mime.type_() == "image" && mime.subtype() == "svg";
+    let safe_inline =
+        is_pdf || (!is_svg && matches!(mime.type_().as_str(), "image" | "video" | "audio"));
     let disposition = if inline && safe_inline {
         "inline".to_owned()
     } else {

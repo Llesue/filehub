@@ -81,6 +81,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/file", get(crate::editor::read).put(crate::editor::save))
         .route("/edit/presence", post(crate::presence::update))
         .route("/thumb", get(crate::thumbs::thumb))
+        .route("/fs/image-info", get(crate::thumbs::image_info))
         .route("/thumb/status", get(crate::thumbs::status))
         .route("/thumb/retry", post(crate::thumbs::retry))
         .route("/cmd", post(crate::cmdrunner::run))
@@ -240,6 +241,7 @@ struct SetupRequest {
     token: String,
     username: String,
     password: String,
+    language: Option<String>,
 }
 
 async fn setup_status(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -263,6 +265,11 @@ async fn setup(
 
     validate_username(&request.username)?;
     validate_password(&request.password)?;
+    if let Some(language) = request.language.as_deref()
+        && !matches!(language, "zh-CN" | "en")
+    {
+        return Err(AppError::bad_request("language must be zh-CN or en"));
+    }
 
     let password_hash = auth::hash_password_async(request.password)
         .await
@@ -282,6 +289,20 @@ async fn setup(
         .map_err(map_db_error)?;
 
     create_home_root(&state, user_id, &home_dir).await?;
+
+    if let Some(language) = request.language {
+        let mut preferences = state
+            .db
+            .get_user_preferences(user_id)
+            .await
+            .map_err(AppError::internal)?;
+        preferences.language = language;
+        state
+            .db
+            .save_user_preferences(user_id, &preferences)
+            .await
+            .map_err(AppError::internal)?;
+    }
 
     state
         .setup
@@ -946,6 +967,13 @@ async fn clear_dir_size_cache_if_needed(state: &Arc<AppState>, key: &str) {
         && let Err(error) = state.db.clear_directory_sizes().await
     {
         tracing::warn!(%error, "failed to clear directory size cache after mode change");
+    }
+    if matches!(
+        key,
+        "thumbnails.jpeg_max_pixels" | "thumbnails.max_pixels" | "thumbnails.max_source_bytes"
+    ) {
+        let cache_dir = state.settings().settings.cache_dir.join("thumbs");
+        crate::thumbs::clear_failure_records(&cache_dir).await;
     }
 }
 

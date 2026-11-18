@@ -12,6 +12,19 @@ The web UI is a Svelte 5 SPA embedded into the Rust binary. Data lives in SQLite
 
 Many years ago, on a WD My Cloud, I used FileBrowser for the first time and was amazed by its clean, elegant interface and how quickly it responded on low-powered hardware. Later, I needed multi-user authentication and the ability to manage arbitrary directories on my NAS, and FileBrowser gradually fell short of those needs. Then I was surprised to learn that FileBrowser had announced it was no longer being maintained—and the idea was born: build my own FileBrowser with the help of OpenCode and DeepSeek.
 
+## Use cases
+
+- Browser entry point for a home NAS or an external drive
+- Moving files between phone and computer with resumable uploads
+- Family photo/video library with password- and expiry-protected sharing
+- Read-only archive for old disks that should never be modified
+- Turning a Windows machine into a temporary file server
+- Small-team file cabinet with multiple users, quotas, and external paths
+- Editing server configs, logs, and docs directly in the browser
+- Collecting event photos through a writable public share
+- Running on low-power ARM devices or a single static Linux binary
+- API clients and automation built on the documented HTTP API
+
 ## Features
 
 - Browse, upload, download, rename, copy, move, and delete files and directories
@@ -253,6 +266,16 @@ All application endpoints live under `/api/v1`; `/healthz` is unauthenticated. T
 - Commands are typed filesystem operations, not shell execution.
 - Share links are intentionally bearer secrets. Treat them as credentials.
 - Never commit `config.json`, databases, logs, or generated credentials.
+
+A dedicated non-root user is recommended. Grant only the data directories it needs through ownership, group membership, or ACLs. Running as root is common on personal NAS boxes, but then the OS provides no write protection:
+
+- Add only the data directories you need; never expose `/`, `/etc`, or `/root` as writable roots.
+- Mark system/config directories read-only inside FileHub.
+- Do not expose FileHub directly to the public internet; use a VPN or reverse proxy with strong passwords.
+- Keep snapshots/backups: a root-level delete has no permission safety net.
+- Keep `ProtectSystem=strict` and a narrow `ReadWritePaths` list in the systemd unit.
+
+As root, `access(W_OK)` reports `0555` directories as writable (root really can write), so filesystem read-only detection is largely ineffective; application-level read-only still works. Windows LocalSystem has the same caveat: mount only the data directories it needs.
 
 ## Development
 

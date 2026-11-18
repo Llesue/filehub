@@ -394,6 +394,45 @@
     }
   }
 
+  let previewEdge = $state(2048);
+  let jpegMaxMp = $state(1000);
+  let maxPixelsMp = $state(50);
+  let maxSourceMb = $state(512);
+  let thumbSettingsReady = $state(false);
+  $effect(() => {
+    if (settings && !thumbSettingsReady) {
+      previewEdge = Number(setting('thumbnails.preview_edge') ?? 2048);
+      jpegMaxMp = Number(setting('thumbnails.jpeg_max_pixels') ?? 1_000_000_000) / 1_000_000;
+      maxPixelsMp = Number(setting('thumbnails.max_pixels') ?? 50_000_000) / 1_000_000;
+      maxSourceMb = Number(setting('thumbnails.max_source_bytes') ?? 512 * 1024 ** 2) / 1024 ** 2;
+      thumbSettingsReady = true;
+    }
+  });
+
+  function settingSource(key: string): string {
+    const source = settings?.sources[key] ?? 'default';
+    return source === 'db'
+      ? t($language, '数据库')
+      : source === 'config'
+        ? t($language, '配置文件')
+        : t($language, '默认值');
+  }
+
+  async function clearSetting(key: string): Promise<void> {
+    try {
+      settings = await api.resetSetting(key, csrf);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '系统设置保存失败'));
+    }
+  }
+
+  async function saveThumbSettings(): Promise<void> {
+    await setSetting('thumbnails.preview_edge', Math.round(previewEdge));
+    await setSetting('thumbnails.jpeg_max_pixels', Math.round(jpegMaxMp * 1_000_000));
+    await setSetting('thumbnails.max_pixels', Math.round(maxPixelsMp * 1_000_000));
+    await setSetting('thumbnails.max_source_bytes', Math.round(maxSourceMb * 1024 ** 2));
+  }
+
   let zipMaxGb = $state(2);
   let zipMaxFiles = $state(1000);
   let zipConcurrency = $state(1);
@@ -711,6 +750,69 @@
       </div>
 
       <div class="settings-group">
+        <h3>{t($language, '缩略图与预览')}</h3>
+        <p class="settings-hint">
+          {t($language, '预览长边范围 512–4096；像素上限按百万像素（MP）计。')}
+        </p>
+        <div class="setting-grid">
+          <label class="setting-row wide"
+            ><span
+              >{t($language, '预览长边')}
+              <small class="setting-source">{settingSource('thumbnails.preview_edge')}</small></span
+            >
+            <div class="quota-setting">
+              <input bind:value={previewEdge} type="number" min="512" max="4096" step="128" />
+              <span>px</span>
+              {#if settings?.sources['thumbnails.preview_edge'] === 'db'}
+                <button
+                  type="button"
+                  class="small"
+                  onclick={() => void clearSetting('thumbnails.preview_edge')}
+                  >{t($language, '清除覆盖')}</button
+                >
+              {/if}
+            </div></label
+          >
+          <label class="setting-row wide"
+            ><span
+              >{t($language, 'JPEG 像素上限')}
+              <small class="setting-source"
+                >{settingSource('thumbnails.jpeg_max_pixels')}</small
+              ></span
+            >
+            <div class="quota-setting">
+              <input bind:value={jpegMaxMp} type="number" min="1" step="1" /><span>MP</span>
+            </div></label
+          >
+          <label class="setting-row wide"
+            ><span
+              >{t($language, '其他图片像素上限')}
+              <small class="setting-source">{settingSource('thumbnails.max_pixels')}</small></span
+            >
+            <div class="quota-setting">
+              <input bind:value={maxPixelsMp} type="number" min="1" step="1" /><span>MP</span>
+            </div></label
+          >
+          <label class="setting-row wide"
+            ><span
+              >{t($language, '源文件大小上限')}
+              <small class="setting-source">{settingSource('thumbnails.max_source_bytes')}</small
+              ></span
+            >
+            <div class="quota-setting">
+              <input bind:value={maxSourceMb} type="number" min="1" step="1" /><span>MB</span>
+            </div></label
+          >
+          <div class="setting-row wide">
+            <span></span>
+            <button type="button" class="small" onclick={() => void saveThumbSettings()}
+              >{t($language, '保存')}</button
+            >
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-group">
         <h3>{t($language, '新用户默认值')}</h3>
         <p class="settings-hint">
           {t($language, '只影响新建用户；已有用户继续使用自己的偏好。')}
@@ -872,6 +974,12 @@
     font-size: 14px;
     font-weight: 600;
   }
+  .setting-source {
+    margin-left: 6px;
+    color: var(--text-2);
+    font-size: 11.5px;
+  }
+
   .settings-hint {
     margin: 0;
     color: var(--text-2);

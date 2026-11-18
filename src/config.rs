@@ -62,6 +62,8 @@ pub struct ThumbnailsSettings {
     /// Reserved workers for full-size preview thumbnails. List thumbnails use
     /// the remaining workers, so scrolling a folder cannot block a preview.
     pub preview_workers: usize,
+    /// Long-edge limit for lightbox preview thumbnails (512..=4096).
+    pub preview_edge: u32,
     pub max_source_bytes: u64,
     pub max_pixels: u64,
     pub jpeg_max_pixels: u64,
@@ -78,9 +80,10 @@ impl Default for ThumbnailsSettings {
             enabled: true,
             workers: 2,
             preview_workers: 1,
+            preview_edge: 2048,
             max_source_bytes: 512 * 1024 * 1024,
             max_pixels: 50_000_000,
-            jpeg_max_pixels: 250_000_000,
+            jpeg_max_pixels: 1_000_000_000,
             video: true,
             video_seek_seconds: 1,
             video_seek_percent: 33,
@@ -293,6 +296,9 @@ impl Settings {
         }
         if self.thumbnails.preview_workers == 0 {
             bail!("thumbnails.preview_workers must be greater than zero");
+        }
+        if !(512..=4096).contains(&self.thumbnails.preview_edge) {
+            bail!("thumbnails.preview_edge must be between 512 and 4096");
         }
         if self.thumbnails.video_seek_percent > 100 {
             bail!("thumbnails.video_seek_percent must be between 0 and 100");

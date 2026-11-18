@@ -1,11 +1,13 @@
 <script lang="ts">
   import { language, t } from '../i18n';
   import { focusTrap } from '../focusTrap';
+  import FileName from './FileName.svelte';
 
   let {
     open,
     title,
     message,
+    items = [],
     confirmLabel,
     danger = false,
     requireText = null,
@@ -16,6 +18,7 @@
     open: boolean;
     title: string;
     message: string;
+    items?: { name: string; isDir: boolean }[];
     confirmLabel?: string;
     danger?: boolean;
     requireText?: string | null;
@@ -23,6 +26,9 @@
     onConfirm: (value: string) => void;
     onCancel: () => void;
   } = $props();
+
+  let shownItems = $derived(items.slice(0, 12));
+  let hiddenCount = $derived(Math.max(0, items.length - shownItems.length));
 
   let input = $state('');
   let overlayPressed = false;
@@ -68,6 +74,19 @@
             >
           {/each}
         </p>
+        {#if shownItems.length > 0}
+          <ul class="confirm-items">
+            {#each shownItems as item (item.name)}
+              <li>
+                <span class="delete-x">×</span>
+                <FileName name={item.name} isDir={item.isDir} />
+              </li>
+            {/each}
+          </ul>
+          {#if hiddenCount > 0}
+            <p class="more">{t($language, '…以及另外 {count} 项', { count: hiddenCount })}</p>
+          {/if}
+        {/if}
         {#if requireText}
           <input
             bind:value={input}
@@ -130,6 +149,33 @@
 
   .line {
     overflow-wrap: anywhere;
+  }
+
+  .confirm-items {
+    display: flex;
+    max-height: 260px;
+    flex-direction: column;
+    gap: 2px;
+    overflow: auto;
+    margin: 0 0 8px;
+    padding: 0;
+    color: var(--text-2);
+    font-size: 14.5px;
+    line-height: 1.6;
+    list-style: none;
+  }
+
+  .confirm-items li {
+    display: flex;
+    align-items: baseline;
+    min-width: 0;
+    white-space: nowrap;
+  }
+
+  .more {
+    margin: 0 0 16px;
+    color: var(--text-2);
+    font-size: 14px;
   }
 
   .delete-x {
