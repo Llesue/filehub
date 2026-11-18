@@ -158,13 +158,9 @@ pub async fn status(
     let started = std::time::Instant::now();
     let job_counts = state.db.job_counts().await.map_err(AppError::internal)?;
     let jobs_ms = started.elapsed().as_millis();
-    let started = std::time::Instant::now();
-    let directory_sizes = state
-        .db
-        .directory_size_counts()
-        .await
-        .map_err(AppError::internal)?;
-    let sizes_ms = started.elapsed().as_millis();
+    let directory_sizes = state.cached_directory_size_counts();
+    state.schedule_directory_size_counts_refresh();
+    let sizes_ms = 0_u128;
     let started = std::time::Instant::now();
     let stats = state.db.stats().await.map_err(AppError::internal)?;
     let stats_ms = started.elapsed().as_millis();

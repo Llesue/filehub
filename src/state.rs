@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -95,6 +95,8 @@ impl WindowRateLimiter {
     }
 }
 
+type DirectorySizeCountsCache = (Instant, Vec<(String, i64)>);
+
 pub struct AppState {
     pub db: Db,
     pub config: ConfigFile,
@@ -112,6 +114,8 @@ pub struct AppState {
     pub usage_cache: Mutex<HashMap<i64, UsageSnapshot>>,
     pub usage_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     pub usage_semaphore: Arc<Semaphore>,
+    directory_size_counts: Mutex<Option<DirectorySizeCountsCache>>,
+    directory_size_counts_refreshing: AtomicBool,
     pub public_rate: WindowRateLimiter,
     pub slow_requests: Mutex<VecDeque<SlowRequest>>,
     pub events: Arc<EventBus>,
@@ -232,16 +236,62 @@ impl AppState {
             usage_cache: Mutex::new(HashMap::new()),
             usage_locks: Mutex::new(HashMap::new()),
             usage_semaphore: Arc::new(Semaphore::new(1)),
+            directory_size_counts: Mutex::new(None),
+            directory_size_counts_refreshing: AtomicBool::new(false),
             public_rate: WindowRateLimiter::default(),
             slow_requests: Mutex::new(VecDeque::new()),
             events,
             edit_presence: Mutex::new(HashMap::new()),
         });
+        state.schedule_directory_size_counts_refresh();
         Ok(state)
     }
 
     pub fn settings(&self) -> Arc<Snapshot> {
         self.snapshot.load_full()
+    }
+
+    /// Directory-size status counts are informational. Scanning 200k rows on
+    /// a slow disk can take seconds, so serve a short-lived cache and refresh
+    /// in the background instead of blocking the admin page.
+    pub fn cached_directory_size_counts(&self) -> Vec<(String, i64)> {
+        self.directory_size_counts
+            .lock()
+            .as_ref()
+            .map(|(_, counts)| counts.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn schedule_directory_size_counts_refresh(self: &Arc<Self>) {
+        {
+            let cache = self.directory_size_counts.lock();
+            if let Some((at, _)) = cache.as_ref()
+                && at.elapsed() < Duration::from_secs(60)
+            {
+                return;
+            }
+        }
+        if self
+            .directory_size_counts_refreshing
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let counts = state.db.directory_size_counts().await;
+            match counts {
+                Ok(counts) => {
+                    *state.directory_size_counts.lock() = Some((Instant::now(), counts));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to refresh directory size counts");
+                }
+            }
+            state
+                .directory_size_counts_refreshing
+                .store(false, Ordering::Relaxed);
+        });
     }
 
     pub async fn reload_settings(&self, ensure_paths: bool) -> anyhow::Result<()> {
