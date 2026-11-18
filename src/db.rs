@@ -2706,17 +2706,18 @@ impl Db {
         root_ranges: Vec<(String, String)>,
         show_hidden: bool,
         limit: i64,
+        cursor: Option<i64>,
         filters: IndexSearchFilters,
-    ) -> anyhow::Result<Vec<IndexEntry>> {
+    ) -> anyhow::Result<(Vec<IndexEntry>, Option<i64>)> {
         if root_ranges.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let query = query.to_owned();
         self.call(move |connection| {
-            let limit = limit.clamp(1, 500);
+            let limit = limit.clamp(1, 200);
             let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
             let mut sql = String::from(
-                "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, \
+                "SELECT e.id, e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, \
                         e.mime_type, e.has_preview, e.is_hidden \
                  FROM index_fts JOIN index_entries e ON e.id = index_fts.rowid \
                  JOIN indexed_dirs d ON d.id = e.dir_id \
@@ -2745,14 +2746,16 @@ impl Db {
                  AND (?{mtime_before} IS NULL OR e.mtime <= ?{mtime_before}) \
                  AND (?{is_dir} IS NULL OR e.is_dir = ?{is_dir}) \
                  AND (?{mime} IS NULL OR e.mime_type LIKE ?{mime}) \
-                 LIMIT ?{limit_param}",
+                 AND (?{cursor} IS NULL OR e.id > ?{cursor}) \
+                 ORDER BY e.id ASC LIMIT ?{limit_param}",
                 next = index + 1,
                 after = index + 2,
                 mtime_after = index + 3,
                 mtime_before = index + 4,
                 is_dir = index + 5,
                 mime = index + 6,
-                limit_param = index + 7,
+                cursor = index + 7,
+                limit_param = index + 8,
             ));
             // The format above uses `?{index}` at the start and named offsets;
             // push values in the same order.
@@ -2794,23 +2797,40 @@ impl Db {
                     .map(rusqlite::types::Value::Text)
                     .unwrap_or(rusqlite::types::Value::Null),
             );
-            params.push(rusqlite::types::Value::Integer(limit));
+            params.push(
+                cursor
+                    .map(rusqlite::types::Value::Integer)
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(rusqlite::types::Value::Integer(limit + 1));
 
             let mut statement = connection.prepare(&sql)?;
             let rows = statement.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok(IndexEntry {
-                    name: row.get(0)?,
-                    real_path: row.get(1)?,
-                    is_dir: row.get::<_, i64>(2)? != 0,
-                    size: row.get(3)?,
-                    mtime: row.get(4)?,
-                    created_at: row.get(5)?,
-                    mime_type: row.get(6)?,
-                    has_preview: row.get::<_, i64>(7)? != 0,
-                    is_hidden: row.get::<_, i64>(8)? != 0,
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    IndexEntry {
+                        name: row.get(1)?,
+                        real_path: row.get(2)?,
+                        is_dir: row.get::<_, i64>(3)? != 0,
+                        size: row.get(4)?,
+                        mtime: row.get(5)?,
+                        created_at: row.get(6)?,
+                        mime_type: row.get(7)?,
+                        has_preview: row.get::<_, i64>(8)? != 0,
+                        is_hidden: row.get::<_, i64>(9)? != 0,
+                    },
+                ))
             })?;
-            rows.collect()
+            let mut rows: Vec<(i64, IndexEntry)> = rows.collect::<rusqlite::Result<_>>()?;
+            let has_more = rows.len() > limit as usize;
+            if has_more {
+                rows.truncate(limit as usize);
+            }
+            let next_cursor = has_more.then(|| rows.last().map(|(id, _)| *id)).flatten();
+            Ok((
+                rows.into_iter().map(|(_, entry)| entry).collect(),
+                next_cursor,
+            ))
         })
         .await
     }

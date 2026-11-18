@@ -1129,7 +1129,17 @@ pub async fn delete_confirm(
     cache_ns += phase.elapsed().as_nanos();
 
     let audit_started = Instant::now();
-    audit(&state, current.user.id, "delete", None, &headers).await;
+    let audit_path = preview.items.first().map(|item| item.relative.as_str());
+    let audit_detail = (preview.items.len() > 1).then(|| format!("items={}", preview.items.len()));
+    state
+        .enqueue_audit(crate::db::AuditRecord {
+            user_id: Some(current.user.id),
+            action: "delete".to_owned(),
+            path: audit_path.map(str::to_owned),
+            detail: audit_detail,
+            ip: auth::client_ip(&headers),
+        })
+        .await;
     let total_ms = started.elapsed().as_millis() as u64;
     if total_ms >= 500 {
         tracing::warn!(

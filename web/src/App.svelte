@@ -134,18 +134,19 @@
   let searchQuery = $state('');
   let searchResults = $state<SearchEntry[]>([]);
   let searchActive = $state(false);
-  let searchIndexing = $state(false);
   let searchLoading = $state(false);
+  let searchLoadingMore = $state(false);
+  let searchNextCursor = $state<string | null>(null);
   let searchTooShort = $state(false);
   let searchRunning = false;
   let pendingSearch: string | null = null;
+  let searchMoreAbort: AbortController | null = null;
   let searchInput = $state<HTMLInputElement | null>(null);
   let searchFiltersOpen = $state(false);
   let searchKind = $state('');
   let searchMinMb = $state('');
   let searchMaxMb = $state('');
   let searchModified = $state('');
-  const indexedRoots = new SvelteSet<number>();
   let searchToken = 0;
   let editorOpen = $state(false);
   let editorName = $state('');
@@ -1388,7 +1389,8 @@
       pendingSearch = null;
       searchActive = true;
       searchLoading = false;
-      searchIndexing = false;
+      searchLoadingMore = false;
+      searchNextCursor = null;
       searchTooShort = true;
       searchResults = [];
       return;
@@ -1396,6 +1398,8 @@
     searchTooShort = false;
     searchActive = true;
     searchLoading = true;
+    searchLoadingMore = false;
+    searchNextCursor = null;
     searchResults = [];
     if (searchRunning) {
       pendingSearch = query;
@@ -1403,29 +1407,6 @@
     }
     pendingSearch = null;
     void runSearch(query);
-  }
-
-  async function waitForIndexJob(
-    jobId: string,
-    token: number,
-    query: string,
-    signal: AbortSignal,
-  ): Promise<void> {
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      if (signal.aborted) return;
-      try {
-        const job: JobInfo = await api.job(jobId, signal);
-        if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
-          return;
-        }
-      } catch (error) {
-        if (isAbortError(error)) return;
-        console.warn('background index status failed', error);
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      if (token !== searchToken) return;
-    }
   }
 
   function searchFilterParams(): {
@@ -1469,49 +1450,37 @@
     searchModified = '';
   }
 
+  function searchEntryKey(entry: SearchEntry): string {
+    return `${entry.rootId ?? 0}:${entry.path}`;
+  }
+
+  function mapSearchEntries(entries: SearchEntry[]): SearchEntry[] {
+    return entries.map((entry) => ({
+      ...entry,
+      rootId: entry.root_id ?? entry.rootId,
+    }));
+  }
+
   async function runSearch(query: string): Promise<void> {
     if (roots.length === 0) return;
     searchRunning = true;
     const token = ++searchToken;
     searchAbort?.abort();
+    searchMoreAbort?.abort();
+    searchMoreAbort = null;
     const controller = new AbortController();
     searchAbort = controller;
     searchLoading = true;
+    searchLoadingMore = false;
 
-    const collect = async (): Promise<SearchEntry[]> => {
-      const indexing: Promise<void>[] = [];
-      for (const root of roots) {
-        if (indexedRoots.has(root.id)) continue;
-        indexedRoots.add(root.id);
-        try {
-          const job = await api.index(root.id, '', true, csrf);
-          indexing.push(waitForIndexJob(job.job_id, token, query, controller.signal));
-        } catch (error) {
-          console.warn('background index failed', error);
-        }
-      }
-      if (indexing.length > 0) {
-        searchIndexing = true;
-        void Promise.allSettled(indexing).then(() => {
-          if (token !== searchToken) return;
-          searchIndexing = false;
-          if (searchQuery.trim() === query && !searchRunning) void runSearch(query);
-        });
-      }
+    try {
       const result = await api.searchAll(
         query,
-        200,
+        100,
+        null,
         controller.signal,
         searchFilterParams(),
       );
-      return result.entries.map((entry) => ({
-        ...entry,
-        rootId: entry.root_id ?? entry.rootId,
-      }));
-    };
-
-    try {
-      const results = await collect();
       if (
         token !== searchToken ||
         controller.signal.aborted ||
@@ -1519,7 +1488,8 @@
       ) {
         return;
       }
-      searchResults = results.slice(0, 200);
+      searchResults = mapSearchEntries(result.entries);
+      searchNextCursor = result.next_cursor;
       searchActive = true;
       searchLoading = false;
     } catch (error) {
@@ -1529,12 +1499,45 @@
         searchRunning = false;
         const next = pendingSearch;
         pendingSearch = null;
+        searchLoading = false;
         if (next && searchQuery.trim() === next) {
           void runSearch(next);
-        } else if (!searchIndexing) {
-          searchLoading = false;
         }
       }
+    }
+  }
+
+  async function loadMoreSearch(): Promise<void> {
+    if (!searchActive || !searchNextCursor || searchLoadingMore || searchRunning) return;
+    const query = searchQuery.trim();
+    const cursor = searchNextCursor;
+    const token = searchToken;
+    const controller = new AbortController();
+    searchMoreAbort?.abort();
+    searchMoreAbort = controller;
+    searchLoadingMore = true;
+    try {
+      const result = await api.searchAll(
+        query,
+        100,
+        cursor,
+        controller.signal,
+        searchFilterParams(),
+      );
+      if (token !== searchToken || searchQuery.trim() !== query) return;
+      const seen = new SvelteSet(searchResults.map(searchEntryKey));
+      const appended = mapSearchEntries(result.entries).filter((entry) => {
+        const key = searchEntryKey(entry);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      searchResults = [...searchResults, ...appended];
+      searchNextCursor = result.next_cursor;
+    } catch (error) {
+      if (!isAbortError(error)) handleFilesError(error);
+    } finally {
+      if (token === searchToken) searchLoadingMore = false;
     }
   }
 
@@ -1544,6 +1547,8 @@
 
     searchActive = false;
     searchLoading = false;
+    searchLoadingMore = false;
+    searchNextCursor = null;
     searchQuery = '';
     searchResults = [];
 
@@ -1593,13 +1598,16 @@
 
   function exitSearch(): void {
     searchAbort?.abort();
+    searchMoreAbort?.abort();
+    searchMoreAbort = null;
     pendingSearch = null;
     searchRunning = false;
     searchActive = false;
     searchLoading = false;
+    searchLoadingMore = false;
+    searchNextCursor = null;
     searchQuery = '';
     searchResults = [];
-    searchIndexing = false;
     searchFiltersOpen = false;
     resetSearchFilters();
   }
@@ -3380,7 +3388,7 @@
               </div>
             {/if}
             {#if adminMounted}
-              <div class:view-hidden={appView !== 'admin' && appView !== 'audit'}>
+              <div class:view-hidden={appView !== 'admin'}>
                 <AdminPage
                   {csrf}
                   onAudit={() => (appView = 'audit')}
@@ -3403,9 +3411,6 @@
                   <div class="search-header-actions">
                     {#if searchLoading}
                       <span class="muted">{t($language, '搜索中…')}</span>
-                    {/if}
-                    {#if searchIndexing}
-                      <span class="muted">{t($language, '索引中…')}</span>
                     {/if}
                     <button
                       type="button"
@@ -3476,7 +3481,7 @@
                   </div>
                 {:else}
                   <div class="search-results">
-                    {#each searchResults as result (result.path)}
+                    {#each searchResults as result (searchEntryKey(result))}
                       <button
                         type="button"
                         class="search-result"
@@ -3491,6 +3496,18 @@
                       </button>
                     {/each}
                   </div>
+                  {#if searchNextCursor}
+                    <div class="search-more">
+                      <button
+                        type="button"
+                        class="ghost"
+                        disabled={searchLoadingMore}
+                        onclick={() => void loadMoreSearch()}
+                      >
+                        {searchLoadingMore ? t($language, '加载中…') : t($language, '加载更多')}
+                      </button>
+                    </div>
+                  {/if}
                 {/if}
               {:else if filesLoading}
                 <div class="files-state">
@@ -5234,6 +5251,21 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+  }
+
+  .search-more {
+    display: flex;
+    justify-content: center;
+    padding: 12px 0;
+  }
+
+  .search-more button {
+    height: 32px;
+    padding: 0 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text-2);
   }
 
   .search-result {

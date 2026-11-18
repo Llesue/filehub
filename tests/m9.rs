@@ -962,12 +962,24 @@ async fn unified_search_unions_roots_without_duplicates() {
         // Overlapping sub-root must not duplicate results.
         (format!("{base}/"), format!("{base}0")),
     ];
-    let entries = app
+    let (first_page, cursor) = app
         .state
         .db
-        .search_entries_all("note", ranges, true, 20, Default::default())
+        .search_entries_all("note", ranges.clone(), true, 1, None, Default::default())
         .await
         .unwrap();
+    assert_eq!(first_page.len(), 1);
+    let cursor = cursor.expect("a second page must exist");
+    let (second_page, _) = app
+        .state
+        .db
+        .search_entries_all("note", ranges, true, 1, Some(cursor), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(second_page.len(), 1);
+    assert_ne!(first_page[0].name, second_page[0].name);
+    let mut entries = first_page;
+    entries.extend(second_page);
     let mut names: Vec<_> = entries.into_iter().map(|entry| entry.name).collect();
     names.sort();
     names.dedup();

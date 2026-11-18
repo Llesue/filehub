@@ -655,6 +655,43 @@ paths:
       responses:
         '200': { description: OK }
         '400': { $ref: '#/components/responses/Error' }
+  /api/v1/search/all:
+    get:
+      tags: [index]
+      summary: 跨所有最外层 root 的统一文件名搜索（游标分页）
+      description: 跳过被父 root 覆盖的子 root，单次 FTS 查询；按 index_entries.id 游标分页。少于 3 个字符返回 400。
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 3 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 100 } }
+        - { name: cursor, in: query, schema: { type: string }, description: 上一页返回的 next_cursor }
+        - { name: min_size, in: query, schema: { type: integer, format: int64, minimum: 0 } }
+        - { name: max_size, in: query, schema: { type: integer, format: int64, minimum: 0 } }
+        - { name: modified_after, in: query, schema: { type: integer, format: int64 } }
+        - { name: modified_before, in: query, schema: { type: integer, format: int64 } }
+        - { name: kind, in: query, schema: { type: string, enum: [image, video, audio, text, pdf, dir, file] } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        root_id: { type: integer, format: int64 }
+                        name: { type: string }
+                        path: { type: string }
+                        is_dir: { type: boolean }
+                        size: { type: integer, format: int64 }
+                        modified: { type: integer, format: int64 }
+                        mime_type: { type: string }
+                        has_preview: { type: boolean }
+                  next_cursor: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/Error' }
   /api/v1/cmd:
     post:
       tags: [files]

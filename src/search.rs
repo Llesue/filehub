@@ -258,6 +258,7 @@ pub struct SearchAllQuery {
     modified_after: Option<i64>,
     modified_before: Option<i64>,
     kind: Option<String>,
+    cursor: Option<String>,
 }
 
 fn root_path_bounds(path: &str) -> Vec<(String, String)> {
@@ -338,13 +339,24 @@ pub async fn search_all(
         .flat_map(|root| root_path_bounds(&root.real_path))
         .collect();
     let started = std::time::Instant::now();
-    let entries = state
+    let cursor = query
+        .cursor
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| AppError::bad_request("invalid cursor"))
+        })
+        .transpose()?;
+    let (entries, next_cursor) = state
         .db
         .search_entries_all(
             query_text,
             ranges,
             preferences.show_hidden,
-            query.limit.unwrap_or(200),
+            query.limit.unwrap_or(100).clamp(1, 200),
+            cursor,
             crate::db::IndexSearchFilters {
                 min_size: query.min_size,
                 max_size: query.max_size,
@@ -393,7 +405,10 @@ pub async fn search_all(
             }))
         })
         .collect();
-    Ok(Json(json!({ "entries": results })))
+    Ok(Json(json!({
+        "entries": results,
+        "next_cursor": next_cursor.map(|value| value.to_string()),
+    })))
 }
 
 async fn load_root(state: &Arc<AppState>, user_id: i64, root_id: i64) -> Result<Root, AppError> {

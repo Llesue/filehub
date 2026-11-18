@@ -1243,7 +1243,8 @@ export const api = {
 
   searchAll(
     query: string,
-    limit = 200,
+    limit = 100,
+    cursor: string | null = null,
     signal?: AbortSignal,
     filters: {
       kind?: string;
@@ -1253,8 +1254,9 @@ export const api = {
       modifiedBefore?: number;
       isDir?: boolean;
     } = {},
-  ): Promise<{ entries: SearchEntry[] }> {
+  ): Promise<{ entries: SearchEntry[]; next_cursor: string | null }> {
     const parameters = new URLSearchParams({ q: query, limit: String(limit) });
+    if (cursor) parameters.set('cursor', cursor);
     if (filters.kind) parameters.set('kind', filters.kind);
     if (filters.minSize !== undefined) parameters.set('min_size', String(filters.minSize));
     if (filters.maxSize !== undefined) parameters.set('max_size', String(filters.maxSize));
@@ -1264,9 +1266,10 @@ export const api = {
     if (filters.modifiedBefore !== undefined) {
       parameters.set('modified_before', String(filters.modifiedBefore));
     }
-    return request<{ entries: SearchEntry[] }>(`/search/all?${parameters.toString()}`, {
-      signal,
-    });
+    return request<{ entries: SearchEntry[]; next_cursor: string | null }>(
+      `/search/all?${parameters.toString()}`,
+      { signal },
+    );
   },
 
   search(
