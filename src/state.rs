@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,10 +111,21 @@ pub struct AppState {
     pub audit_tx: tokio::sync::mpsc::Sender<AuditMessage>,
     pub usage_cache: Mutex<HashMap<i64, UsageSnapshot>>,
     pub usage_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    pub usage_semaphore: Arc<Semaphore>,
     pub public_rate: WindowRateLimiter,
     pub slow_requests: Mutex<VecDeque<SlowRequest>>,
     pub events: Arc<EventBus>,
     pub edit_presence: Mutex<HashMap<PresenceKey, PresenceEntry>>,
+}
+
+fn path_chain(target: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut current = Some(target.to_path_buf());
+    while let Some(path) = current {
+        paths.push(path.to_string_lossy().to_string());
+        current = path.parent().map(Path::to_path_buf);
+    }
+    paths
 }
 
 impl AppState {
@@ -147,7 +158,7 @@ impl AppState {
         let bootstrap = build_snapshot(&config, &[])?;
         ensure_directories(&bootstrap)?;
 
-        let db = Db::open(&bootstrap.settings.db_path, 4)?;
+        let db = Db::open(&bootstrap.settings.db_path, 8)?;
         ensure_default_roots(&db).await?;
         let overrides = db.settings_overrides().await?;
         let snapshot = build_snapshot(&config, &overrides)?;
@@ -220,6 +231,7 @@ impl AppState {
             audit_tx,
             usage_cache: Mutex::new(HashMap::new()),
             usage_locks: Mutex::new(HashMap::new()),
+            usage_semaphore: Arc::new(Semaphore::new(1)),
             public_rate: WindowRateLimiter::default(),
             slow_requests: Mutex::new(VecDeque::new()),
             events,
@@ -232,10 +244,12 @@ impl AppState {
         self.snapshot.load_full()
     }
 
-    pub async fn reload_settings(&self) -> anyhow::Result<()> {
+    pub async fn reload_settings(&self, ensure_paths: bool) -> anyhow::Result<()> {
         let overrides = self.db.settings_overrides().await?;
         let snapshot = build_snapshot(&self.config, &overrides)?;
-        ensure_directories(&snapshot)?;
+        if ensure_paths {
+            ensure_directories(&snapshot)?;
+        }
         let permits = snapshot.settings.downloads.zip_concurrency.max(1);
         self.snapshot.store(Arc::new(snapshot));
         *self.zip_semaphore.lock() = Arc::new(Semaphore::new(permits));
@@ -251,13 +265,10 @@ impl AppState {
     }
 
     pub async fn enqueue_audit(&self, record: AuditRecord) {
-        if self
-            .audit_tx
-            .send(AuditMessage::Record(record))
-            .await
-            .is_err()
-        {
-            tracing::warn!("audit writer is closed; dropping audit record");
+        // Auditing is best-effort: never make a user request wait for the
+        // audit writer when a long DB operation has filled the channel.
+        if let Err(error) = self.audit_tx.try_send(AuditMessage::Record(record)) {
+            tracing::warn!(%error, "audit queue is full or closed; dropping audit record");
         }
     }
 
@@ -274,28 +285,66 @@ impl AppState {
     }
 
     pub fn invalidate_usage(&self, user_id: i64) {
-        self.usage_cache.lock().remove(&user_id);
+        // Keep the last value and let the next reader refresh it in the
+        // background. Dropping it forces a slow full walk on the next request.
+        if let Some(snapshot) = self.usage_cache.lock().get_mut(&user_id) {
+            snapshot.computed_at = 0;
+        }
     }
 
-    pub async fn invalidate_path_caches(&self, target: &Path, user_id: Option<i64>, subtree: bool) {
+    pub async fn invalidate_path_caches(
+        self: &Arc<Self>,
+        target: &Path,
+        user_id: Option<i64>,
+        subtree: bool,
+    ) {
         self.invalidate_path_caches_with_usage(target, user_id, subtree, UsageInvalidation::Full)
             .await;
     }
 
     pub async fn invalidate_path_caches_with_usage(
-        &self,
+        self: &Arc<Self>,
         target: &Path,
         user_id: Option<i64>,
         subtree: bool,
         usage: UsageInvalidation,
     ) {
-        let mut paths = Vec::new();
-        let mut current = Some(target.to_path_buf());
-        while let Some(path) = current {
-            paths.push(path.to_string_lossy().to_string());
-            current = path.parent().map(Path::to_path_buf);
+        let paths = path_chain(target);
+        let _ = self.db.invalidate_path_chain(paths).await;
+        if subtree {
+            self.schedule_cache_cleanup(vec![target.to_path_buf()]);
         }
-        let _ = self.db.invalidate_path_chain(paths, subtree).await;
+        self.apply_usage_invalidation(user_id, usage);
+    }
+
+    /// Invalidates many targets and their ancestors in one short transaction.
+    /// Descendant cache rows are left for `schedule_cache_cleanup`.
+    pub async fn invalidate_paths_exact(&self, targets: &[PathBuf], user_id: Option<i64>) {
+        self.invalidate_paths_exact_with_usage(targets, user_id, UsageInvalidation::Full)
+            .await;
+    }
+
+    pub async fn invalidate_paths_exact_with_usage(
+        &self,
+        targets: &[PathBuf],
+        user_id: Option<i64>,
+        usage: UsageInvalidation,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        let mut paths = BTreeSet::new();
+        for target in targets {
+            paths.extend(path_chain(target));
+        }
+        let _ = self
+            .db
+            .invalidate_path_chain(paths.into_iter().collect())
+            .await;
+        self.apply_usage_invalidation(user_id, usage);
+    }
+
+    fn apply_usage_invalidation(&self, user_id: Option<i64>, usage: UsageInvalidation) {
         if let Some(user_id) = user_id {
             match usage {
                 UsageInvalidation::Full => self.invalidate_usage(user_id),
@@ -303,6 +352,57 @@ impl AppState {
                 UsageInvalidation::None => {}
             }
         }
+    }
+
+    /// Deletes descendant cache rows in short background batches so a delete,
+    /// rename or transfer never holds the SQLite writer lock for long.
+    pub fn schedule_cache_cleanup(self: &Arc<Self>, targets: Vec<PathBuf>) {
+        let mut unique = BTreeSet::new();
+        for target in targets {
+            unique.insert(target.to_string_lossy().to_string());
+        }
+        if unique.is_empty() {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            for target in unique {
+                loop {
+                    match state.db.delete_cached_subtree_batch(&target, 500).await {
+                        Ok(0) => break,
+                        Ok(deleted) => {
+                            tracing::debug!(path = %target, deleted, "cleaned cached descendants");
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(path = %target, %error, "cache cleanup failed");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Marks descendant size caches stale in short background batches.
+    pub fn schedule_sizes_stale(self: &Arc<Self>, target: PathBuf) {
+        let state = Arc::clone(self);
+        let target = target.to_string_lossy().to_string();
+        tokio::spawn(async move {
+            loop {
+                match state.db.mark_cached_sizes_stale_batch(&target, 500).await {
+                    Ok(0) => break,
+                    Ok(updated) => {
+                        tracing::debug!(path = %target, updated, "marked cached sizes stale");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %target, %error, "size invalidation failed");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     pub fn adjust_usage(&self, user_id: i64, delta: i64) {

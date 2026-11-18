@@ -262,7 +262,7 @@ impl Default for JobsSettings {
             thumbnail_queue_max: 64,
             dir_size_ttl_seconds: 300,
             dir_size_error_retry_seconds: 60,
-            usage_cache_seconds: 45,
+            usage_cache_seconds: 900,
             dir_size_use_logical: true,
             audit_retention_days: 90,
             audit_max_rows: 200_000,

@@ -42,6 +42,18 @@
 - Editor long lines, CRLF rewrites, silent close, and generic “cannot preview” messages.
 - Delete confirmations wrapped long filenames and pushed the extension onto a second line.
 
+### Blocking and responsiveness fixes
+
+- Deleting, renaming, copying, moving and index cleanup no longer delete cache subtrees with a single case-insensitive `LIKE` transaction. Exact paths are invalidated in the request; descendants are removed in background batches using primary-key range predicates.
+- `indexed_dirs` entries are removed through bounded `index_entries` batches, so FTS triggers no longer hold the SQLite writer lock for a whole subtree.
+- Usage is no longer recomputed by a full home-directory walk for every upload session; uploads use the per-user cached snapshot, usage invalidation keeps the last value for a background refresh, the TTL is 15 minutes, and refreshes are serialized.
+- Listing probes (`dir_mtime_ns` / `has_symlinks`) run in `spawn_blocking` instead of a Tokio worker thread.
+- The admin page renders after loading users/paths/settings; usage, roots and status load in a second wave through one bulk roots endpoint.
+- Settings are written through a single coalescing queue with optimistic UI and inline save state; single-value controls auto-save, while custom CSS and file uploads keep explicit buttons.
+- `dir_size_use_logical` cache clearing and thumbnail failure-record cleanup run in background batches.
+- Thumbnail cache pruning is rate-limited to once per minute instead of walking the whole cache after every generated image.
+- Interactive copy/move jobs keep a reserved share of the job queue, and audit enqueueing is best-effort instead of blocking request handlers.
+
 ### Verification
 
 - `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets`.

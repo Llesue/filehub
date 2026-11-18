@@ -20,7 +20,7 @@ use crate::db::{Root, UploadSession, unix_now};
 use crate::error::AppError;
 use crate::fsops;
 use crate::jobs::{JobContext, JobKind, JobOutcome, SubmitOutcome};
-use crate::state::{AppState, DeleteItem, DeletePreview};
+use crate::state::{AppState, DeleteItem, DeletePreview, UsageInvalidation};
 use crate::usage;
 
 pub async fn roots(
@@ -91,7 +91,15 @@ pub async fn list(
     let order = query.order.unwrap_or_else(|| "asc".to_owned());
     let sort_by_size = sort == "size";
     let real_path = resolved.absolute.to_string_lossy().to_string();
-    let current_mtime = fsops::dir_mtime_ns(&resolved.absolute).unwrap_or_default();
+    let probe_path = resolved.absolute.clone();
+    let (current_mtime, has_symlinks) = tokio::task::spawn_blocking(move || {
+        (
+            fsops::dir_mtime_ns(&probe_path).unwrap_or_default(),
+            fsops::has_symlinks(&probe_path),
+        )
+    })
+    .await
+    .unwrap_or((0, true));
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     let offset = query
         .cursor
@@ -105,7 +113,6 @@ pub async fn list(
         .transpose()?
         .unwrap_or(0);
 
-    let has_symlinks = fsops::has_symlinks(&resolved.absolute);
     if !sort_by_size
         && !has_symlinks
         && let Some((indexed_mtime, indexed_entries, has_more)) = state
@@ -690,10 +697,7 @@ pub async fn create_upload(
             std::path::Path::new(&current.user.home_dir),
         )
     {
-        let home = std::path::PathBuf::from(&current.user.home_dir);
-        let usage = tokio::task::spawn_blocking(move || fsops::path_size(&home))
-            .await
-            .map_err(|err| AppError::internal(anyhow::anyhow!("quota task failed: {err}")))??;
+        let usage = crate::usage::cached_or_scan(&state, &current.user).await?;
         if usage.saturating_add(size as u64) > quota_bytes.max(0) as u64 {
             let error = AppError::QuotaExceeded;
             warn_upload(current.user.id, &filename, "quota", &error);
@@ -955,8 +959,15 @@ pub async fn complete_upload(
         .await
         .map_err(AppError::internal)?;
 
+    let usage =
+        if crate::platform::path_within(&target_path, std::path::Path::new(&current.user.home_dir))
+        {
+            UsageInvalidation::Delta(upload.total_size)
+        } else {
+            UsageInvalidation::None
+        };
     state
-        .invalidate_path_caches(&target_path, Some(current.user.id), false)
+        .invalidate_path_caches_with_usage(&target_path, Some(current.user.id), false, usage)
         .await;
 
     audit(
@@ -1085,6 +1096,7 @@ pub async fn delete_confirm(
     let mut remove_ns = 0_u128;
     let mut cache_ns = 0_u128;
     let root = load_root(&state, current.user.id, preview.root_id).await?;
+    let mut cache_targets = Vec::with_capacity(preview.items.len());
     for item in &preview.items {
         let phase = Instant::now();
         let resolved =
@@ -1097,12 +1109,14 @@ pub async fn delete_confirm(
             .await
             .map_err(|err| AppError::internal(anyhow::anyhow!("delete task failed: {err}")))??;
         remove_ns += phase.elapsed().as_nanos();
-        let phase = Instant::now();
-        state
-            .invalidate_path_caches(&resolved.absolute, Some(current.user.id), true)
-            .await;
-        cache_ns += phase.elapsed().as_nanos();
+        cache_targets.push(resolved.absolute.clone());
     }
+    let phase = Instant::now();
+    state
+        .invalidate_paths_exact(&cache_targets, Some(current.user.id))
+        .await;
+    state.schedule_cache_cleanup(cache_targets);
+    cache_ns += phase.elapsed().as_nanos();
 
     let audit_started = Instant::now();
     audit(&state, current.user.id, "delete", None, &headers).await;
@@ -1670,7 +1684,12 @@ pub async fn mkdir(
     .await
     .map_err(|err| AppError::internal(anyhow::anyhow!("mkdir task failed: {err}")))??;
     state
-        .invalidate_path_caches(&resolved.absolute, Some(current.user.id), false)
+        .invalidate_path_caches_with_usage(
+            &resolved.absolute,
+            Some(current.user.id),
+            false,
+            UsageInvalidation::None,
+        )
         .await;
     audit(
         &state,
@@ -1705,7 +1724,12 @@ pub async fn touch(
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("touch task failed: {err}")))??;
     state
-        .invalidate_path_caches(&resolved.absolute, Some(current.user.id), false)
+        .invalidate_path_caches_with_usage(
+            &resolved.absolute,
+            Some(current.user.id),
+            false,
+            UsageInvalidation::None,
+        )
         .await;
     audit(
         &state,
@@ -1750,12 +1774,15 @@ pub async fn rename(
     tokio::task::spawn_blocking(move || fsops::rename_path(&source_absolute, &target_absolute))
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("rename task failed: {err}")))??;
+    let cache_targets = vec![source.absolute.clone(), target.absolute.clone()];
     state
-        .invalidate_path_caches(&source.absolute, Some(current.user.id), true)
+        .invalidate_paths_exact_with_usage(
+            &cache_targets,
+            Some(current.user.id),
+            UsageInvalidation::None,
+        )
         .await;
-    state
-        .invalidate_path_caches(&target.absolute, Some(current.user.id), true)
-        .await;
+    state.schedule_cache_cleanup(cache_targets);
     audit(
         &state,
         current.user.id,
@@ -1964,6 +1991,7 @@ async fn execute_transfer_job(
     let mut results = Vec::with_capacity(total_items);
     let mut failed = 0_usize;
     let mut bytes_done_total = 0_u64;
+    let mut cache_targets = Vec::with_capacity(total_items.saturating_mul(2));
     for (index, source) in sources.iter().enumerate() {
         ctx.check_cancelled()?;
         let source_again = authz::resolve(
@@ -2061,13 +2089,9 @@ async fn execute_transfer_job(
                     .unwrap_or(&target)
                     .to_string_lossy()
                     .to_string();
-                state
-                    .invalidate_path_caches(&target, Some(user_id), true)
-                    .await;
+                cache_targets.push(target.clone());
                 if payload.move_items {
-                    state
-                        .invalidate_path_caches(&source.absolute, Some(user_id), true)
-                        .await;
+                    cache_targets.push(source.absolute.clone());
                 }
                 results.push(json!({
                     "source": source.relative,
@@ -2093,6 +2117,12 @@ async fn execute_transfer_job(
         }
     }
 
+    if !cache_targets.is_empty() {
+        state
+            .invalidate_paths_exact(&cache_targets, Some(user_id))
+            .await;
+        state.schedule_cache_cleanup(cache_targets);
+    }
     if failed == total_items && total_items > 0 {
         return Err(AppError::bad_request(format!(
             "all {failed} transfer items failed"

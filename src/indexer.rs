@@ -215,10 +215,10 @@ pub async fn index_path(
         return Err(AppError::Cancelled);
     }
     let outcome = scan_result?;
-    for removed in outcome.removed {
-        let value = removed.to_string_lossy().to_string();
-        let _ = state.db.invalidate_index_subtree(&value).await;
-        let _ = state.db.invalidate_directory_sizes(&value).await;
+    let removed: Vec<PathBuf> = outcome.removed.iter().map(PathBuf::from).collect();
+    if !removed.is_empty() {
+        state.invalidate_paths_exact(&removed, None).await;
+        state.schedule_cache_cleanup(removed);
     }
     if let Some(usn) = outcome.usn {
         let _ = state.db.upsert_usn_state(&usn).await;
@@ -231,10 +231,7 @@ pub async fn index_path(
         let _ = state.db.mark_directory_size_stale(&value).await;
         current = path.parent().map(Path::to_path_buf);
     }
-    let _ = state
-        .db
-        .mark_directory_sizes_stale(&base.to_string_lossy())
-        .await;
+    state.schedule_sizes_stale(base.clone());
 
     Ok(stats)
 }
@@ -513,13 +510,17 @@ pub async fn quick_scan(
             stats.changed += 1;
             stats.entries += count;
         }
+        let mut missing_targets = Vec::with_capacity(batch.missing.len());
         for missing in batch.missing {
-            let _ = state.db.invalidate_index_subtree(&missing).await;
-            let _ = state.db.invalidate_directory_sizes(&missing).await;
             if let Some(parent) = Path::new(&missing).parent() {
                 parents.insert(parent.to_path_buf());
             }
+            missing_targets.push(PathBuf::from(missing));
             stats.missing += 1;
+        }
+        if !missing_targets.is_empty() {
+            state.invalidate_paths_exact(&missing_targets, None).await;
+            state.schedule_cache_cleanup(missing_targets);
         }
         progress(stats.checked, total);
     }

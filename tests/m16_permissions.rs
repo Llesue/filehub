@@ -8,6 +8,7 @@ struct TestApp {
     _dir: tempfile::TempDir,
     home: std::path::PathBuf,
     router: Router,
+    state: std::sync::Arc<filehub::state::AppState>,
     cookie: String,
     csrf: String,
     user_id: i64,
@@ -19,7 +20,7 @@ async fn setup_app() -> TestApp {
     let state = filehub::state::AppState::new_test(dir.path(), "test-token")
         .await
         .unwrap();
-    let router = filehub::app::router(state);
+    let router = filehub::app::router(state.clone());
     let setup = send_json(
         &router,
         Method::POST,
@@ -40,6 +41,7 @@ async fn setup_app() -> TestApp {
         home: dir.path().join("users/admin"),
         _dir: dir,
         router,
+        state,
         cookie,
         csrf,
         user_id,
@@ -328,6 +330,115 @@ async fn setup_language_becomes_admin_preference() {
         None,
         None,
         json!({"token":"test-token","username":"admin","password":"correct horse","language":"fr"}),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn delete_returns_before_subtree_cache_cleanup() {
+    let app = setup_app().await;
+    let victim = app.home.join("victim");
+    std::fs::create_dir_all(victim.join("child")).unwrap();
+    std::fs::write(victim.join("child").join("a.txt"), "hello").unwrap();
+
+    let victim_path = victim.to_string_lossy().to_string();
+    let child_path = victim.join("child").to_string_lossy().to_string();
+    let deep_path = victim
+        .join("child")
+        .join("deep")
+        .to_string_lossy()
+        .to_string();
+    let mut rows = Vec::new();
+    rows.push((victim_path.clone(), 5, 0, None));
+    rows.push((child_path.clone(), 5, 0, None));
+    rows.push((deep_path.clone(), 5, 0, None));
+    for index in 0..5000 {
+        rows.push((
+            victim
+                .join(format!("child/cache-{index}"))
+                .to_string_lossy()
+                .to_string(),
+            1,
+            0,
+            None,
+        ));
+    }
+    app.state.db.set_directory_sizes_batch(rows).await.unwrap();
+
+    let preview = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/delete/preview",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root":app.root_id,"paths":["victim"]}),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let body = json_body(preview).await;
+    let token = body["token"].as_str().unwrap().to_owned();
+    let code = body["confirm_code"].as_str().unwrap().to_owned();
+
+    let started = std::time::Instant::now();
+    let deleted = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/delete",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"token":token,"confirm_code":code}),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "delete must not wait for subtree cache cleanup"
+    );
+    assert!(!victim.exists());
+
+    let mut cleaned = false;
+    for _ in 0..200 {
+        if app
+            .state
+            .db
+            .directory_size_state(&child_path)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            cleaned = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(cleaned, "subtree cache rows must be cleaned in background");
+}
+
+#[tokio::test]
+async fn batch_settings_update_is_atomic_and_validated() {
+    let app = setup_app().await;
+    let response = send_json(
+        &app.router,
+        Method::PATCH,
+        "/api/v1/admin/settings",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"values":{"thumbnails.enabled":false,"editor.enabled":false}}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["settings"]["thumbnails"]["enabled"], false);
+    assert_eq!(body["settings"]["editor"]["enabled"], false);
+
+    let invalid = send_json(
+        &app.router,
+        Method::PATCH,
+        "/api/v1/admin/settings",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"values":{"not.a.key":1}}),
     )
     .await;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);

@@ -109,6 +109,44 @@ fn covering_root<'a>(
         .min_by_key(|other| other.real_path.len())
 }
 
+pub async fn list_all_roots(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    let all = state
+        .db
+        .list_all_roots()
+        .await
+        .map_err(AppError::internal)?;
+    let mut grouped: std::collections::BTreeMap<i64, Vec<crate::db::Root>> =
+        std::collections::BTreeMap::new();
+    for root in all {
+        grouped.entry(root.user_id).or_default().push(root);
+    }
+    let mut result = serde_json::Map::new();
+    for (user_id, roots) in grouped {
+        let values: Vec<Value> = roots
+            .iter()
+            .map(|root| {
+                let covered = covering_root(&roots, root);
+                json!({
+                    "id": root.id,
+                    "alias": root.alias,
+                    "real_path": root.real_path,
+                    "read_only": root.read_only,
+                    "sort_order": root.sort_order,
+                    "covered_by": covered.map(|other| other.alias.clone()),
+                    "covered_by_id": covered.map(|other| other.id),
+                })
+            })
+            .collect();
+        result.insert(user_id.to_string(), Value::Array(values));
+    }
+    Ok(Json(json!({ "roots": result })))
+}
+
 pub async fn status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

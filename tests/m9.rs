@@ -670,9 +670,14 @@ async fn dir_size_disk_mode_deduplicates_hardlinks() {
         .upsert_setting("jobs.dir_size_use_logical", "false")
         .await
         .unwrap();
-    app.state.reload_settings().await.unwrap();
+    app.state.reload_settings(false).await.unwrap();
     app.state
-        .invalidate_path_caches(&hard_dir, Some(1), true)
+        .invalidate_path_caches_with_usage(
+            &hard_dir,
+            Some(1),
+            false,
+            filehub::state::UsageInvalidation::None,
+        )
         .await;
 
     let disk = wait_dir_size(&app, "hard").await;

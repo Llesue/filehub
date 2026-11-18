@@ -781,16 +781,22 @@ export const api = {
     rootId: number,
     payload: { alias: string; read_only: boolean; sort_order?: number },
     csrf: string,
-  ): Promise<{ root: AdminRoot }> {
-    return request<{ root: AdminRoot }>(
+  ): Promise<{ updated: boolean }> {
+    return request<{ updated: boolean }>(
       `/admin/users/${userId}/roots/${rootId}`,
       { method: 'PUT', body: JSON.stringify(payload) },
       csrf,
     );
   },
 
-  userUsage(userId: number): Promise<{ used_bytes: number }> {
-    return request<{ used_bytes: number }>(`/admin/users/${userId}/usage`);
+  userUsage(
+    userId: number,
+  ): Promise<{ used_bytes: number | null; quota_bytes: number | null; computing: boolean }> {
+    return request<{
+      used_bytes: number | null;
+      quota_bytes: number | null;
+      computing: boolean;
+    }>(`/admin/users/${userId}/usage`);
   },
 
   adminUsage(): Promise<{
@@ -1417,6 +1423,18 @@ export const api = {
       { method: 'PUT', body: JSON.stringify({ key, value }) },
       csrf,
     );
+  },
+
+  updateSettings(values: Record<string, unknown>, csrf: string): Promise<SettingsResponse> {
+    return request<SettingsResponse>(
+      '/admin/settings',
+      { method: 'PATCH', body: JSON.stringify({ values }) },
+      csrf,
+    );
+  },
+
+  listAllRoots(): Promise<{ roots: Record<string, AdminRoot[]> }> {
+    return request('/admin/roots');
   },
 
   resetSetting(key: string, csrf: string): Promise<SettingsResponse> {

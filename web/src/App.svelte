@@ -4656,13 +4656,13 @@
   }
 
   .sort-trigger {
-    height: 30px;
-    padding: 0 9px;
+    height: 34px;
+    padding: 0 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--surface);
     color: var(--text-2);
-    font-size: 12.5px;
+    font-size: 13px;
     white-space: nowrap;
   }
 

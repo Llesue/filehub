@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
@@ -48,6 +48,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/users/usage", get(crate::usage::admin_batch))
         .route("/admin/users/{id}/usage", get(user_usage))
         .route("/admin/status", get(crate::admin_fs::status))
+        .route("/admin/roots", get(crate::admin_fs::list_all_roots))
         .route(
             "/admin/server-paths",
             get(crate::admin_fs::list_server_paths).post(crate::admin_fs::add_server_path),
@@ -57,7 +58,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             put(crate::admin_fs::update_server_path).delete(crate::admin_fs::delete_server_path),
         )
         .route("/admin/audit", get(crate::admin_fs::list_audit))
-        .route("/admin/settings", get(get_settings).put(put_setting))
+        .route(
+            "/admin/settings",
+            get(get_settings).put(put_setting).patch(patch_settings),
+        )
         .route("/admin/settings/{key}", delete(delete_setting))
         .route(
             "/admin/branding/icon",
@@ -794,11 +798,24 @@ async fn user_usage(
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
     let ttl = state.settings().settings.jobs.usage_cache_seconds as i64;
-    let snapshot = crate::usage::load_snapshot(&state, &user, ttl).await?;
+    if let Some(snapshot) = state.usage_cache.lock().get(&user.id).cloned() {
+        let stale = unix_now().saturating_sub(snapshot.computed_at) > ttl.max(1);
+        if stale {
+            crate::usage::spawn_refresh(Arc::clone(&state), user.clone());
+        }
+        return Ok(Json(json!({
+            "used_bytes": snapshot.used_bytes,
+            "quota_bytes": snapshot.quota_bytes,
+            "computed_at": snapshot.computed_at,
+            "computing": stale,
+        })));
+    }
+    crate::usage::spawn_refresh(Arc::clone(&state), user.clone());
     Ok(Json(json!({
-        "used_bytes": snapshot.used_bytes,
-        "quota_bytes": snapshot.quota_bytes,
-        "computed_at": snapshot.computed_at,
+        "used_bytes": null,
+        "quota_bytes": user.quota_bytes,
+        "computed_at": null,
+        "computing": true,
     })))
 }
 
@@ -903,17 +920,32 @@ async fn put_setting(
         overrides.push((request.key.clone(), encoded.clone()));
     }
 
+    let ensure_paths = is_path_setting(&request.key);
     let candidate = config::build_snapshot(&state.config, &overrides)
         .map_err(|err| AppError::bad_request(err.to_string()))?;
-    config::ensure_directories(&candidate).map_err(|err| AppError::bad_request(err.to_string()))?;
+    if ensure_paths {
+        config::ensure_directories(&candidate)
+            .map_err(|err| AppError::bad_request(err.to_string()))?;
+    }
 
+    let started = Instant::now();
     state
         .db
         .upsert_setting(&request.key, &encoded)
         .await
         .map_err(AppError::internal)?;
-    state.reload_settings().await.map_err(AppError::internal)?;
+    state
+        .reload_settings(ensure_paths)
+        .await
+        .map_err(AppError::internal)?;
     clear_dir_size_cache_if_needed(&state, &request.key).await;
+    if started.elapsed().as_millis() >= 500 {
+        tracing::warn!(
+            key = %request.key,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "slow settings write"
+        );
+    }
 
     audit(
         &state,
@@ -921,6 +953,125 @@ async fn put_setting(
         "settings_updated",
         None,
         Some(&request.key),
+        &headers,
+    )
+    .await;
+
+    Ok(Json(settings_json(&state)))
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchSettingsRequest {
+    values: serde_json::Map<String, Value>,
+}
+
+async fn patch_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    payload: Result<Json<PatchSettingsRequest>, JsonRejection>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    auth::require_csrf(&current, &headers)?;
+    let Json(request) = payload.map_err(json_rejection)?;
+    if request.values.is_empty() {
+        return Err(AppError::bad_request("values cannot be empty"));
+    }
+    if request.values.len() > 32 {
+        return Err(AppError::bad_request("at most 32 settings per request"));
+    }
+
+    let mut encoded_values = Vec::with_capacity(request.values.len());
+    let mut ensure_paths = false;
+    for (key, value) in &request.values {
+        if !config::is_known_key(key) {
+            return Err(AppError::bad_request(format!(
+                "unknown settings key: {key}"
+            )));
+        }
+        if config::is_bootstrap_key(key) {
+            return Err(AppError::bad_request(
+                "this setting is bootstrap-only and cannot be changed from the database",
+            ));
+        }
+        ensure_paths |= is_path_setting(key);
+        let encoded = serde_json::to_string(value)
+            .map_err(|err| AppError::bad_request(format!("invalid value: {err}")))?;
+        encoded_values.push((key.clone(), encoded));
+    }
+
+    let mut overrides = state
+        .db
+        .settings_overrides()
+        .await
+        .map_err(AppError::internal)?;
+    for (key, encoded) in &encoded_values {
+        if let Some(existing) = overrides.iter_mut().find(|(name, _)| name == key) {
+            existing.1 = encoded.clone();
+        } else {
+            overrides.push((key.clone(), encoded.clone()));
+        }
+    }
+
+    let candidate = config::build_snapshot(&state.config, &overrides)
+        .map_err(|err| AppError::bad_request(err.to_string()))?;
+    if ensure_paths {
+        config::ensure_directories(&candidate)
+            .map_err(|err| AppError::bad_request(err.to_string()))?;
+    }
+
+    let started = Instant::now();
+    state
+        .db
+        .upsert_settings_batch(encoded_values)
+        .await
+        .map_err(AppError::internal)?;
+    state
+        .reload_settings(ensure_paths)
+        .await
+        .map_err(AppError::internal)?;
+
+    let keys: Vec<String> = request.values.keys().cloned().collect();
+    if keys.iter().any(|key| key == "jobs.dir_size_use_logical") {
+        let cleanup = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                match cleanup.db.clear_directory_sizes_batch(500).await {
+                    Ok(0) => break,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to clear directory size cache");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    if keys.iter().any(|key| {
+        matches!(
+            key.as_str(),
+            "thumbnails.jpeg_max_pixels" | "thumbnails.max_pixels" | "thumbnails.max_source_bytes"
+        )
+    }) {
+        let cache_dir = state.settings().settings.cache_dir.join("thumbs");
+        tokio::spawn(async move {
+            crate::thumbs::clear_failure_records(&cache_dir).await;
+        });
+    }
+    if started.elapsed().as_millis() >= 500 {
+        tracing::warn!(
+            count = keys.len(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            "slow settings batch write"
+        );
+    }
+
+    audit(
+        &state,
+        Some(current.user.id),
+        "settings_updated",
+        None,
+        Some(&keys.join(",")),
         &headers,
     )
     .await;
@@ -941,12 +1092,16 @@ async fn delete_setting(
         return Err(AppError::NotFound);
     }
 
+    let ensure_paths = is_path_setting(&key);
     state
         .db
         .delete_setting(&key)
         .await
         .map_err(AppError::internal)?;
-    state.reload_settings().await.map_err(AppError::internal)?;
+    state
+        .reload_settings(ensure_paths)
+        .await
+        .map_err(AppError::internal)?;
     clear_dir_size_cache_if_needed(&state, &key).await;
 
     audit(
@@ -962,18 +1117,34 @@ async fn delete_setting(
     Ok(Json(settings_json(&state)))
 }
 
+fn is_path_setting(key: &str) -> bool {
+    matches!(key, "db_path" | "users_root" | "cache_dir")
+}
+
 async fn clear_dir_size_cache_if_needed(state: &Arc<AppState>, key: &str) {
-    if key == "jobs.dir_size_use_logical"
-        && let Err(error) = state.db.clear_directory_sizes().await
-    {
-        tracing::warn!(%error, "failed to clear directory size cache after mode change");
+    if key == "jobs.dir_size_use_logical" {
+        let cleanup = Arc::clone(state);
+        tokio::spawn(async move {
+            loop {
+                match cleanup.db.clear_directory_sizes_batch(500).await {
+                    Ok(0) => break,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to clear directory size cache");
+                        break;
+                    }
+                }
+            }
+        });
     }
     if matches!(
         key,
         "thumbnails.jpeg_max_pixels" | "thumbnails.max_pixels" | "thumbnails.max_source_bytes"
     ) {
         let cache_dir = state.settings().settings.cache_dir.join("thumbs");
-        crate::thumbs::clear_failure_records(&cache_dir).await;
+        tokio::spawn(async move {
+            crate::thumbs::clear_failure_records(&cache_dir).await;
+        });
     }
 }
 

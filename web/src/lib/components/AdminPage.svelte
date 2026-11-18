@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { SvelteMap } from 'svelte/reactivity';
   import { api, type AdminRoot, type ServerPath, type SettingsResponse, type User } from '../api';
   import { branding, brandMark, loadBranding } from '../branding';
   import { language, localeOf, t } from '../i18n';
@@ -39,6 +40,7 @@
   let editingPathId = $state<number | null>(null);
   let editingPathAlias = $state('');
   let editingPathOriginal = $state('');
+  let savingPathId = $state<number | null>(null);
 
   function password(): string {
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%';
@@ -59,22 +61,32 @@
       users = userResult.users;
       paths = pathResult.paths;
       settings = settingsResult;
-      const [usageResult, rootEntries, statusResult] = await Promise.all([
-        api.adminUsage(),
-        Promise.all(
-          users.map(async (user) => [user.id, (await api.listUserRoots(user.id)).roots] as const),
-        ),
-        api.adminStatus(),
-      ]);
-      applyUsage(usageResult);
-      roots = Object.fromEntries(rootEntries);
-      status = statusResult;
+      loading = false;
+      loadedOnce = true;
+      void loadDeferred();
     } catch (error) {
       showNotice(error instanceof Error ? error.message : t($language, '管理数据加载失败'));
     } finally {
       loading = false;
       loadedOnce = true;
+    }
+  }
+
+  async function loadDeferred(): Promise<void> {
+    try {
+      const [usageResult, rootsResult, statusResult] = await Promise.all([
+        api.adminUsage(),
+        api.listAllRoots(),
+        api.adminStatus(),
+      ]);
+      applyUsage(usageResult);
+      roots = Object.fromEntries(
+        Object.entries(rootsResult.roots).map(([id, entries]) => [Number(id), entries]),
+      );
+      status = statusResult;
       scheduleUsagePoll();
+    } catch (error) {
+      console.warn('could not load deferred admin data', error);
     }
   }
 
@@ -107,6 +119,9 @@
   onMount(() => void load());
   onDestroy(() => {
     if (usageTimer) clearTimeout(usageTimer);
+    if (settingFlushTimer) clearTimeout(settingFlushTimer);
+    for (const timer of savedTimers.values()) clearTimeout(timer);
+    savedTimers.clear();
   });
 
   function formatBytes(value: number | null): string {
@@ -210,20 +225,27 @@
 
   async function finishPathAlias(): Promise<void> {
     if (editingPathId === null) return;
+    const id = editingPathId;
+    const original = editingPathOriginal;
     const value = editingPathAlias.trim();
-    if (!value || value === editingPathOriginal) {
-      editingPathId = null;
-      editingPathAlias = editingPathOriginal;
-      return;
-    }
+    editingPathId = null;
+    editingPathAlias = original;
+    if (!value || value === original) return;
+    const target = paths.find((path) => path.id === id);
+    const previous = target?.alias ?? original;
+    if (target) target.alias = value;
+    savingPathId = id;
     try {
-      await api.updateServerPath(editingPathId, value, csrf);
-      editingPathId = null;
-      await load();
+      const result = await api.updateServerPath(id, value, csrf);
+      if (target) target.alias = result.alias;
     } catch (error) {
+      if (target) target.alias = previous;
+      editingPathId = id;
+      editingPathAlias = value;
+      editingPathOriginal = original;
       showNotice(error instanceof Error ? error.message : t($language, '修改别名失败'));
-      editingPathId = null;
-      editingPathAlias = editingPathOriginal;
+    } finally {
+      savingPathId = null;
     }
   }
 
@@ -241,16 +263,18 @@
   }
 
   async function toggleRoot(user: User, root: AdminRoot): Promise<void> {
+    const previous = root.read_only;
+    root.read_only = !previous;
     try {
       await api.updateRoot(
         user.id,
         root.id,
-        { alias: root.alias, read_only: !root.read_only, sort_order: root.sort_order },
+        { alias: root.alias, read_only: root.read_only, sort_order: root.sort_order },
         csrf,
       );
-      await load();
       onRootsChanged?.();
     } catch (error) {
+      root.read_only = previous;
       showNotice(error instanceof Error ? error.message : t($language, '权限修改失败'));
     }
   }
@@ -277,12 +301,108 @@
     return current;
   }
 
-  async function setSetting(key: string, value: unknown): Promise<void> {
-    try {
-      settings = await api.updateSetting(key, value, csrf);
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : t($language, '系统设置保存失败'));
+  type SettingState = 'saving' | 'saved' | 'error';
+  let settingStates = $state<Record<string, SettingState>>({});
+  let settingErrors = $state<Record<string, string>>({});
+  const pendingSettings = new SvelteMap<string, unknown>();
+  const savedTimers = new SvelteMap<string, ReturnType<typeof setTimeout>>();
+  let settingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  let settingsChain: Promise<void> = Promise.resolve();
+
+  function markSettingState(key: string, state: SettingState, message = ''): void {
+    settingStates = { ...settingStates, [key]: state };
+    settingErrors = { ...settingErrors, [key]: message };
+    const existing = savedTimers.get(key);
+    if (existing) {
+      clearTimeout(existing);
+      savedTimers.delete(key);
     }
+    if (state === 'saved') {
+      const timer = setTimeout(() => {
+        savedTimers.delete(key);
+        if (settingStates[key] !== 'saved') return;
+        const next = { ...settingStates };
+        delete next[key];
+        settingStates = next;
+      }, 1500);
+      savedTimers.set(key, timer);
+    }
+  }
+
+  function setLocalSetting(key: string, value: unknown): void {
+    if (!settings) return;
+    const parts = key.split('.');
+    let target = settings.settings as Record<string, unknown>;
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      const part = parts[index];
+      if (!part) continue;
+      const next = target[part];
+      if (!next || typeof next !== 'object') target[part] = {};
+      target = target[part] as Record<string, unknown>;
+    }
+    const last = parts[parts.length - 1];
+    if (last) target[last] = value;
+  }
+
+  function applySettingsSnapshot(result: SettingsResponse): void {
+    settings = result;
+    for (const [key, value] of pendingSettings) setLocalSetting(key, value);
+  }
+
+  function queueSetting(key: string, value: unknown): void {
+    setLocalSetting(key, value);
+    pendingSettings.set(key, value);
+    markSettingState(key, 'saving');
+    if (settingFlushTimer) clearTimeout(settingFlushTimer);
+    settingFlushTimer = setTimeout(() => {
+      settingFlushTimer = null;
+      void flushSettings();
+    }, 250);
+  }
+
+  async function flushSettings(): Promise<void> {
+    if (!settings || pendingSettings.size === 0) return;
+    const entries = Array.from(pendingSettings);
+    pendingSettings.clear();
+    const values = Object.fromEntries(entries);
+    settingsChain = settingsChain.then(async () => {
+      try {
+        const result = await api.updateSettings(values, csrf);
+        applySettingsSnapshot(result);
+        for (const key of Object.keys(values)) {
+          if (!pendingSettings.has(key)) markSettingState(key, 'saved');
+        }
+        if ('ui.brand_name' in values) void loadBranding();
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : t($language, '系统设置保存失败');
+        showNotice(message);
+        for (const key of Object.keys(values)) {
+          if (!pendingSettings.has(key)) markSettingState(key, 'error', message);
+        }
+        try {
+          applySettingsSnapshot(await api.getSettings());
+        } catch (refreshError) {
+          console.warn('could not reload settings after failed save', refreshError);
+        }
+      }
+    });
+    await settingsChain;
+  }
+
+  function saveNumber(
+    key: string,
+    raw: string | number,
+    minimum: number,
+    maximum: number,
+    scale = 1,
+  ): void {
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < minimum || value > maximum) {
+      markSettingState(key, 'error', t($language, '数值超出允许范围'));
+      return;
+    }
+    queueSetting(key, Math.round(value * scale));
   }
 
   let defaultQuotaGb = $state(15);
@@ -294,8 +414,8 @@
     }
   });
 
-  async function saveDefaultQuota(): Promise<void> {
-    await setSetting('default_quota_bytes', Math.round(defaultQuotaGb * 1024 ** 3));
+  function saveDefaultQuota(): void {
+    saveNumber('default_quota_bytes', defaultQuotaGb, 0, 1024 * 1024, 1024 ** 3);
   }
 
   let brandNameInput = $state('FileHub');
@@ -353,12 +473,14 @@
     }
   }
 
-  async function saveBrandName(): Promise<void> {
+  function saveBrandName(): void {
     const value = brandNameInput.trim();
-    if (!value) return;
-    await setSetting('ui.brand_name', value);
-    await loadBranding();
-    showNotice(t($language, '已保存'), 'info', t($language, '品牌'));
+    if (!value) {
+      markSettingState('ui.brand_name', 'error', t($language, '品牌名称不能为空'));
+      return;
+    }
+    if (value === String(setting('ui.brand_name') ?? '')) return;
+    queueSetting('ui.brand_name', value);
   }
 
   async function uploadBrandIcon(event: Event): Promise<void> {
@@ -409,6 +531,13 @@
     }
   });
 
+  function blurOnEnter(event: KeyboardEvent): void {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      (event.currentTarget as HTMLElement | null)?.blur();
+    }
+  }
+
   function settingSource(key: string): string {
     const source = settings?.sources[key] ?? 'default';
     return source === 'db'
@@ -419,18 +548,23 @@
   }
 
   async function clearSetting(key: string): Promise<void> {
+    pendingSettings.delete(key);
+    markSettingState(key, 'saving');
     try {
-      settings = await api.resetSetting(key, csrf);
+      applySettingsSnapshot(await api.resetSetting(key, csrf));
+      markSettingState(key, 'saved');
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : t($language, '系统设置保存失败'));
+      const message = error instanceof Error ? error.message : t($language, '系统设置保存失败');
+      showNotice(message);
+      markSettingState(key, 'error', message);
     }
   }
 
-  async function saveThumbSettings(): Promise<void> {
-    await setSetting('thumbnails.preview_edge', Math.round(previewEdge));
-    await setSetting('thumbnails.jpeg_max_pixels', Math.round(jpegMaxMp * 1_000_000));
-    await setSetting('thumbnails.max_pixels', Math.round(maxPixelsMp * 1_000_000));
-    await setSetting('thumbnails.max_source_bytes', Math.round(maxSourceMb * 1024 ** 2));
+  function saveThumbSettings(): void {
+    saveNumber('thumbnails.preview_edge', previewEdge, 512, 4096);
+    saveNumber('thumbnails.jpeg_max_pixels', jpegMaxMp, 1, 100_000, 1_000_000);
+    saveNumber('thumbnails.max_pixels', maxPixelsMp, 1, 100_000, 1_000_000);
+    saveNumber('thumbnails.max_source_bytes', maxSourceMb, 1, 1_048_576, 1024 ** 2);
   }
 
   let zipMaxGb = $state(2);
@@ -446,12 +580,28 @@
     }
   });
 
-  async function saveZipSettings(): Promise<void> {
-    await setSetting('downloads.zip_max_bytes', Math.round(zipMaxGb * 1024 ** 3));
-    await setSetting('downloads.zip_max_files', Math.round(zipMaxFiles));
-    await setSetting('downloads.zip_concurrency', Math.max(1, Math.round(zipConcurrency)));
+  function saveZipSettings(): void {
+    saveNumber('downloads.zip_max_bytes', zipMaxGb, 0, 1024 * 1024, 1024 ** 3);
+    saveNumber('downloads.zip_max_files', zipMaxFiles, 0, 10_000_000);
+    saveNumber('downloads.zip_concurrency', zipConcurrency, 1, 64);
   }
 </script>
+
+{#snippet saveState(key: string)}
+  {#if settingStates[key]}
+    <small
+      class="setting-save"
+      class:saved={settingStates[key] === 'saved'}
+      class:error={settingStates[key] === 'error'}
+      title={settingErrors[key] || ''}
+      >{settingStates[key] === 'saving'
+        ? t($language, '保存中…')
+        : settingStates[key] === 'saved'
+          ? t($language, '已保存')
+          : t($language, '保存失败')}</small
+    >
+  {/if}
+{/snippet}
 
 <section class="admin-page">
   <header class="admin-header">
@@ -605,6 +755,9 @@
               >{path.alias}</button
             >
           {/if}
+          {#if savingPathId === path.id}
+            <small class="setting-save">{t($language, '保存中…')}</small>
+          {/if}
           <span class="root-path">{path.real_path}</span>
           <button type="button" class="text-button danger" onclick={() => (deletePathTarget = path)}
             >{t($language, '删除')}</button
@@ -619,12 +772,14 @@
       <h2>{t($language, '品牌')}</h2>
       <div class="setting-grid">
         <label class="setting-row"
-          ><span>{t($language, '品牌名称')}</span>
+          ><span>{t($language, '品牌名称')}{@render saveState('ui.brand_name')}</span>
           <div class="quota-setting">
-            <input bind:value={brandNameInput} maxlength="64" />
-            <button type="button" class="small" onclick={() => void saveBrandName()}
-              >{t($language, '保存')}</button
-            >
+            <input
+              bind:value={brandNameInput}
+              maxlength="64"
+              onblur={saveBrandName}
+              onkeydown={blurOnEnter}
+            />
           </div></label
         >
         <div class="setting-row">
@@ -690,25 +845,25 @@
         </p>
         <div class="setting-grid">
           <label class="setting-row"
-            ><span>{t($language, '缩略图')}</span><input
+            ><span>{t($language, '缩略图')}{@render saveState('thumbnails.enabled')}</span><input
               type="checkbox"
               checked={Boolean(setting('thumbnails.enabled'))}
               onchange={(event) =>
-                void setSetting('thumbnails.enabled', event.currentTarget.checked)}
+                queueSetting('thumbnails.enabled', event.currentTarget.checked)}
             /></label
           >
           <label class="setting-row"
-            ><span>{t($language, '文本编辑器')}</span><input
+            ><span>{t($language, '文本编辑器')}{@render saveState('editor.enabled')}</span><input
               type="checkbox"
               checked={Boolean(setting('editor.enabled'))}
-              onchange={(event) => void setSetting('editor.enabled', event.currentTarget.checked)}
+              onchange={(event) => queueSetting('editor.enabled', event.currentTarget.checked)}
             /></label
           >
           <label class="setting-row"
-            ><span>{t($language, '终端')}</span><input
+            ><span>{t($language, '终端')}{@render saveState('terminal_enabled')}</span><input
               type="checkbox"
               checked={Boolean(setting('terminal_enabled'))}
-              onchange={(event) => void setSetting('terminal_enabled', event.currentTarget.checked)}
+              onchange={(event) => queueSetting('terminal_enabled', event.currentTarget.checked)}
             /></label
           >
         </div>
@@ -721,29 +876,51 @@
             <span>{t($language, 'ZIP 下载限制')}</span>
             <div class="zip-fields">
               <label class="zip-field"
-                ><span>{t($language, '最大大小')}</span>
-                <input bind:value={zipMaxGb} type="number" min="0" step="1" /><span>GB</span></label
+                ><span>{t($language, '最大大小')}{@render saveState('downloads.zip_max_bytes')}</span>
+                <input
+                  bind:value={zipMaxGb}
+                  type="number"
+                  min="0"
+                  step="1"
+                  onblur={saveZipSettings}
+                  onkeydown={blurOnEnter}
+                /><span>GB</span></label
               >
               <label class="zip-field"
-                ><span>{t($language, '最大文件数')}</span>
-                <input bind:value={zipMaxFiles} type="number" min="0" step="1" /></label
+                ><span>{t($language, '最大文件数')}{@render saveState('downloads.zip_max_files')}</span>
+                <input
+                  bind:value={zipMaxFiles}
+                  type="number"
+                  min="0"
+                  step="1"
+                  onblur={saveZipSettings}
+                  onkeydown={blurOnEnter}
+                /></label
               >
               <label class="zip-field"
-                ><span>{t($language, '并发数')}</span>
-                <input bind:value={zipConcurrency} type="number" min="1" step="1" /></label
-              >
-              <button type="button" class="small" onclick={() => void saveZipSettings()}
-                >{t($language, '保存')}</button
+                ><span>{t($language, '并发数')}{@render saveState('downloads.zip_concurrency')}</span>
+                <input
+                  bind:value={zipConcurrency}
+                  type="number"
+                  min="1"
+                  step="1"
+                  onblur={saveZipSettings}
+                  onkeydown={blurOnEnter}
+                /></label
               >
             </div>
           </div>
           <label class="setting-row"
-            ><span>{t($language, '默认配额')}</span>
+            ><span>{t($language, '默认配额')}{@render saveState('default_quota_bytes')}</span>
             <div class="quota-setting">
-              <input bind:value={defaultQuotaGb} type="number" min="0" step="1" /><span>GB</span
-              ><button type="button" class="small" onclick={() => void saveDefaultQuota()}
-                >{t($language, '保存')}</button
-              >
+              <input
+                bind:value={defaultQuotaGb}
+                type="number"
+                min="0"
+                step="1"
+                onblur={saveDefaultQuota}
+                onkeydown={blurOnEnter}
+              /><span>GB</span>
             </div></label
           >
         </div>
@@ -758,10 +935,19 @@
           <label class="setting-row wide"
             ><span
               >{t($language, '预览长边')}
-              <small class="setting-source">{settingSource('thumbnails.preview_edge')}</small></span
+              <small class="setting-source">{settingSource('thumbnails.preview_edge')}</small>
+              {@render saveState('thumbnails.preview_edge')}</span
             >
             <div class="quota-setting">
-              <input bind:value={previewEdge} type="number" min="512" max="4096" step="128" />
+              <input
+                bind:value={previewEdge}
+                type="number"
+                min="512"
+                max="4096"
+                step="128"
+                onblur={saveThumbSettings}
+                onkeydown={blurOnEnter}
+              />
               <span>px</span>
               {#if settings?.sources['thumbnails.preview_edge'] === 'db'}
                 <button
@@ -778,37 +964,54 @@
               >{t($language, 'JPEG 像素上限')}
               <small class="setting-source"
                 >{settingSource('thumbnails.jpeg_max_pixels')}</small
-              ></span
+              >
+              {@render saveState('thumbnails.jpeg_max_pixels')}</span
             >
             <div class="quota-setting">
-              <input bind:value={jpegMaxMp} type="number" min="1" step="1" /><span>MP</span>
+              <input
+                bind:value={jpegMaxMp}
+                type="number"
+                min="1"
+                step="1"
+                onblur={saveThumbSettings}
+                onkeydown={blurOnEnter}
+              /><span>MP</span>
             </div></label
           >
           <label class="setting-row wide"
             ><span
               >{t($language, '其他图片像素上限')}
-              <small class="setting-source">{settingSource('thumbnails.max_pixels')}</small></span
+              <small class="setting-source">{settingSource('thumbnails.max_pixels')}</small>
+              {@render saveState('thumbnails.max_pixels')}</span
             >
             <div class="quota-setting">
-              <input bind:value={maxPixelsMp} type="number" min="1" step="1" /><span>MP</span>
+              <input
+                bind:value={maxPixelsMp}
+                type="number"
+                min="1"
+                step="1"
+                onblur={saveThumbSettings}
+                onkeydown={blurOnEnter}
+              /><span>MP</span>
             </div></label
           >
           <label class="setting-row wide"
             ><span
               >{t($language, '源文件大小上限')}
-              <small class="setting-source">{settingSource('thumbnails.max_source_bytes')}</small
-              ></span
+              <small class="setting-source">{settingSource('thumbnails.max_source_bytes')}</small>
+              {@render saveState('thumbnails.max_source_bytes')}</span
             >
             <div class="quota-setting">
-              <input bind:value={maxSourceMb} type="number" min="1" step="1" /><span>MB</span>
+              <input
+                bind:value={maxSourceMb}
+                type="number"
+                min="1"
+                step="1"
+                onblur={saveThumbSettings}
+                onkeydown={blurOnEnter}
+              /><span>MB</span>
             </div></label
           >
-          <div class="setting-row wide">
-            <span></span>
-            <button type="button" class="small" onclick={() => void saveThumbSettings()}
-              >{t($language, '保存')}</button
-            >
-          </div>
         </div>
       </div>
 
@@ -819,36 +1022,40 @@
         </p>
         <div class="setting-grid">
           <label class="setting-row"
-            ><span>{t($language, '默认显示隐藏文件')}</span><input
+            ><span
+              >{t($language, '默认显示隐藏文件')}{@render saveState('show_hidden_default')}</span
+            ><input
               type="checkbox"
               checked={Boolean(setting('show_hidden_default'))}
               onchange={(event) =>
-                void setSetting('show_hidden_default', event.currentTarget.checked)}
+                queueSetting('show_hidden_default', event.currentTarget.checked)}
             /></label
           >
           <label class="setting-row"
-            ><span>{t($language, '默认主题')}</span><select
+            ><span>{t($language, '默认主题')}{@render saveState('ui.default_theme')}</span><select
               value={String(setting('ui.default_theme') ?? 'system')}
-              onchange={(event) => void setSetting('ui.default_theme', event.currentTarget.value)}
+              onchange={(event) => queueSetting('ui.default_theme', event.currentTarget.value)}
               ><option value="system">{t($language, '跟随系统')}</option><option value="light"
                 >{t($language, '浅色')}</option
               ><option value="dark">{t($language, '深色')}</option></select
             ></label
           >
           <label class="setting-row"
-            ><span>{t($language, '默认语言')}</span><select
+            ><span>{t($language, '默认语言')}{@render saveState('ui.default_locale')}</span><select
               value={String(setting('ui.default_locale') ?? 'zh-CN')}
-              onchange={(event) => void setSetting('ui.default_locale', event.currentTarget.value)}
+              onchange={(event) => queueSetting('ui.default_locale', event.currentTarget.value)}
               ><option value="zh-CN">{t($language, '中文')}</option><option value="en"
                 >English</option
               ></select
             ></label
           >
           <label class="setting-row"
-            ><span>{t($language, '上传同名文件')}</span><select
+            ><span
+              >{t($language, '上传同名文件')}{@render saveState('upload_conflict_default')}</span
+            ><select
               value={String(setting('upload_conflict_default') ?? 'rename')}
               onchange={(event) =>
-                void setSetting('upload_conflict_default', event.currentTarget.value)}
+                queueSetting('upload_conflict_default', event.currentTarget.value)}
               ><option value="rename">{t($language, '自动重命名')}</option><option value="overwrite"
                 >{t($language, '覆盖')}</option
               ><option value="skip">{t($language, '跳过')}</option></select
@@ -974,6 +1181,21 @@
     font-size: 14px;
     font-weight: 600;
   }
+  .setting-save {
+    margin-left: 6px;
+    color: var(--text-2);
+    font-size: 11.5px;
+    font-weight: 400;
+  }
+
+  .setting-save.saved {
+    color: var(--accent-text);
+  }
+
+  .setting-save.error {
+    color: var(--danger);
+  }
+
   .setting-source {
     margin-left: 6px;
     color: var(--text-2);

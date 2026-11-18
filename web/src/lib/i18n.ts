@@ -665,6 +665,8 @@ const en: Record<string, string> = {
   源文件大小上限: 'Source size limit',
   '预览长边范围 512–4096；像素上限按百万像素（MP）计。':
     'Preview long edge is 512–4096; pixel limits are in megapixels (MP).',
+  数值超出允许范围: 'Value is outside the allowed range',
+  品牌名称不能为空: 'Brand name cannot be empty',
   默认值: 'Default',
   配置文件: 'Config file',
   '服务进程没有访问权限（文件系统权限不足）':

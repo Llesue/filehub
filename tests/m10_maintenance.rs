@@ -306,13 +306,23 @@ async fn switching_dir_size_mode_clears_cached_sizes() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        app.state
+    let mut cleared = false;
+    for _ in 0..100 {
+        if app
+            .state
             .db
             .directory_size_state("/tmp/filehub-size-fixture")
             .await
             .unwrap()
-            .is_none(),
+            .is_none()
+        {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        cleared,
         "cached directory sizes must be dropped when the mode changes"
     );
 }

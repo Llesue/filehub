@@ -116,6 +116,11 @@ pub async fn load_snapshot(
     {
         return Ok(snapshot);
     }
+    let _permit = state
+        .usage_semaphore
+        .acquire()
+        .await
+        .map_err(|_| AppError::internal(anyhow::anyhow!("usage worker closed")))?;
     let snapshot = compute_snapshot(state, user).await?;
     state.usage_cache.lock().insert(user.id, snapshot.clone());
     state.events.publish(
@@ -139,7 +144,7 @@ fn usage_lock(state: &Arc<AppState>, user_id: i64) -> Arc<tokio::sync::Mutex<()>
         .clone()
 }
 
-fn spawn_refresh(state: Arc<AppState>, user: User) {
+pub(crate) fn spawn_refresh(state: Arc<AppState>, user: User) {
     tokio::spawn(async move {
         let lock = usage_lock(&state, user.id);
         let guard = lock.lock().await;

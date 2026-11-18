@@ -772,6 +772,32 @@ paths:
       summary: 批量用户用量（缓存，未命中时后台统计）
       responses:
         '200': { description: OK }
+  /api/v1/admin/roots:
+    get:
+      tags: [admin]
+      summary: 所有用户的存储目录（一次加载，避免 N+1）
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roots:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id: { type: integer, format: int64 }
+                          alias: { type: string }
+                          real_path: { type: string }
+                          read_only: { type: boolean }
+                          sort_order: { type: integer }
+                          covered_by: { type: string, nullable: true }
+                          covered_by_id: { type: integer, format: int64, nullable: true }
   /api/v1/admin/status:
     get:
       tags: [admin]
@@ -953,6 +979,24 @@ paths:
                 value: {}
       responses:
         '200': { description: OK }
+    patch:
+      tags: [admin]
+      summary: 批量写入 DB 覆盖（一次构建并重载配置）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [values]
+              properties:
+                values:
+                  type: object
+                  additionalProperties: {}
+                  maxProperties: 32
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
   /api/v1/admin/settings/{key}:
     delete:
       tags: [admin]

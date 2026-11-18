@@ -763,6 +763,25 @@ impl Db {
         .await
     }
 
+    pub async fn upsert_settings_batch(&self, values: Vec<(String, String)>) -> anyhow::Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            for (key, value) in &values {
+                transaction.execute(
+                    "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                    params![key, value, unix_now()],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn delete_setting(&self, key: &str) -> anyhow::Result<bool> {
         let key = key.to_owned();
         self.call(move |connection| {
@@ -974,6 +993,27 @@ impl Db {
                  FROM user_roots WHERE user_id = ?1 ORDER BY sort_order, id",
             )?;
             let rows = statement.query_map(params![user_id], |row| {
+                Ok(Root {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    real_path: row.get(2)?,
+                    alias: row.get(3)?,
+                    read_only: row.get::<_, i64>(4)? != 0,
+                    sort_order: row.get(5)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn list_all_roots(&self) -> anyhow::Result<Vec<Root>> {
+        self.call(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, user_id, real_path, alias, read_only, sort_order \
+                 FROM user_roots ORDER BY user_id, sort_order, id",
+            )?;
+            let rows = statement.query_map([], |row| {
                 Ok(Root {
                     id: row.get(0)?,
                     user_id: row.get(1)?,
@@ -1479,14 +1519,20 @@ impl Db {
         // tens of thousands of entries keeps the SQLite writer lock for seconds
         // and makes deletes/uploads/listing wait behind it.
         const CHUNK: usize = 500;
-        self.call(move |connection| {
-            connection.execute(
-                "DELETE FROM index_entries WHERE dir_id = ?1",
-                params![dir_id],
-            )?;
-            Ok(())
-        })
-        .await?;
+        loop {
+            let removed = self
+                .call(move |connection| {
+                    connection.execute(
+                        "DELETE FROM index_entries WHERE rowid IN (\
+                           SELECT rowid FROM index_entries WHERE dir_id = ?1 LIMIT ?2)",
+                        params![dir_id, CHUNK as i64],
+                    )
+                })
+                .await?;
+            if removed == 0 {
+                break;
+            }
+        }
 
         let total = entries.len();
         for chunk in entries.chunks(CHUNK) {
@@ -1830,25 +1876,6 @@ impl Db {
         .await
     }
 
-    pub async fn invalidate_index_subtree(&self, prefix: &str) -> anyhow::Result<()> {
-        let prefix = prefix.to_owned();
-        self.call(move |connection| {
-            let escaped = prefix
-                .replace('!', "!!")
-                .replace('%', "!%")
-                .replace('_', "!_");
-            let unix_pattern = format!("{escaped}/%");
-            let windows_pattern = format!("{escaped}\\%");
-            connection.execute(
-                "DELETE FROM indexed_dirs WHERE real_path = ?1 \
-                 OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
-                params![prefix, unix_pattern, windows_pattern],
-            )?;
-            Ok(())
-        })
-        .await
-    }
-
     pub async fn mark_directory_size_stale(&self, real_path: &str) -> anyhow::Result<()> {
         let real_path = real_path.to_owned();
         self.call(move |connection| {
@@ -1862,86 +1889,133 @@ impl Db {
         .await
     }
 
-    pub async fn mark_directory_sizes_stale(&self, prefix: &str) -> anyhow::Result<()> {
-        let prefix = prefix.to_owned();
+    fn subtree_bounds(prefix: &str) -> Vec<(String, String)> {
+        let mut bounds = Vec::new();
+        for (separator, upper) in [("/", "0"), ("\\", "]")] {
+            let base = prefix.strip_suffix(separator).unwrap_or(prefix);
+            let start = format!("{base}{separator}");
+            let end = format!("{base}{upper}");
+            if start < end {
+                bounds.push((start, end));
+            }
+        }
+        bounds
+    }
+
+    pub async fn delete_cached_subtree_batch(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<usize> {
+        let bounds = Self::subtree_bounds(prefix);
+        if bounds.is_empty() {
+            return Ok(0);
+        }
+        let limit = limit.clamp(1, 5000) as i64;
         self.call(move |connection| {
-            let escaped = prefix
-                .replace('!', "!!")
-                .replace('%', "!%")
-                .replace('_', "!_");
-            let unix_pattern = format!("{escaped}/%");
-            let windows_pattern = format!("{escaped}\\%");
-            connection.execute(
-                "UPDATE directory_sizes SET status = 'stale' \
-                 WHERE (real_path = ?1 OR real_path LIKE ?2 ESCAPE '!' \
-                        OR real_path LIKE ?3 ESCAPE '!') \
-                 AND status IN ('ready', 'error')",
-                params![prefix, unix_pattern, windows_pattern],
-            )?;
-            Ok(())
+            let mut deleted = 0usize;
+            let transaction = connection.transaction()?;
+            for (start, end) in &bounds {
+                let remaining = limit - deleted as i64;
+                if remaining <= 0 {
+                    break;
+                }
+                deleted += transaction.execute(
+                    "DELETE FROM directory_sizes WHERE rowid IN (\
+                       SELECT rowid FROM directory_sizes \
+                       WHERE real_path >= ?1 AND real_path < ?2 LIMIT ?3)",
+                    params![start, end, remaining],
+                )?;
+            }
+            transaction.commit()?;
+
+            // Deleting indexed_dirs directly cascades through FTS triggers for
+            // every entry. Remove entries in small transactions first so the
+            // writer lock is released between chunks.
+            let mut dir_ids: Vec<i64> = Vec::new();
+            for (start, end) in &bounds {
+                let mut statement = connection.prepare(
+                    "SELECT id FROM indexed_dirs WHERE real_path >= ?1 AND real_path < ?2 \
+                     ORDER BY id LIMIT 5",
+                )?;
+                let rows = statement.query_map(params![start, end], |row| row.get(0))?;
+                for id in rows {
+                    dir_ids.push(id?);
+                }
+            }
+            for dir_id in dir_ids {
+                loop {
+                    let transaction = connection.transaction()?;
+                    let removed = transaction.execute(
+                        "DELETE FROM index_entries WHERE rowid IN (\
+                           SELECT rowid FROM index_entries WHERE dir_id = ?1 LIMIT 1000)",
+                        params![dir_id],
+                    )?;
+                    transaction.commit()?;
+                    if removed == 0 {
+                        break;
+                    }
+                }
+                let transaction = connection.transaction()?;
+                deleted += transaction
+                    .execute("DELETE FROM indexed_dirs WHERE id = ?1", params![dir_id])?;
+                transaction.commit()?;
+            }
+            Ok(deleted)
         })
         .await
     }
 
-    pub async fn invalidate_directory_sizes(&self, prefix: &str) -> anyhow::Result<()> {
-        let prefix = prefix.to_owned();
+    /// Updates a bounded batch of cached descendant sizes to `stale`.
+    pub async fn mark_cached_sizes_stale_batch(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<usize> {
+        let bounds = Self::subtree_bounds(prefix);
+        if bounds.is_empty() {
+            return Ok(0);
+        }
+        let limit = limit.clamp(1, 5000) as i64;
         self.call(move |connection| {
-            let escaped = prefix
-                .replace('!', "!!")
-                .replace('%', "!%")
-                .replace('_', "!_");
-            let unix_pattern = format!("{escaped}/%");
-            let windows_pattern = format!("{escaped}\\%");
-            connection.execute(
-                "DELETE FROM directory_sizes WHERE real_path = ?1 \
-                 OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
-                params![prefix, unix_pattern, windows_pattern],
-            )?;
-            Ok(())
+            let transaction = connection.transaction()?;
+            let mut updated = 0usize;
+            for (start, end) in &bounds {
+                let remaining = limit - updated as i64;
+                if remaining <= 0 {
+                    break;
+                }
+                updated += transaction.execute(
+                    "UPDATE directory_sizes SET status = 'stale' WHERE rowid IN (\
+                       SELECT rowid FROM directory_sizes \
+                       WHERE real_path >= ?1 AND real_path < ?2 \
+                         AND status IN ('ready', 'error') LIMIT ?3)",
+                    params![start, end, remaining],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(updated)
         })
         .await
     }
 
     /// Apply a target + ancestor cache invalidation chain in one transaction.
     /// This collapses many short write attempts into a single writer-lock wait.
-    pub async fn invalidate_path_chain(
-        &self,
-        paths: Vec<String>,
-        subtree: bool,
-    ) -> anyhow::Result<()> {
+    pub async fn invalidate_path_chain(&self, paths: Vec<String>) -> anyhow::Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
         self.call(move |connection| {
             let transaction = connection.transaction()?;
-            for (index, path) in paths.iter().enumerate() {
-                if index == 0 && subtree {
-                    let escaped = path
-                        .replace('!', "!!")
-                        .replace('%', "!%")
-                        .replace('_', "!_");
-                    let unix_pattern = format!("{escaped}/%");
-                    let windows_pattern = format!("{escaped}\\%");
-                    transaction.execute(
-                        "DELETE FROM directory_sizes WHERE real_path = ?1 \
-                         OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
-                        params![path, unix_pattern, windows_pattern],
-                    )?;
-                    transaction.execute(
-                        "DELETE FROM indexed_dirs WHERE real_path = ?1 \
-                         OR real_path LIKE ?2 ESCAPE '!' OR real_path LIKE ?3 ESCAPE '!'",
-                        params![path, unix_pattern, windows_pattern],
-                    )?;
-                } else {
-                    transaction.execute(
-                        "DELETE FROM directory_sizes WHERE real_path = ?1",
-                        params![path],
-                    )?;
-                    transaction.execute(
-                        "UPDATE indexed_dirs SET status = 'stale' WHERE real_path = ?1",
-                        params![path],
-                    )?;
-                }
+            for path in &paths {
+                transaction.execute(
+                    "DELETE FROM directory_sizes WHERE real_path = ?1",
+                    params![path],
+                )?;
+                transaction.execute(
+                    "UPDATE indexed_dirs SET status = 'stale' WHERE real_path = ?1",
+                    params![path],
+                )?;
             }
             transaction.commit()?;
             Ok(())
@@ -2084,15 +2158,17 @@ impl Db {
     pub async fn append_pending_index_dirs(&self, paths: &[String]) -> anyhow::Result<usize> {
         let paths = paths.to_vec();
         self.call(move |connection| {
+            let transaction = connection.transaction()?;
             let now = unix_now();
             let mut inserted = 0_usize;
             for path in paths {
-                inserted += connection.execute(
+                inserted += transaction.execute(
                     "INSERT OR IGNORE INTO pending_index_dirs (real_path, created_at) \
                      VALUES (?1, ?2)",
                     params![path, now],
                 )?;
             }
+            transaction.commit()?;
             Ok(inserted)
         })
         .await
@@ -2335,6 +2411,18 @@ impl Db {
         self.call(|connection| {
             let removed = connection.execute("DELETE FROM directory_sizes", [])?;
             Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn clear_directory_sizes_batch(&self, limit: usize) -> anyhow::Result<usize> {
+        let limit = limit.clamp(1, 5000) as i64;
+        self.call(move |connection| {
+            connection.execute(
+                "DELETE FROM directory_sizes WHERE rowid IN (\
+                   SELECT rowid FROM directory_sizes LIMIT ?1)",
+                params![limit],
+            )
         })
         .await
     }
@@ -3091,4 +3179,77 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Db;
+
+    #[test]
+    fn subtree_bounds_handle_both_separators() {
+        let bounds = Db::subtree_bounds("/mnt/media");
+        assert!(bounds.contains(&("/mnt/media/".to_owned(), "/mnt/media0".to_owned())));
+        assert!(bounds.contains(&("/mnt/media\\".to_owned(), "/mnt/media]".to_owned())));
+        let windows = Db::subtree_bounds("C:\\Music");
+        assert!(windows.contains(&("C:\\Music\\".to_owned(), "C:\\Music]".to_owned())));
+        assert!(windows.contains(&("C:\\Music/".to_owned(), "C:\\Music0".to_owned())));
+        assert!(
+            Db::subtree_bounds("/mnt/media/")
+                .contains(&("/mnt/media/".to_owned(), "/mnt/media0".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_subtree_cleanup_is_batched_and_precise() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db"), 1).unwrap();
+        for path in [
+            "/data/keep",
+            "/data/del",
+            "/data/del/a",
+            "/data/del/b",
+            "/data/del/deep/c",
+            "/data/del2/x",
+            "/data/delx",
+        ] {
+            db.set_directory_size(path, "ready", 1, 0, None)
+                .await
+                .unwrap();
+        }
+        for path in ["/data/del", "/data/del/a", "/data/del2/x"] {
+            db.upsert_index_dir(path, 0).await.unwrap();
+        }
+
+        let mut removed = 0;
+        loop {
+            let count = db
+                .delete_cached_subtree_batch("/data/del", 2)
+                .await
+                .unwrap();
+            if count == 0 {
+                break;
+            }
+            removed += count;
+        }
+        assert!(removed >= 2);
+
+        let sizes = db
+            .directory_size_values(vec![
+                "/data/keep".to_owned(),
+                "/data/del".to_owned(),
+                "/data/del/a".to_owned(),
+                "/data/del/deep/c".to_owned(),
+                "/data/del2/x".to_owned(),
+                "/data/delx".to_owned(),
+            ])
+            .await
+            .unwrap();
+        assert!(sizes.contains_key("/data/keep"));
+        assert!(sizes.contains_key("/data/del"));
+        assert!(!sizes.contains_key("/data/del/a"));
+        assert!(!sizes.contains_key("/data/del/deep/c"));
+        assert!(sizes.contains_key("/data/del2/x"));
+        assert!(sizes.contains_key("/data/delx"));
+        assert_eq!(db.count_indexed_dirs().await.unwrap(), 2);
+    }
 }

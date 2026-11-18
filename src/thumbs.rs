@@ -2,6 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -244,7 +245,7 @@ pub(crate) async fn thumbnail_response(
                     match result {
                         Ok(bytes) => {
                             let _ = std::fs::remove_file(&job_failure_path);
-                            let _ = prune_cache(&job_prune_dir, job_cache_max_bytes);
+                            maybe_prune_cache(&job_prune_dir, job_cache_max_bytes);
                             tracing::debug!(
                                 path = %job_log_source.display(),
                                 width,
@@ -326,7 +327,7 @@ pub(crate) async fn thumbnail_response(
             let bytes = tokio::fs::read(&cache_path)
                 .await
                 .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
-            let _ = prune_cache(&cache_dir, settings.settings.thumbnails.cache_max_bytes);
+            maybe_prune_cache(&cache_dir, settings.settings.thumbnails.cache_max_bytes);
             image_response(bytes, &cache_key)
         }
         "cancelled" => Err(AppError::NotFound),
@@ -1265,6 +1266,28 @@ fn image_response(bytes: Vec<u8>, key: &str) -> Result<Response, AppError> {
             .map_err(|err| AppError::internal(anyhow::anyhow!(err)))?,
     );
     Ok(response)
+}
+
+static LAST_CACHE_PRUNE: AtomicU64 = AtomicU64::new(0);
+
+/// `prune_cache` stats every cached thumbnail. Running it after every
+/// generated image turns thumbnail generation quadratic on large caches.
+fn maybe_prune_cache(directory: &Path, max_bytes: u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let last = LAST_CACHE_PRUNE.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 60 {
+        return;
+    }
+    if LAST_CACHE_PRUNE
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let _ = prune_cache(directory, max_bytes);
 }
 
 fn prune_cache(directory: &Path, max_bytes: u64) -> anyhow::Result<()> {

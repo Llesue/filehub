@@ -252,7 +252,20 @@ impl JobManager {
                 .filter(|job| matches!(job.status.as_str(), "queued" | "running"))
                 .count();
             if active >= self.queue_limit {
-                return Err(AppError::QueueFull);
+                // Keep a small reserved allowance for interactive transfers so
+                // a full index/thumbnail queue cannot make copy/move return 503.
+                let transfers = inner
+                    .jobs
+                    .values()
+                    .filter(|job| {
+                        matches!(job.kind.as_str(), "copy" | "move")
+                            && matches!(job.status.as_str(), "queued" | "running")
+                    })
+                    .count();
+                let reserve = (self.queue_limit / 8).max(4);
+                if !(kind.is_transfer() && transfers < reserve) {
+                    return Err(AppError::QueueFull);
+                }
             }
             if kind == JobKind::Thumbnail {
                 let queued_thumbnails = inner
