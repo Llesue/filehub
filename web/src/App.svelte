@@ -997,13 +997,45 @@
   const dirSizeTimers = new SvelteMap<string, ReturnType<typeof setTimeout>>();
   const dirSizeAttempts = new SvelteMap<string, number>();
   const dirSizeControllers = new SvelteSet<AbortController>();
+  const dirSizeQueue: Array<() => void> = [];
+  const DIR_SIZE_CONCURRENCY = 6;
+  let dirSizeActive = 0;
 
   function abortDirSizeRequests(): void {
     for (const controller of dirSizeControllers) controller.abort();
     dirSizeControllers.clear();
+    dirSizeQueue.length = 0;
     for (const timer of dirSizeTimers.values()) clearTimeout(timer);
     dirSizeTimers.clear();
     dirSizeAttempts.clear();
+  }
+
+  function pumpDirSizeQueue(): void {
+    while (dirSizeActive < DIR_SIZE_CONCURRENCY && dirSizeQueue.length > 0) {
+      const run = dirSizeQueue.shift();
+      run?.();
+    }
+  }
+
+  function enqueueDirectorySize(
+    key: string,
+    rootId: number,
+    path: string,
+    generation: number,
+  ): void {
+    const run = (): void => {
+      if (generation !== dirSizeGeneration) {
+        pumpDirSizeQueue();
+        return;
+      }
+      dirSizeActive += 1;
+      void requestDirectorySize(key, rootId, path, generation).finally(() => {
+        dirSizeActive = Math.max(0, dirSizeActive - 1);
+        pumpDirSizeQueue();
+      });
+    };
+    if (dirSizeActive < DIR_SIZE_CONCURRENCY) run();
+    else dirSizeQueue.push(run);
   }
 
   function loadDirectorySizes(
@@ -1018,7 +1050,7 @@
       const key = `${rootId}:${joinPath(path, entry.name)}`;
       if (dirSizeTimers.has(key)) continue;
       if (!revalidate && dirSizes[key] !== undefined) continue;
-      void requestDirectorySize(key, rootId, joinPath(path, entry.name), generation);
+      enqueueDirectorySize(key, rootId, joinPath(path, entry.name), generation);
     }
   }
 

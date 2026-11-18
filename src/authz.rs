@@ -31,9 +31,41 @@ pub async fn resolve(
         .map_err(AppError::internal)?;
     let path = path.to_owned();
 
-    tokio::task::spawn_blocking(move || resolve_sync(root, roots, path, require_write, links))
+    tokio::task::spawn_blocking(move || resolve_sync(root, roots, path, require_write, &links))
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("authorization task failed: {err}")))?
+}
+
+pub async fn resolve_many(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root_id: i64,
+    paths: Vec<String>,
+    require_write: bool,
+) -> Result<Vec<ResolvedPath>, AppError> {
+    let roots = state
+        .db
+        .list_roots(user_id)
+        .await
+        .map_err(AppError::internal)?;
+    let root = roots
+        .iter()
+        .find(|root| root.id == root_id)
+        .cloned()
+        .ok_or(AppError::NotFound)?;
+    let links = state
+        .db
+        .list_trusted_links()
+        .await
+        .map_err(AppError::internal)?;
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|path| resolve_sync(root.clone(), roots.clone(), path, require_write, &links))
+            .collect()
+    })
+    .await
+    .map_err(|err| AppError::internal(anyhow::anyhow!("authorization task failed: {err}")))?
 }
 
 fn resolve_sync(
@@ -41,7 +73,7 @@ fn resolve_sync(
     roots: Vec<Root>,
     path: String,
     require_write: bool,
-    links: Vec<TrustedLink>,
+    links: &[TrustedLink],
 ) -> Result<ResolvedPath, AppError> {
     if path.len() > 4096 || path.contains('\0') || path.contains('\\') || path.starts_with('/') {
         return Err(AppError::invalid_path("invalid path"));

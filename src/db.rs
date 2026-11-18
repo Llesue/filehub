@@ -50,6 +50,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (22, include_str!("../migrations/0022_user_soft_delete.sql")),
     (23, include_str!("../migrations/0023_global_custom_css.sql")),
+    (
+        24,
+        include_str!("../migrations/0024_search_and_cache_indexes.sql"),
+    ),
 ];
 
 pub fn unix_now() -> i64 {
@@ -103,6 +107,7 @@ pub struct TokenUser {
     pub user: User,
     pub scope: String,
     pub expires_at: Option<i64>,
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -699,7 +704,8 @@ impl Db {
         self.call(move |connection| {
             connection
                 .query_row(
-                    "SELECT t.id AS token_id, t.scope AS token_scope, t.expires_at AS token_expires, u.* \
+                    "SELECT t.id AS token_id, t.scope AS token_scope, \
+                            t.expires_at AS token_expires, t.last_used_at AS token_last_used, u.* \
                      FROM api_tokens t JOIN users u ON u.id = t.user_id \
                      WHERE t.token_hash = ?1 AND u.deleted_at IS NULL",
                     params![token_hash],
@@ -709,6 +715,7 @@ impl Db {
                             user: User::from_row(row)?,
                             scope: row.get("token_scope")?,
                             expires_at: row.get("token_expires")?,
+                            last_used_at: row.get("token_last_used")?,
                         })
                     },
                 )
@@ -2710,7 +2717,16 @@ impl Db {
                     entries.push(entry?);
                 }
             } else {
-                let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+                // FTS trigram needs at least three characters. For shorter
+                // queries use a case-insensitive prefix so the dedicated name
+                // index can serve the request instead of scanning every row.
+                let pattern = format!(
+                    "{}%",
+                    query
+                        .replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_")
+                );
                 let mut statement = connection.prepare(
                     "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, \
                             e.mime_type, e.has_preview, e.is_hidden \

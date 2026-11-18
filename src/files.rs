@@ -528,10 +528,8 @@ pub async fn zip(
         return Err(AppError::bad_request("select between 1 and 1000 paths"));
     }
 
-    let mut selected = Vec::with_capacity(request.paths.len());
-    for path in request.paths {
-        selected.push(authz::resolve(&state, current.user.id, root.id, &path, false).await?);
-    }
+    let selected =
+        authz::resolve_many(&state, current.user.id, root.id, request.paths, false).await?;
 
     let settings = state.settings();
     let max_bytes = settings.settings.downloads.zip_max_bytes;
@@ -1002,10 +1000,18 @@ pub async fn delete_preview(
     }
 
     let root = load_root(&state, current.user.id, request.root).await?;
-    let mut items = Vec::with_capacity(request.paths.len());
+    let requested_paths = request.paths;
+    let resolved_paths = authz::resolve_many(
+        &state,
+        current.user.id,
+        root.id,
+        requested_paths.clone(),
+        true,
+    )
+    .await?;
+    let mut items = Vec::with_capacity(requested_paths.len());
 
-    for path in request.paths {
-        let resolved = authz::resolve(&state, current.user.id, root.id, &path, true).await?;
+    for resolved in resolved_paths {
         if resolved.relative.is_empty() {
             return Err(AppError::invalid_path(
                 "the root directory cannot be deleted",
@@ -1097,11 +1103,15 @@ pub async fn delete_confirm(
     let mut cache_ns = 0_u128;
     let root = load_root(&state, current.user.id, preview.root_id).await?;
     let mut cache_targets = Vec::with_capacity(preview.items.len());
-    for item in &preview.items {
-        let phase = Instant::now();
-        let resolved =
-            authz::resolve(&state, current.user.id, root.id, &item.relative, true).await?;
-        resolve_ns += phase.elapsed().as_nanos();
+    let paths: Vec<String> = preview
+        .items
+        .iter()
+        .map(|item| item.relative.clone())
+        .collect();
+    let phase = Instant::now();
+    let resolved_paths = authz::resolve_many(&state, current.user.id, root.id, paths, true).await?;
+    resolve_ns += phase.elapsed().as_nanos();
+    for resolved in resolved_paths {
         let relative = resolved.relative.clone();
         let path = resolved.absolute.clone();
         let phase = Instant::now();

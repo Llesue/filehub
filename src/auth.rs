@@ -119,11 +119,18 @@ pub async fn current_user(
             .ok_or(AppError::Unauthorized)?;
 
         validate_token(&token_user)?;
-        state
-            .db
-            .touch_token(token_user.token_id)
-            .await
-            .map_err(AppError::internal)?;
+        // API clients often poll; a write per request turns into a global
+        // SQLite writer bottleneck. Record usage at most once every 5 minutes.
+        if token_user
+            .last_used_at
+            .is_none_or(|at| crate::db::unix_now().saturating_sub(at) >= 300)
+        {
+            state
+                .db
+                .touch_token(token_user.token_id)
+                .await
+                .map_err(AppError::internal)?;
+        }
 
         return Ok(CurrentUser {
             user: token_user.user,
