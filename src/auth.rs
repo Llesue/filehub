@@ -125,11 +125,13 @@ pub async fn current_user(
             .last_used_at
             .is_none_or(|at| crate::db::unix_now().saturating_sub(at) >= 300)
         {
-            state
-                .db
-                .touch_token(token_user.token_id)
-                .await
-                .map_err(AppError::internal)?;
+            let db = state.db.clone();
+            let token_id = token_user.token_id;
+            tokio::spawn(async move {
+                if let Err(error) = db.touch_token(token_id).await {
+                    tracing::warn!(%error, "failed to update token last_used_at");
+                }
+            });
         }
 
         return Ok(CurrentUser {

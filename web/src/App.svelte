@@ -1384,8 +1384,7 @@
       return;
     }
     const length = Array.from(query).length;
-    const asciiOnly = Array.from(query).every((character) => (character.codePointAt(0) ?? 0) < 128);
-    if (length < 2 || (asciiOnly && length < 3)) {
+    if (length < 3) {
       searchAbort?.abort();
       searchActive = true;
       searchLoading = false;
@@ -3447,7 +3446,7 @@
                     {searchLoading
                       ? t($language, '搜索中…')
                       : searchTooShort
-                        ? t($language, '请输入至少 2 个字符（纯英文至少 3 个）')
+                        ? t($language, '请输入至少 3 个字符')
                         : t($language, '没有找到匹配的文件')}
                   </div>
                 {:else}
