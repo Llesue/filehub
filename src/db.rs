@@ -2746,8 +2746,8 @@ impl Db {
                  AND (?{mtime_before} IS NULL OR e.mtime <= ?{mtime_before}) \
                  AND (?{is_dir} IS NULL OR e.is_dir = ?{is_dir}) \
                  AND (?{mime} IS NULL OR e.mime_type LIKE ?{mime}) \
-                 AND (?{cursor} IS NULL OR e.id > ?{cursor}) \
-                 ORDER BY e.id ASC LIMIT ?{limit_param}",
+                 AND index_fts.rowid > ?{cursor} \
+                 LIMIT ?{limit_param}",
                 next = index + 1,
                 after = index + 2,
                 mtime_after = index + 3,
@@ -2797,11 +2797,7 @@ impl Db {
                     .map(rusqlite::types::Value::Text)
                     .unwrap_or(rusqlite::types::Value::Null),
             );
-            params.push(
-                cursor
-                    .map(rusqlite::types::Value::Integer)
-                    .unwrap_or(rusqlite::types::Value::Null),
-            );
+            params.push(rusqlite::types::Value::Integer(cursor.unwrap_or(0)));
             params.push(rusqlite::types::Value::Integer(limit + 1));
 
             let mut statement = connection.prepare(&sql)?;
