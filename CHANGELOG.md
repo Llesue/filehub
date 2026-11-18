@@ -53,6 +53,8 @@
 - `dir_size_use_logical` cache clearing and thumbnail failure-record cleanup run in background batches.
 - Thumbnail cache pruning is rate-limited to once per minute instead of walking the whole cache after every generated image.
 - Interactive copy/move jobs keep a reserved share of the job queue, and audit enqueueing is best-effort instead of blocking request handlers.
+- Short search queries (<3 characters) use an indexed case-insensitive prefix instead of a full `%LIKE%` scan; ZIP and bulk delete resolve all paths against one cached roots/links snapshot.
+- API token `last_used_at` writes are throttled to once every five minutes, and directory-size requests in the file browser are limited to six concurrent probes.
 
 ### Verification
 
