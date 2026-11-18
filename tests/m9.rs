@@ -985,3 +985,37 @@ async fn unified_search_unions_roots_without_duplicates() {
     names.dedup();
     assert_eq!(names, vec!["alpha-note.txt", "beta-note.txt"]);
 }
+
+#[tokio::test]
+async fn two_character_chinese_search_uses_bigrams() {
+    let app = setup_app().await;
+    std::fs::write(app.home.join("山西旅游-测试.txt"), b"x").unwrap();
+    std::fs::write(app.home.join("手机照片-测试.txt"), b"x").unwrap();
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    let root = app
+        .state
+        .db
+        .list_roots(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let base = root.real_path.trim_end_matches(['/', '\\']);
+    let ranges = vec![(format!("{base}/"), format!("{base}0"))];
+    let (entries, _) = app
+        .state
+        .db
+        .search_entries_bigram("山西", ranges.clone(), true, 10, None, Default::default())
+        .await
+        .unwrap();
+    assert!(entries.iter().any(|entry| entry.name.contains("山西旅游")));
+    let (entries, _) = app
+        .state
+        .db
+        .search_entries_bigram("手机", ranges, true, 10, None, Default::default())
+        .await
+        .unwrap();
+    assert!(entries.iter().any(|entry| entry.name.contains("手机照片")));
+}
