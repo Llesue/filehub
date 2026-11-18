@@ -138,8 +138,6 @@
   let searchLoadingMore = $state(false);
   let searchNextCursor = $state<string | null>(null);
   let searchTooShort = $state(false);
-  let searchRunning = false;
-  let pendingSearch: string | null = null;
   let searchMoreAbort: AbortController | null = null;
   let searchInput = $state<HTMLInputElement | null>(null);
   let searchFiltersOpen = $state(false);
@@ -1386,7 +1384,6 @@
     const length = Array.from(query).length;
     if (length < 3) {
       searchAbort?.abort();
-      pendingSearch = null;
       searchActive = true;
       searchLoading = false;
       searchLoadingMore = false;
@@ -1401,11 +1398,6 @@
     searchLoadingMore = false;
     searchNextCursor = null;
     searchResults = [];
-    if (searchRunning) {
-      pendingSearch = query;
-      return;
-    }
-    pendingSearch = null;
     void runSearch(query);
   }
 
@@ -1463,7 +1455,6 @@
 
   async function runSearch(query: string): Promise<void> {
     if (roots.length === 0) return;
-    searchRunning = true;
     const token = ++searchToken;
     searchAbort?.abort();
     searchMoreAbort?.abort();
@@ -1495,20 +1486,12 @@
     } catch (error) {
       if (token === searchToken && !isAbortError(error)) handleFilesError(error);
     } finally {
-      if (token === searchToken) {
-        searchRunning = false;
-        const next = pendingSearch;
-        pendingSearch = null;
-        searchLoading = false;
-        if (next && searchQuery.trim() === next) {
-          void runSearch(next);
-        }
-      }
+      if (token === searchToken) searchLoading = false;
     }
   }
 
   async function loadMoreSearch(): Promise<void> {
-    if (!searchActive || !searchNextCursor || searchLoadingMore || searchRunning) return;
+    if (!searchActive || !searchNextCursor || searchLoadingMore || searchLoading) return;
     const query = searchQuery.trim();
     const cursor = searchNextCursor;
     const token = searchToken;
@@ -1600,8 +1583,6 @@
     searchAbort?.abort();
     searchMoreAbort?.abort();
     searchMoreAbort = null;
-    pendingSearch = null;
-    searchRunning = false;
     searchActive = false;
     searchLoading = false;
     searchLoadingMore = false;
