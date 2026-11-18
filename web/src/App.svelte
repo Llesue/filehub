@@ -182,6 +182,7 @@
   let appView = $state<'files' | 'settings' | 'admin' | 'audit' | 'shares'>('files');
   let settingsMounted = $state(false);
   let sharesMounted = $state(false);
+  let adminMounted = $state(false);
   let contextMenu = $state<{ x: number; y: number; entry: Entry } | null>(null);
   let contextMenuElement = $state<HTMLElement | null>(null);
   let contextMenuLeft = $state(false);
@@ -301,6 +302,7 @@
   $effect(() => {
     if (appView === 'settings') settingsMounted = true;
     if (appView === 'shares') sharesMounted = true;
+    if (appView === 'admin') adminMounted = true;
   });
 
   onMount(() => {
@@ -3305,19 +3307,21 @@
                 <SharesPage {csrf} />
               </div>
             {/if}
-            {#if appView === 'settings'}
-              <!-- kept mounted above so returning to settings does not reload -->
-            {:else if appView === 'admin' || appView === 'audit'}
-              <div class:view-hidden={appView === 'audit'}>
+            {#if adminMounted}
+              <div class:view-hidden={appView !== 'admin' && appView !== 'audit'}>
                 <AdminPage
                   {csrf}
                   onAudit={() => (appView = 'audit')}
                   onRootsChanged={() => void refreshRoots()}
                 />
               </div>
-              {#if appView === 'audit'}
-                <AuditPage onBack={() => (appView = 'admin')} />
-              {/if}
+            {/if}
+            {#if appView === 'settings'}
+              <!-- kept mounted above so returning to settings does not reload -->
+            {:else if appView === 'admin'}
+              <!-- kept mounted above so returning to admin does not reload -->
+            {:else if appView === 'audit'}
+              <AuditPage onBack={() => (appView = 'admin')} />
             {:else if appView === 'shares'}
               <!-- kept mounted above so returning to shares does not reload -->
             {:else}

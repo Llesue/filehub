@@ -154,13 +154,20 @@ pub async fn status(
     let current = auth::current_user(&state, &headers).await?;
     auth::require_admin(&current)?;
     let jobs = state.jobs.summary();
+    let status_started = std::time::Instant::now();
+    let started = std::time::Instant::now();
     let job_counts = state.db.job_counts().await.map_err(AppError::internal)?;
+    let jobs_ms = started.elapsed().as_millis();
+    let started = std::time::Instant::now();
     let directory_sizes = state
         .db
         .directory_size_counts()
         .await
         .map_err(AppError::internal)?;
+    let sizes_ms = started.elapsed().as_millis();
+    let started = std::time::Instant::now();
     let stats = state.db.stats().await.map_err(AppError::internal)?;
+    let stats_ms = started.elapsed().as_millis();
     let slow_requests = state.recent_slow_requests();
     let settings = state.settings();
     let last_quick_scan = state
@@ -175,6 +182,10 @@ pub async fn status(
         .await
         .ok()
         .flatten();
+    let total_ms = status_started.elapsed().as_millis();
+    if total_ms >= 500 {
+        tracing::warn!(jobs_ms, sizes_ms, stats_ms, "slow admin status queries");
+    }
     Ok(Json(json!({
         "jobs": jobs,
         "job_counts": job_counts.iter().map(|(kind, status, count)| json!({

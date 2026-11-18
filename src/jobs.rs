@@ -307,11 +307,17 @@ impl JobManager {
             started_at: None,
             finished_at: None,
         };
-        let (record, created) = self
-            .db
-            .create_job(record)
-            .await
-            .map_err(AppError::internal)?;
+        // Thumbnail jobs are short-lived and extremely numerous. Persisting
+        // every create/start/finish row turns a photo grid into a stream of
+        // SQLite writes that blocks settings and metadata requests.
+        let (record, created) = if kind == JobKind::Thumbnail {
+            (record, true)
+        } else {
+            self.db
+                .create_job(record)
+                .await
+                .map_err(AppError::internal)?
+        };
         let job = Job::from_record(record);
         if !created {
             tracing::info!(
@@ -378,8 +384,10 @@ impl JobManager {
             match semaphore.acquire_owned().await {
                 Ok(permit) => Some(permit),
                 Err(_) => {
-                    self.finish_row(&id, "failed", None, Some("job worker closed"))
-                        .await;
+                    if kind != JobKind::Thumbnail {
+                        self.finish_row(&id, "failed", None, Some("job worker closed"))
+                            .await;
+                    }
                     self.remove_active(&id, kind, &key);
                     return;
                 }
@@ -389,13 +397,17 @@ impl JobManager {
         };
         if token.is_cancelled() {
             drop(permit);
-            self.finish_row(&id, "cancelled", None, Some("cancelled"))
-                .await;
+            if kind != JobKind::Thumbnail {
+                self.finish_row(&id, "cancelled", None, Some("cancelled"))
+                    .await;
+            }
             self.remove_active(&id, kind, &key);
             return;
         }
 
-        if let Err(error) = self.db.mark_job_running(&id).await {
+        if kind != JobKind::Thumbnail
+            && let Err(error) = self.db.mark_job_running(&id).await
+        {
             tracing::warn!(job_id = %id, error = %error, "failed to mark job running");
         }
         {
@@ -506,10 +518,11 @@ impl JobManager {
             );
             return;
         }
-        if let Err(write_error) = self
-            .db
-            .finish_job(&id, status, result.as_deref(), error.as_deref())
-            .await
+        if kind != JobKind::Thumbnail
+            && let Err(write_error) = self
+                .db
+                .finish_job(&id, status, result.as_deref(), error.as_deref())
+                .await
         {
             tracing::warn!(job_id = %id, error = %write_error, "failed to persist job result");
         }
@@ -567,6 +580,21 @@ impl JobManager {
         };
         if let Some(job) = final_job {
             self.notify_waiters(&id, &job);
+            // Thumbnail notifiers often attach after a fast job has already
+            // finished. Keep the result briefly so wait_for can still see it;
+            // these jobs are in-memory only and are evicted shortly after.
+            if kind == JobKind::Thumbnail {
+                let manager = Arc::clone(&self);
+                let keep_id = id.clone();
+                {
+                    let mut inner = self.inner.lock();
+                    inner.jobs.insert(keep_id.clone(), job);
+                }
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    manager.inner.lock().jobs.remove(&keep_id);
+                });
+            }
         }
     }
 
