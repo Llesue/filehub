@@ -53,7 +53,7 @@
 - `dir_size_use_logical` cache clearing and thumbnail failure-record cleanup run in background batches.
 - Thumbnail cache pruning is rate-limited to once per minute instead of walking the whole cache after every generated image.
 - Interactive copy/move jobs keep a reserved share of the job queue, and audit enqueueing is best-effort instead of blocking request handlers.
-- Short queries keep substring semantics; the UI asks for at least 2 characters (3 for ASCII-only) and slow searches are logged. ZIP and bulk delete resolve all paths against one cached roots/links snapshot.
+- The UI requires at least 3 characters before searching, avoiding multi-second substring scans; slow searches are logged. ZIP and bulk delete resolve all paths against one cached roots/links snapshot. API-token last-used updates are asynchronous and throttled.
 - Admin status caches directory-size counts and bounds informational DB queries, so entering system settings no longer waits for a multi-second scan. Thumbnail jobs stay in memory instead of writing three SQLite rows each, and maintenance pruning is batched.
 - Leaving a directory cancels queued list-thumbnail jobs for the old view; closing the lightbox cancels its preview job. Running short list thumbnails are allowed to finish, while long copy/move/delete/upload/index jobs are never cancelled by navigation.
 - Settings focus/blur without a value change no longer writes to the database; grouped numeric fields only submit changed keys.
