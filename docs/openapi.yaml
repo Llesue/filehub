@@ -659,9 +659,9 @@ paths:
     get:
       tags: [index]
       summary: 跨所有最外层 root 的统一文件名搜索（游标分页）
-      description: 跳过被父 root 覆盖的子 root，单次 FTS 查询；按 index_entries.id 游标分页。少于 3 个字符返回 400。
+      description: 跳过被父 root 覆盖的子 root，单次 FTS 查询；按 index_entries.id 游标分页。少于 3 个字符返回 400；2 个中文字符走 bigram 索引。
       parameters:
-        - { name: q, in: query, required: true, schema: { type: string, minLength: 3 } }
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 2 }, description: 至少 3 字符；2 个中文字符允许 }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 100 } }
         - { name: cursor, in: query, schema: { type: string }, description: 上一页返回的 next_cursor }
         - { name: min_size, in: query, schema: { type: integer, format: int64, minimum: 0 } }

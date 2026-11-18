@@ -58,6 +58,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         25,
         include_str!("../migrations/0025_drop_short_search_index.sql"),
     ),
+    (26, include_str!("../migrations/0026_name_bigrams.sql")),
 ];
 
 pub fn unix_now() -> i64 {
@@ -319,6 +320,31 @@ pub struct JobRecord {
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+}
+
+fn is_cjk(character: char) -> bool {
+    let code = character as u32;
+    (0x3400..=0x4DBF).contains(&code)
+        || (0x4E00..=0x9FFF).contains(&code)
+        || (0xF900..=0xFAFF).contains(&code)
+}
+
+fn name_bigrams(name: &str) -> Vec<String> {
+    let mut grams = Vec::new();
+    let mut seen = HashSet::new();
+    let mut previous: Option<char> = None;
+    for character in name.chars() {
+        if let Some(prev) = previous
+            && (is_cjk(prev) || is_cjk(character))
+        {
+            let gram = format!("{prev}{character}");
+            if seen.insert(gram.clone()) {
+                grams.push(gram);
+            }
+        }
+        previous = Some(character);
+    }
+    grams
 }
 
 #[derive(Debug, Clone)]
@@ -1605,21 +1631,30 @@ impl Db {
                         "INSERT INTO index_entries \
                          (dir_id, name, real_path, is_dir, size, mtime, created_at, mime_type, \
                           has_preview, is_hidden) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) RETURNING id",
+                    )?;
+                    let mut gram_statement = transaction.prepare(
+                        "INSERT OR IGNORE INTO index_name_bigrams (entry_id, gram) VALUES (?1, ?2)",
                     )?;
                     for entry in &rows {
-                        statement.execute(params![
-                            dir_id,
-                            entry.name,
-                            entry.real_path,
-                            entry.is_dir as i64,
-                            entry.size,
-                            entry.mtime,
-                            entry.created_at,
-                            entry.mime_type,
-                            entry.has_preview as i64,
-                            entry.is_hidden as i64
-                        ])?;
+                        let entry_id: i64 = statement.query_row(
+                            params![
+                                dir_id,
+                                entry.name,
+                                entry.real_path,
+                                entry.is_dir as i64,
+                                entry.size,
+                                entry.mtime,
+                                entry.created_at,
+                                entry.mime_type,
+                                entry.has_preview as i64,
+                                entry.is_hidden as i64
+                            ],
+                            |row| row.get(0),
+                        )?;
+                        for gram in name_bigrams(&entry.name) {
+                            gram_statement.execute(params![entry_id, gram])?;
+                        }
                     }
                 }
                 transaction.commit()?;
@@ -2827,6 +2862,173 @@ impl Db {
                 rows.into_iter().map(|(_, entry)| entry).collect(),
                 next_cursor,
             ))
+        })
+        .await
+    }
+
+    /// Short CJK query path: exact bigram lookup, ordered by entry id so the
+    /// same cursor pagination as the trigram path can be reused.
+    pub async fn search_entries_bigram(
+        &self,
+        gram: &str,
+        root_ranges: Vec<(String, String)>,
+        show_hidden: bool,
+        limit: i64,
+        cursor: Option<i64>,
+        filters: IndexSearchFilters,
+    ) -> anyhow::Result<(Vec<IndexEntry>, Option<i64>)> {
+        if root_ranges.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let gram = gram.to_owned();
+        self.call(move |connection| {
+            let limit = limit.clamp(1, 200);
+            let mut sql = String::from(
+                "SELECT e.id, e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, \
+                        e.mime_type, e.has_preview, e.is_hidden \
+                 FROM index_name_bigrams b JOIN index_entries e ON e.id = b.entry_id \
+                 JOIN indexed_dirs d ON d.id = e.dir_id \
+                 WHERE b.gram = ?1 AND (",
+            );
+            let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(gram)];
+            let mut index = 2;
+            for (position, (start, end)) in root_ranges.iter().enumerate() {
+                if position > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str(&format!(
+                    "(e.real_path >= ?{index} AND e.real_path < ?{})",
+                    index + 1
+                ));
+                params.push(rusqlite::types::Value::Text(start.clone()));
+                params.push(rusqlite::types::Value::Text(end.clone()));
+                index += 2;
+            }
+            sql.push_str(&format!(
+                ") AND (?{index} = 1 OR e.name NOT LIKE '.%') \
+                 AND (?{next} IS NULL OR e.size >= ?{next}) \
+                 AND (?{after} IS NULL OR e.size <= ?{after}) \
+                 AND (?{mtime_after} IS NULL OR e.mtime >= ?{mtime_after}) \
+                 AND (?{mtime_before} IS NULL OR e.mtime <= ?{mtime_before}) \
+                 AND (?{is_dir} IS NULL OR e.is_dir = ?{is_dir}) \
+                 AND (?{mime} IS NULL OR e.mime_type LIKE ?{mime}) \
+                 AND b.entry_id > ?{cursor} \
+                 ORDER BY b.entry_id ASC LIMIT ?{limit_param}",
+                next = index + 1,
+                after = index + 2,
+                mtime_after = index + 3,
+                mtime_before = index + 4,
+                is_dir = index + 5,
+                mime = index + 6,
+                cursor = index + 7,
+                limit_param = index + 8,
+            ));
+            params.push(rusqlite::types::Value::Integer(show_hidden as i64));
+            params.push(
+                filters
+                    .min_size
+                    .map(|value| rusqlite::types::Value::Integer(value.min(i64::MAX as u64) as i64))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .max_size
+                    .map(|value| rusqlite::types::Value::Integer(value.min(i64::MAX as u64) as i64))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .modified_after
+                    .map(rusqlite::types::Value::Integer)
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .modified_before
+                    .map(rusqlite::types::Value::Integer)
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .is_dir
+                    .map(|value| rusqlite::types::Value::Integer(value as i64))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                filters
+                    .mime_prefix
+                    .clone()
+                    .map(rusqlite::types::Value::Text)
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(rusqlite::types::Value::Integer(cursor.unwrap_or(0)));
+            params.push(rusqlite::types::Value::Integer(limit + 1));
+
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    IndexEntry {
+                        name: row.get(1)?,
+                        real_path: row.get(2)?,
+                        is_dir: row.get::<_, i64>(3)? != 0,
+                        size: row.get(4)?,
+                        mtime: row.get(5)?,
+                        created_at: row.get(6)?,
+                        mime_type: row.get(7)?,
+                        has_preview: row.get::<_, i64>(8)? != 0,
+                        is_hidden: row.get::<_, i64>(9)? != 0,
+                    },
+                ))
+            })?;
+            let mut rows: Vec<(i64, IndexEntry)> = rows.collect::<rusqlite::Result<_>>()?;
+            let has_more = rows.len() > limit as usize;
+            if has_more {
+                rows.truncate(limit as usize);
+            }
+            let next_cursor = has_more.then(|| rows.last().map(|(id, _)| *id)).flatten();
+            Ok((
+                rows.into_iter().map(|(_, entry)| entry).collect(),
+                next_cursor,
+            ))
+        })
+        .await
+    }
+
+    /// One-time/restart-safe backfill for entries indexed before M26.
+    pub async fn backfill_name_bigrams_batch(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<(usize, Option<i64>)> {
+        let limit = limit.clamp(1, 5000) as i64;
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT id, name FROM index_entries WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+            let rows = statement
+                .query_map(params![after_id, limit], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            if rows.is_empty() {
+                return Ok((0, None));
+            }
+            let last_id = rows.last().map(|(id, _)| *id);
+            let transaction = connection.transaction()?;
+            {
+                let mut insert = transaction.prepare(
+                    "INSERT OR IGNORE INTO index_name_bigrams (entry_id, gram) \
+                     SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM index_entries WHERE id = ?1)",
+                )?;
+                for (entry_id, name) in &rows {
+                    for gram in name_bigrams(name) {
+                        insert.execute(params![entry_id, gram])?;
+                    }
+                }
+            }
+            transaction.commit()?;
+            Ok((rows.len(), last_id))
         })
         .await
     }

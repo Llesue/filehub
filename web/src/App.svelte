@@ -1382,8 +1382,17 @@
       exitSearch();
       return;
     }
-    const length = Array.from(query).length;
-    if (length < 3) {
+    const characters = Array.from(query);
+    const length = characters.length;
+    const hasCjk = characters.some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return (
+        (code >= 0x3400 && code <= 0x4dbf) ||
+        (code >= 0x4e00 && code <= 0x9fff) ||
+        (code >= 0xf900 && code <= 0xfaff)
+      );
+    });
+    if (length < 3 && !(length === 2 && hasCjk)) {
       searchAbort?.abort();
       searchActive = true;
       searchLoading = false;
@@ -3458,7 +3467,7 @@
                     {searchLoading
                       ? t($language, '搜索中…')
                       : searchTooShort
-                        ? t($language, '请输入至少 3 个字符')
+                        ? t($language, '请输入至少 3 个字符（中文可输入 2 个）')
                         : t($language, '没有找到匹配的文件')}
                   </div>
                 {:else}

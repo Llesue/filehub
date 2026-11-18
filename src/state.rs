@@ -244,6 +244,7 @@ impl AppState {
             edit_presence: Mutex::new(HashMap::new()),
         });
         state.schedule_directory_size_counts_refresh();
+        state.schedule_bigram_backfill();
         Ok(state)
     }
 
@@ -291,6 +292,44 @@ impl AppState {
             state
                 .directory_size_counts_refreshing
                 .store(false, Ordering::Relaxed);
+        });
+    }
+
+    /// Populates name bigrams for entries that existed before M26. The marker
+    /// makes the scan restart-safe; the operation is idempotent.
+    pub fn schedule_bigram_backfill(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if state
+                .db
+                .runtime_state_get("index.bigram_backfill")
+                .await
+                .ok()
+                .flatten()
+                == Some(1)
+            {
+                return;
+            }
+            let mut after = 0_i64;
+            loop {
+                match state.db.backfill_name_bigrams_batch(after, 500).await {
+                    Ok((0, _)) => break,
+                    Ok((_processed, Some(last))) => {
+                        after = last;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Ok((_processed, None)) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, "name bigram backfill failed");
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = state.db.runtime_state_set("index.bigram_backfill", 1).await {
+                tracing::warn!(%error, "failed to persist bigram backfill marker");
+            } else {
+                tracing::info!("name bigram backfill completed");
+            }
         });
     }
 

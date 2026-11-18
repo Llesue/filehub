@@ -261,6 +261,13 @@ pub struct SearchAllQuery {
     cursor: Option<String>,
 }
 
+fn is_cjk(character: char) -> bool {
+    let code = character as u32;
+    (0x3400..=0x4DBF).contains(&code)
+        || (0x4E00..=0x9FFF).contains(&code)
+        || (0xF900..=0xFAFF).contains(&code)
+}
+
 fn root_path_bounds(path: &str) -> Vec<(String, String)> {
     let mut bounds = Vec::new();
     for (separator, upper) in [("/", "0"), ("\\", "]")] {
@@ -286,9 +293,11 @@ pub async fn search_all(
         .await
         .map_err(AppError::internal)?;
     let query_text = query.q.trim();
-    if query_text.chars().count() < 3 {
+    let query_len = query_text.chars().count();
+    let has_cjk = query_text.chars().any(is_cjk);
+    if query_len < 3 && !(query_len == 2 && has_cjk) {
         return Err(AppError::bad_request(
-            "search query must be at least 3 characters",
+            "search query must be at least 3 characters, or 2 CJK characters",
         ));
     }
     if let (Some(min), Some(max)) = (query.min_size, query.max_size)
@@ -349,25 +358,42 @@ pub async fn search_all(
                 .map_err(|_| AppError::bad_request("invalid cursor"))
         })
         .transpose()?;
-    let (entries, next_cursor) = state
-        .db
-        .search_entries_all(
-            query_text,
-            ranges,
-            preferences.show_hidden,
-            query.limit.unwrap_or(100).clamp(1, 200),
-            cursor,
-            crate::db::IndexSearchFilters {
-                min_size: query.min_size,
-                max_size: query.max_size,
-                modified_after: query.modified_after,
-                modified_before: query.modified_before,
-                is_dir,
-                mime_prefix,
-            },
-        )
-        .await
-        .map_err(AppError::internal)?;
+    let filters = crate::db::IndexSearchFilters {
+        min_size: query.min_size,
+        max_size: query.max_size,
+        modified_after: query.modified_after,
+        modified_before: query.modified_before,
+        is_dir,
+        mime_prefix,
+    };
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let (entries, next_cursor) = if query_len == 2 {
+        state
+            .db
+            .search_entries_bigram(
+                query_text,
+                ranges,
+                preferences.show_hidden,
+                limit,
+                cursor,
+                filters,
+            )
+            .await
+            .map_err(AppError::internal)?
+    } else {
+        state
+            .db
+            .search_entries_all(
+                query_text,
+                ranges,
+                preferences.show_hidden,
+                limit,
+                cursor,
+                filters,
+            )
+            .await
+            .map_err(AppError::internal)?
+    };
     if started.elapsed().as_millis() >= 500 {
         tracing::warn!(
             roots = roots.len(),
