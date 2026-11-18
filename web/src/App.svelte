@@ -884,7 +884,8 @@
     ) {
       cancelThumbScope(viewRootId, viewPath, 'dir');
     }
-    const refreshing = activeRootId === rootId && currentPath === path && entries.length > 0;
+    const refreshing =
+      viewRootId === rootId && viewPath === path && entries.length > 0;
     filesLoading = !refreshing;
     filesRefreshing = refreshing;
     filesError = '';
