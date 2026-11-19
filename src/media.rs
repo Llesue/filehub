@@ -366,10 +366,8 @@ async fn run_transcode_job(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                if let Some(pid) = pid
-                    && let Some(pid) = rustix::process::Pid::from_raw(pid as i32)
-                {
-                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                if let Some(pid) = pid {
+                    crate::platform::kill_process(pid);
                 }
                 let _ = std::fs::remove_file(&temp);
                 return Err(AppError::Cancelled);

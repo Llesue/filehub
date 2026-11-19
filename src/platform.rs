@@ -70,6 +70,23 @@ pub fn prune_service_logs(retention_days: u64) -> usize {
     removed
 }
 
+/// Terminate a child process and its descendants when possible.
+#[cfg(unix)]
+pub fn kill_process(pid: u32) {
+    if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+}
+
+#[cfg(windows)]
+pub fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// Create `path` (and parents) and restrict the directory to the owner.
 pub fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
