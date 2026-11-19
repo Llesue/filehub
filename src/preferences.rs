@@ -48,9 +48,11 @@ pub async fn get_preferences(
         .get_user_preferences(current.user.id)
         .await
         .map_err(AppError::internal)?;
+    let capabilities = crate::capabilities::load(&state, &current.user).await?;
     Ok(Json(json!({
         "preferences": preferences_json(&preferences),
         "system": system_json(&state),
+        "capabilities": capabilities.json(),
     })))
 }
 
@@ -114,9 +116,11 @@ pub async fn update_preferences(
         .save_user_preferences(current.user.id, &preferences)
         .await
         .map_err(AppError::internal)?;
+    let capabilities = crate::capabilities::load(&state, &current.user).await?;
     Ok(Json(json!({
         "preferences": preferences_json(&preferences),
         "system": system_json(&state),
+        "capabilities": capabilities.json(),
     })))
 }
 
@@ -172,12 +176,10 @@ pub async fn upload_avatar(
         .map_err(|_| AppError::UnsupportedMedia("could not encode avatar".to_owned()))?;
 
     let avatars = avatar_directory(&state);
-    tokio::fs::create_dir_all(&avatars)
-        .await
+    crate::platform::create_private_dir_all(&avatars)
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
     let path = avatars.join(format!("{}.jpg", current.user.id));
-    tokio::fs::write(&path, encoded)
-        .await
+    crate::platform::write_private_file(&path, &encoded)
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
 
     let mut preferences = state

@@ -443,3 +443,248 @@ async fn batch_settings_update_is_atomic_and_validated() {
     .await;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn admin_feature_toggles_are_enforced_server_side() {
+    let app = setup_app().await;
+    seed_file(app.home.join("a.txt"));
+
+    let created = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/users",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"username":"alice","password":"correct horse","role":"user"}),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await;
+    let alice_id = created["user"]["id"].as_i64().unwrap();
+    assert_eq!(created["user"]["features"]["terminal"], true);
+    assert_eq!(created["user"]["features"]["zip"], true);
+    assert_eq!(created["user"]["features"]["unzip"], true);
+
+    let login = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username":"alice","password":"correct horse"}),
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::OK);
+    let alice_cookie = session_cookie(&login);
+    let me = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/me",
+        Some(&alice_cookie),
+        None,
+    )
+    .await;
+    let alice_csrf = json_body(me).await["csrf_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let alice_root = send_json(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/admin/users/{alice_id}/roots"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"path": app.home.to_string_lossy(), "alias": "shared", "read_only": false}),
+    )
+    .await;
+    assert_eq!(alice_root.status(), StatusCode::OK);
+    let alice_root_id = json_body(alice_root).await["root_id"].as_i64().unwrap();
+
+    let preferences = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/me/preferences",
+        Some(&alice_cookie),
+        None,
+    )
+    .await;
+    let preferences = json_body(preferences).await;
+    assert_eq!(preferences["capabilities"]["terminal"], true);
+    assert_eq!(preferences["capabilities"]["zip"], true);
+    assert_eq!(preferences["capabilities"]["unzip"], true);
+
+    let updated = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/admin/users/{alice_id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "feature_terminal": false,
+            "feature_zip": false,
+            "feature_unzip": false,
+        }),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = json_body(updated).await;
+    assert_eq!(updated["user"]["features"]["terminal"], false);
+    assert_eq!(updated["user"]["features"]["zip"], false);
+    assert_eq!(updated["user"]["features"]["unzip"], false);
+
+    let preferences = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/me/preferences",
+        Some(&alice_cookie),
+        None,
+    )
+    .await;
+    let preferences = json_body(preferences).await;
+    assert_eq!(preferences["capabilities"]["terminal"], false);
+    assert_eq!(preferences["capabilities"]["zip"], false);
+    assert_eq!(preferences["capabilities"]["unzip"], false);
+
+    let cmd = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/cmd",
+        Some(&alice_cookie),
+        Some(&alice_csrf),
+        json!({"root": alice_root_id, "cwd": "", "line": "pwd"}),
+    )
+    .await;
+    assert_eq!(cmd.status(), StatusCode::FORBIDDEN);
+
+    let zip = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/download/zip",
+        Some(&alice_cookie),
+        Some(&alice_csrf),
+        json!({"root": alice_root_id, "paths": ["a.txt"]}),
+    )
+    .await;
+    assert_eq!(zip.status(), StatusCode::FORBIDDEN);
+
+    // User preference cannot re-enable what the admin disabled.
+    let enabled = send_json(
+        &app.router,
+        Method::PATCH,
+        "/api/v1/me/preferences",
+        Some(&alice_cookie),
+        Some(&alice_csrf),
+        json!({"terminal_enabled": true}),
+    )
+    .await;
+    assert_eq!(enabled.status(), StatusCode::OK);
+    let preferences = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/me/preferences",
+        Some(&alice_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        json_body(preferences).await["capabilities"]["terminal"],
+        false,
+        "user preference must not override the admin policy"
+    );
+
+    let restored = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/admin/users/{alice_id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"feature_terminal": true, "feature_zip": true, "feature_unzip": true}),
+    )
+    .await;
+    assert_eq!(restored.status(), StatusCode::OK);
+
+    let cmd = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/cmd",
+        Some(&alice_cookie),
+        Some(&alice_csrf),
+        json!({"root": alice_root_id, "cwd": "", "line": "pwd"}),
+    )
+    .await;
+    assert_eq!(cmd.status(), StatusCode::OK);
+}
+
+fn seed_file(path: std::path::PathBuf) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, b"data").unwrap();
+}
+
+#[tokio::test]
+async fn entry_limit_blocks_creating_more_files() {
+    let app = setup_app().await;
+    std::fs::create_dir_all(&app.home).unwrap();
+
+    let setting = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/admin/settings",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"key":"max_entries_per_user","value":2}),
+    )
+    .await;
+    assert_eq!(setting.status(), StatusCode::OK);
+
+    for name in ["a.txt", "b.txt"] {
+        let response = send_json(
+            &app.router,
+            Method::POST,
+            "/api/v1/fs/touch",
+            Some(&app.cookie),
+            Some(&app.csrf),
+            json!({"root": app.root_id, "path": "", "name": name}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+    }
+
+    let denied = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/touch",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "", "name": "c.txt"}),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::INSUFFICIENT_STORAGE);
+    let body = json_body(denied).await;
+    assert_eq!(body["error"]["code"], "ENTRY_LIMIT_EXCEEDED");
+    assert!(!app.home.join("c.txt").exists());
+
+    let mkdir = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "", "name": "dir"}),
+    )
+    .await;
+    assert_eq!(mkdir.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+    let usage = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/usage",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    let usage = json_body(usage).await;
+    assert_eq!(usage["entry_count"], 2);
+    assert_eq!(usage["max_entries"], 2);
+}

@@ -402,6 +402,20 @@ pub async fn search_all(
             "slow unified search"
         );
     }
+    let dir_paths: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.is_dir)
+        .map(|entry| entry.real_path.clone())
+        .collect();
+    let dir_stats = if dir_paths.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .db
+            .dir_index_stats(dir_paths)
+            .await
+            .map_err(AppError::internal)?
+    };
     let results: Vec<Value> = entries
         .into_iter()
         .filter_map(|entry| {
@@ -418,6 +432,11 @@ pub async fn search_all(
             if path.is_empty() {
                 return None;
             }
+            let stat = if entry.is_dir {
+                dir_stats.get(&entry.real_path)
+            } else {
+                None
+            };
             Some(json!({
                 "root_id": root.id,
                 "name": entry.name,
@@ -428,6 +447,10 @@ pub async fn search_all(
                 "created": entry.created_at,
                 "mime_type": entry.mime_type,
                 "has_preview": entry.has_preview,
+                "dir_size": stat.and_then(|value| value.size),
+                "dir_size_source": stat.map(|value| value.source.clone()),
+                "dir_size_stale": stat.is_some_and(|value| value.stale),
+                "entry_count": stat.and_then(|value| value.entry_count),
             }))
         })
         .collect();

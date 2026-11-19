@@ -77,6 +77,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/properties", get(crate::properties::properties))
         .route("/download", get(crate::files::download))
         .route("/download/zip", post(crate::files::zip))
+        .route("/media/audio-info", get(crate::media::audio_info))
+        .route("/media/transcode", post(crate::media::transcode))
+        .route("/media/transcoded", get(crate::media::transcoded))
+        .route("/archive/zip", post(crate::files::archive_zip))
         .route("/index", post(crate::search::index))
         .route("/index/status", get(crate::search::index_status))
         .route("/search", get(crate::search::search))
@@ -358,6 +362,14 @@ async fn login(
         .await
         .map_err(AppError::internal)?
     else {
+        // Burn the same Argon2 cost as a real account so timing does not
+        // reveal whether the username exists.
+        auth::verify_password_async(
+            request.password.clone(),
+            auth::DUMMY_PASSWORD_HASH.to_owned(),
+        )
+        .await
+        .map_err(AppError::internal)?;
         state.rate_limiter.record_failure(&request.username);
         audit(
             &state,
@@ -372,6 +384,9 @@ async fn login(
     };
 
     if user.disabled {
+        auth::verify_password_async(request.password.clone(), user.password_hash.clone())
+            .await
+            .map_err(AppError::internal)?;
         state.rate_limiter.record_failure(&request.username);
         return Err(AppError::Unauthorized);
     }
@@ -685,6 +700,9 @@ struct UpdateUserRequest {
     quota_bytes: Option<i64>,
     clear_quota: Option<bool>,
     disabled: Option<bool>,
+    feature_terminal: Option<bool>,
+    feature_zip: Option<bool>,
+    feature_unzip: Option<bool>,
 }
 
 async fn update_user(
@@ -754,6 +772,34 @@ async fn update_user(
         .await
         .map_err(AppError::internal)?;
     state.invalidate_usage(id);
+
+    let features_changed = request.feature_terminal.is_some()
+        || request.feature_zip.is_some()
+        || request.feature_unzip.is_some();
+    if features_changed {
+        state
+            .db
+            .update_user_features(
+                id,
+                request.feature_terminal,
+                request.feature_zip,
+                request.feature_unzip,
+            )
+            .await
+            .map_err(AppError::internal)?;
+        state
+            .events
+            .publish("user.features_changed", Some(id), json!({ "user_id": id }));
+        audit(
+            &state,
+            Some(current.user.id),
+            "user_features_changed",
+            None,
+            Some(&format!("user_id={id}")),
+            &headers,
+        )
+        .await;
+    }
 
     if let Some(password) = request.password {
         let password_hash = auth::hash_password_async(password)
@@ -1189,6 +1235,11 @@ fn user_json(user: &User) -> Value {
         "role": user.role,
         "quota_bytes": user.quota_bytes,
         "disabled": user.disabled,
+        "features": {
+            "terminal": user.feature_terminal,
+            "zip": user.feature_zip,
+            "unzip": user.feature_unzip,
+        },
         "created_at": user.created_at,
         "updated_at": user.updated_at,
         "last_login_at": user.last_login_at,

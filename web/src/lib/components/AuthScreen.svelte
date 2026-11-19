@@ -44,7 +44,7 @@
 <main class="auth-shell">
   <section class="auth-card" aria-labelledby="auth-title">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true">
+      <span class="brand-mark" class:has-icon={$branding.iconUrl} aria-hidden="true">
         {#if $branding.iconUrl}<img src={$branding.iconUrl} alt="" />{:else}{brandMark($branding.name)}{/if}
       </span>
       <span>{$branding.name}</span>
@@ -172,6 +172,10 @@
     color: var(--on-accent);
     font-size: 14.5px;
     font-weight: 600;
+  }
+
+  .brand-mark.has-icon {
+    background: transparent;
   }
 
   h1 {

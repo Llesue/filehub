@@ -190,6 +190,29 @@
     }
   }
 
+  async function toggleFeature(
+    user: User,
+    key: 'terminal' | 'zip' | 'unzip',
+    value: boolean,
+  ): Promise<void> {
+    const original = { ...user.features };
+    user.features = { ...user.features, [key]: value };
+    try {
+      const result = await api.updateUser(
+        user.id,
+        {
+          [`feature_${key}`]: value,
+        },
+        csrf,
+      );
+      const index = users.findIndex((entry) => entry.id === user.id);
+      if (index >= 0) users[index] = result.user;
+    } catch (error) {
+      user.features = original;
+      showNotice(error instanceof Error ? error.message : t($language, '功能开关保存失败'));
+    }
+  }
+
   async function confirmDelete(): Promise<void> {
     if (!deleteUser) return;
     try {
@@ -696,6 +719,34 @@
             <button type="button" class="text-button danger" onclick={() => (deleteUser = user)}
               >{t($language, '删除')}</button
             >
+          </div>
+          <div class="feature-row">
+            <label>
+              <input
+                type="checkbox"
+                checked={user.features.terminal}
+                onchange={(event) =>
+                  void toggleFeature(user, 'terminal', event.currentTarget.checked)}
+              />
+              {t($language, '允许终端')}
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={user.features.zip}
+                onchange={(event) => void toggleFeature(user, 'zip', event.currentTarget.checked)}
+              />
+              {t($language, '允许ZIP')}
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={user.features.unzip}
+                onchange={(event) =>
+                  void toggleFeature(user, 'unzip', event.currentTarget.checked)}
+              />
+              {t($language, '允许解压')}
+            </label>
           </div>
           <div class="user-meta">
             <span>{t($language, '创建')} {formatDate(user.created_at)}</span>
@@ -1308,6 +1359,21 @@
     background: var(--surface-2);
     color: var(--text-2);
     font-size: 11px;
+  }
+
+  .feature-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem 1.25rem;
+    margin-top: 0.5rem;
+    font-size: 0.9rem;
+  }
+
+  .feature-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    cursor: pointer;
   }
 
   .user-meta {

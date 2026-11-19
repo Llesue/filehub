@@ -356,6 +356,19 @@ pub fn write_upload_chunk(path: &Path, offset: u64, data: &[u8]) -> Result<(), A
     Ok(())
 }
 
+/// Create `target` exclusively and write `data` into it.
+///
+/// `create_new` refuses to follow or replace an existing entry, including a
+/// dangling symlink, so this cannot write outside the intended directory.
+pub fn write_new_file(target: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    crate::platform::set_private_mode(&mut options);
+    let mut file = options.open(target)?;
+    file.write_all(data)?;
+    file.sync_all()
+}
+
 pub fn finalize_upload(temp: &Path, target: &Path) -> Result<(), AppError> {
     if target.exists() {
         return Err(AppError::conflict("target file already exists"));
@@ -771,6 +784,67 @@ pub fn path_size(path: &Path) -> Result<u64, AppError> {
     Ok(total)
 }
 
+/// Total bytes and entry count (files + directories, symlinks excluded).
+pub fn path_usage(path: &Path) -> Result<(u64, u64), AppError> {
+    fn walk(path: &Path, bytes: &mut u64, entries: &mut u64) -> Result<(), AppError> {
+        let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if metadata.is_file() {
+            *bytes = bytes.saturating_add(metadata.len());
+            *entries = entries.saturating_add(1);
+            return Ok(());
+        }
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(path).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            *entries = entries.saturating_add(1);
+            walk(&entry.path(), bytes, entries)?;
+        }
+        Ok(())
+    }
+
+    let mut bytes = 0_u64;
+    let mut entries = 0_u64;
+    if std::fs::symlink_metadata(path).is_ok() {
+        walk(path, &mut bytes, &mut entries)?;
+    }
+    Ok((bytes, entries))
+}
+
+/// Count entries under `path` without following symlinks, stopping at `limit`.
+pub fn count_entries_limited(path: &Path, limit: u64) -> u64 {
+    if limit == 0 {
+        return 0;
+    }
+    let mut count = 0_u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if count >= limit {
+                return count;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            count = count.saturating_add(1);
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    count
+}
+
 pub fn create_directory(path: &Path) -> Result<(), AppError> {
     std::fs::create_dir(path).map_err(io_error)
 }
@@ -953,8 +1027,13 @@ fn remove_path_quiet(path: &Path) {
     }
 }
 
+fn path_occupied(path: &Path) -> bool {
+    // symlink_metadata sees dangling symlinks, exists() does not.
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 pub fn unique_target(target: &Path) -> PathBuf {
-    if !target.exists() {
+    if !path_occupied(target) {
         return target.to_path_buf();
     }
     let parent = target.parent().unwrap_or_else(|| Path::new(""));
@@ -971,7 +1050,7 @@ pub fn unique_target(target: &Path) -> PathBuf {
             _ => format!("{stem} ({index})"),
         };
         let candidate = parent.join(name);
-        if !candidate.exists() {
+        if !path_occupied(&candidate) {
             return candidate;
         }
     }

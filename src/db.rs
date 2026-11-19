@@ -59,6 +59,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/0025_drop_short_search_index.sql"),
     ),
     (26, include_str!("../migrations/0026_name_bigrams.sql")),
+    (27, include_str!("../migrations/0027_user_features.sql")),
+    (28, include_str!("../migrations/0028_job_kinds_archive.sql")),
 ];
 
 pub fn unix_now() -> i64 {
@@ -77,6 +79,9 @@ pub struct User {
     pub home_dir: String,
     pub quota_bytes: Option<i64>,
     pub disabled: bool,
+    pub feature_terminal: bool,
+    pub feature_zip: bool,
+    pub feature_unzip: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_login_at: Option<i64>,
@@ -92,6 +97,9 @@ impl User {
             home_dir: row.get("home_dir")?,
             quota_bytes: row.get("quota_bytes")?,
             disabled: row.get::<_, i64>("disabled")? != 0,
+            feature_terminal: row.get::<_, i64>("feature_terminal")? != 0,
+            feature_zip: row.get::<_, i64>("feature_zip")? != 0,
+            feature_unzip: row.get::<_, i64>("feature_unzip")? != 0,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
             last_login_at: row.get("last_login_at")?,
@@ -185,6 +193,14 @@ pub struct IndexSearchFilters {
     pub modified_before: Option<i64>,
     pub is_dir: Option<bool>,
     pub mime_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirIndexStat {
+    pub size: Option<u64>,
+    pub entry_count: Option<u64>,
+    pub source: String,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +410,15 @@ impl Db {
             })?;
         }
 
+        #[cfg(unix)]
+        {
+            // The database stores password hashes, session hashes and audit data.
+            if path.exists() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+
         let pool_size = pool_size.max(1);
         let mut connections = Vec::with_capacity(pool_size);
 
@@ -403,6 +428,24 @@ impl Db {
             configure(&connection)?;
             migrate(&mut connection)?;
             connections.push(Arc::new(Mutex::new(connection)));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            // WAL/SHM are created next to the database and inherit restrictive
+            // modes from it, but tighten them explicitly in case they already
+            // exist from an older release.
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_owned();
+                sidecar.push(suffix);
+                let sidecar = std::path::PathBuf::from(sidecar);
+                if sidecar.exists() {
+                    let _ =
+                        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600));
+                }
+            }
         }
 
         Ok(Self {
@@ -566,6 +609,35 @@ impl Db {
             let changed = connection.execute(
                 "UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
                 params![password_hash, now, id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn update_user_features(
+        &self,
+        id: i64,
+        terminal: Option<bool>,
+        zip: Option<bool>,
+        unzip: Option<bool>,
+    ) -> anyhow::Result<bool> {
+        self.call(move |connection| {
+            let now = unix_now();
+            let changed = connection.execute(
+                "UPDATE users SET \
+                 feature_terminal = COALESCE(?1, feature_terminal), \
+                 feature_zip = COALESCE(?2, feature_zip), \
+                 feature_unzip = COALESCE(?3, feature_unzip), \
+                 updated_at = ?4 \
+                 WHERE id = ?5 AND deleted_at IS NULL",
+                params![
+                    terminal.map(i64::from),
+                    zip.map(i64::from),
+                    unzip.map(i64::from),
+                    now,
+                    id
+                ],
             )?;
             Ok(changed > 0)
         })
@@ -1789,6 +1861,67 @@ impl Db {
                 }
             }
             Ok(states)
+        })
+        .await
+    }
+
+    pub async fn dir_index_stats(
+        &self,
+        paths: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, DirIndexStat>> {
+        self.call(move |connection| {
+            let mut indexed = connection.prepare(
+                "SELECT total_size_bytes, entry_count, status FROM indexed_dirs WHERE real_path = ?1",
+            )?;
+            let mut cached = connection.prepare(
+                "SELECT size_bytes, status, has_value FROM directory_sizes WHERE real_path = ?1",
+            )?;
+            let mut result = HashMap::new();
+            for path in paths {
+                if let Some((size, entries, status)) = indexed
+                    .query_row(params![path], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .optional()?
+                {
+                    result.insert(
+                        path,
+                        DirIndexStat {
+                            size: Some(size.max(0) as u64),
+                            entry_count: Some(entries.max(0) as u64),
+                            source: "index".to_owned(),
+                            stale: status != "ready",
+                        },
+                    );
+                    continue;
+                }
+                if let Some((size, status, has_value)) = cached
+                    .query_row(params![path], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .optional()?
+                    && has_value != 0
+                {
+                    result.insert(
+                        path,
+                        DirIndexStat {
+                            size: Some(size.max(0) as u64),
+                            entry_count: None,
+                            source: "cache".to_owned(),
+                            stale: status != "ready",
+                        },
+                    );
+                }
+            }
+            Ok(result)
         })
         .await
     }

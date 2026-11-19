@@ -402,3 +402,45 @@ async fn user_preferences_default_and_patch_flow() {
     assert_eq!(updated["preferences"]["upload_conflict"], "skip");
     assert_eq!(updated["preferences"]["terminal_enabled"], false);
 }
+
+#[tokio::test]
+async fn login_unknown_user_and_wrong_password_look_the_same() {
+    let app = test_app().await;
+    let setup = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/setup",
+        None,
+        None,
+        json!({"token":"test-token","username":"admin","password":"correct horse"}),
+    )
+    .await;
+    assert_eq!(setup.status(), StatusCode::OK);
+
+    let unknown = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username":"ghost","password":"whatever"}),
+    )
+    .await;
+    let wrong = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username":"admin","password":"whatever"}),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(unknown).await, json_body(wrong).await);
+
+    assert!(!filehub::auth::verify_password(
+        "whatever",
+        filehub::auth::DUMMY_PASSWORD_HASH
+    ));
+}

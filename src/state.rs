@@ -20,6 +20,7 @@ use crate::presence::{PresenceEntry, PresenceKey};
 pub struct DeleteItem {
     pub relative: String,
     pub is_dir: bool,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,18 @@ pub struct DeletePreview {
     pub items: Vec<DeleteItem>,
     pub expires_at: i64,
     pub confirm_code: String,
+    pub requires_code: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CmdConfirmation {
+    pub user_id: i64,
+    pub root_id: i64,
+    pub cwd: String,
+    pub code: String,
+    pub targets: Vec<String>,
+    pub expires_at: i64,
+    pub attempts: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +54,7 @@ pub enum UsageInvalidation {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UsageSnapshot {
     pub used_bytes: u64,
+    pub entry_count: u64,
     pub quota_bytes: Option<i64>,
     pub disks: Vec<DiskUsage>,
     pub computed_at: i64,
@@ -104,6 +118,7 @@ pub struct AppState {
     pub setup: SetupState,
     pub rate_limiter: RateLimiter,
     pub delete_tokens: Mutex<HashMap<String, DeletePreview>>,
+    pub cmd_confirmations: Mutex<HashMap<String, CmdConfirmation>>,
     pub share_tickets: Mutex<HashMap<String, ShareTicket>>,
     pub ffmpeg: Option<PathBuf>,
     pub thumb_semaphore: Arc<Semaphore>,
@@ -196,11 +211,12 @@ impl AppState {
             .preview_workers
             .clamp(1, thumb_workers);
         let thumb_list_workers = thumb_workers.saturating_sub(preview_workers).max(1);
-        let ffmpeg = if snapshot.settings.thumbnails.video {
-            crate::thumbs::detect_ffmpeg()
-        } else {
-            None
-        };
+        let ffmpeg =
+            if snapshot.settings.thumbnails.video || snapshot.settings.media.audio_transcode {
+                crate::thumbs::detect_ffmpeg()
+            } else {
+                None
+            };
         let events = EventBus::new(256);
         let jobs = JobManager::new(
             db.clone(),
@@ -226,6 +242,7 @@ impl AppState {
             },
             rate_limiter: RateLimiter::new(),
             delete_tokens: Mutex::new(HashMap::new()),
+            cmd_confirmations: Mutex::new(HashMap::new()),
             share_tickets: Mutex::new(HashMap::new()),
             ffmpeg,
             thumb_semaphore: Arc::new(Semaphore::new(thumb_list_workers)),
@@ -245,6 +262,7 @@ impl AppState {
         });
         state.schedule_directory_size_counts_refresh();
         state.schedule_bigram_backfill();
+        crate::media::warm_cache(&state).await;
         Ok(state)
     }
 
@@ -502,6 +520,17 @@ impl AppState {
         if let Some(snapshot) = cache.get_mut(&user_id) {
             let adjusted = (snapshot.used_bytes as i64).saturating_add(delta).max(0);
             snapshot.used_bytes = adjusted as u64;
+        }
+    }
+
+    pub fn adjust_entries(&self, user_id: i64, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mut cache = self.usage_cache.lock();
+        if let Some(snapshot) = cache.get_mut(&user_id) {
+            let adjusted = (snapshot.entry_count as i64).saturating_add(delta).max(0);
+            snapshot.entry_count = adjusted as u64;
         }
     }
 

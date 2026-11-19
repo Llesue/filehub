@@ -34,6 +34,12 @@ pub struct CurrentUser {
     pub scope: Option<String>,
 }
 
+/// Argon2id hash of a throwaway password.
+///
+/// Login verifies this hash for unknown or disabled accounts so response time
+/// does not reveal whether a username exists.
+pub const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$NQ5gShmaW0+Av0Q56X1GAw$CcqN45A5Bx4S0hhUg2ApA5NtbaM3kjiT/5p99DeyPrU";
+
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()

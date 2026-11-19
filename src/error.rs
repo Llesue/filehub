@@ -13,6 +13,8 @@ pub enum AppError {
     TooLarge(String),
     #[error("quota exceeded")]
     QuotaExceeded,
+    #[error("file count limit exceeded")]
+    EntryLimitExceeded,
     #[error("unauthorized")]
     Unauthorized,
     #[error("forbidden")]
@@ -73,6 +75,7 @@ impl AppError {
             Self::InvalidPath(_) => "INVALID_PATH",
             Self::TooLarge(_) => "TOO_LARGE",
             Self::QuotaExceeded => "QUOTA_EXCEEDED",
+            Self::EntryLimitExceeded => "ENTRY_LIMIT_EXCEEDED",
             Self::Unauthorized => "UNAUTHORIZED",
             Self::Forbidden => "FORBIDDEN",
             Self::PermissionDenied => "PERMISSION_DENIED",
@@ -106,6 +109,11 @@ impl IntoResponse for AppError {
                 StatusCode::INSUFFICIENT_STORAGE,
                 "QUOTA_EXCEEDED",
                 "User quota exceeded".to_owned(),
+            ),
+            Self::EntryLimitExceeded => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "ENTRY_LIMIT_EXCEEDED",
+                "File count limit exceeded".to_owned(),
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,

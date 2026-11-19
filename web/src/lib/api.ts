@@ -21,6 +21,19 @@ export interface SystemFeatures {
 export interface PreferencesResponse {
   preferences: UserPreferences;
   system: SystemFeatures;
+  capabilities: Capabilities;
+}
+
+export interface UserFeatures {
+  terminal: boolean;
+  zip: boolean;
+  unzip: boolean;
+}
+
+export interface Capabilities {
+  terminal: boolean;
+  zip: boolean;
+  unzip: boolean;
 }
 
 export interface User {
@@ -29,6 +42,7 @@ export interface User {
   role: Role;
   quota_bytes: number | null;
   disabled: boolean;
+  features: UserFeatures;
   created_at: number;
   updated_at: number;
   last_login_at: number | null;
@@ -103,6 +117,23 @@ export interface ServerPath {
   alias: string;
   real_path: string;
   created_at: number;
+}
+
+export interface AudioTrackInfo {
+  index: number;
+  codec: string;
+  channels: number;
+  layout: string;
+  language: string;
+  default: boolean;
+  supported: boolean;
+}
+
+export interface AudioInfo {
+  ffmpeg: boolean;
+  tracks: AudioTrackInfo[];
+  default_track: number | null;
+  has_supported_track: boolean;
 }
 
 export interface ShareInfo {
@@ -235,6 +266,7 @@ export interface ShareMeta {
   path: string;
   is_dir: boolean;
   read_only: boolean;
+  zip_allowed?: boolean;
   size?: number;
   modified?: number;
   mime_type?: string;
@@ -273,15 +305,20 @@ export interface SearchEntry {
   created?: number;
   mime_type?: string;
   has_preview?: boolean;
-  rootId?: number;
+  dir_size?: number | null;
+  dir_size_source?: string | null;
+  dir_size_stale?: boolean;
+  entry_count?: number | null;
+  rootId: number;
   root_id?: number;
 }
 
 export interface DeletePreview {
   token: string;
   expires_at: number;
-  items: Array<{ relative: string; is_dir: boolean }>;
+  items: Array<{ relative: string; is_dir: boolean; size?: number }>;
   confirm_code: string;
+  requires_code?: boolean;
 }
 
 interface ApiErrorBody {
@@ -752,12 +789,56 @@ export const api = {
       quota_bytes?: number;
       clear_quota?: boolean;
       disabled?: boolean;
+      feature_terminal?: boolean;
+      feature_zip?: boolean;
+      feature_unzip?: boolean;
     },
     csrf: string,
   ): Promise<{ user: User }> {
     return request<{ user: User }>(
       `/admin/users/${id}`,
       { method: 'PUT', body: JSON.stringify(payload) },
+      csrf,
+    );
+  },
+
+  audioInfo(root: number, path: string): Promise<AudioInfo> {
+    const query = new URLSearchParams({ root: String(root), path });
+    return request<AudioInfo>(`/media/audio-info?${query.toString()}`);
+  },
+
+  transcodeAudio(
+    root: number,
+    path: string,
+    track: number,
+    csrf: string,
+  ): Promise<{ job_id: string | null; ready: boolean; path: string; track: number }> {
+    return request(
+      '/media/transcode',
+      { method: 'POST', body: JSON.stringify({ root, path, track }) },
+      csrf,
+    );
+  },
+
+  transcodedUrl(root: number, path: string, track: number): string {
+    const query = new URLSearchParams({
+      root: String(root),
+      path,
+      track: String(track),
+    });
+    return `/api/v1/media/transcoded?${query.toString()}`;
+  },
+
+  archiveZip(
+    root: number,
+    dir: string,
+    paths: string[],
+    name: string,
+    csrf: string,
+  ): Promise<{ job_id: string; status: string; created: boolean; name: string }> {
+    return request(
+      '/archive/zip',
+      { method: 'POST', body: JSON.stringify({ root, dir, paths, name }) },
       csrf,
     );
   },

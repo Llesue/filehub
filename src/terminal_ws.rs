@@ -24,15 +24,28 @@ enum ClientMessage {
     Exec {
         line: String,
         confirm: Option<bool>,
+        confirm_code: Option<String>,
     },
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    Ready { cwd: String },
-    Result { output: String, cwd: String },
-    Error { message: String },
+    Ready {
+        cwd: String,
+    },
+    Result {
+        output: String,
+        cwd: String,
+    },
+    Confirm {
+        prompt: String,
+        code: String,
+        expires_at: i64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub async fn websocket(
@@ -41,14 +54,7 @@ pub async fn websocket(
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
     let current = auth::current_user(&state, &headers).await?;
-    let preferences = state
-        .db
-        .get_user_preferences(current.user.id)
-        .await
-        .map_err(AppError::internal)?;
-    if !state.settings().settings.terminal_enabled || !preferences.terminal_enabled {
-        return Err(AppError::Forbidden);
-    }
+    crate::capabilities::require_terminal(&state, &current.user).await?;
     Ok(upgrade.on_upgrade(move |socket| session(state, current, headers, socket)))
 }
 
@@ -114,7 +120,29 @@ async fn session(
                 authenticated = true;
                 let _ = send(&mut sender, &ServerMessage::Ready { cwd: cwd.clone() }).await;
             }
-            ClientMessage::Exec { line, confirm } => {
+            ClientMessage::Exec {
+                line,
+                confirm,
+                confirm_code,
+            } => {
+                match crate::capabilities::load_by_id(&state, current.user.id).await {
+                    Ok(capabilities) if capabilities.terminal => {}
+                    Ok(_) => {
+                        let _ = send(
+                            &mut sender,
+                            &ServerMessage::Error {
+                                message: "terminal has been disabled by the administrator"
+                                    .to_owned(),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = send_error(&mut sender, error).await;
+                        break;
+                    }
+                }
                 if !authenticated {
                     let _ = send(
                         &mut sender,
@@ -134,21 +162,23 @@ async fn session(
                 };
                 let next_cwd = cwd.clone();
                 let is_cd = line.split_whitespace().next() == Some("cd");
-                let result = tokio::time::timeout(
-                    Duration::from_secs(60),
-                    cmdrunner::execute(
-                        &state,
-                        current.user.id,
-                        root,
-                        next_cwd.clone(),
-                        line,
-                        confirm.unwrap_or(false),
-                        &headers,
-                    ),
-                )
-                .await;
+                let future = cmdrunner::execute(
+                    &state,
+                    current.user.id,
+                    root,
+                    next_cwd.clone(),
+                    line.clone(),
+                    confirm.unwrap_or(false),
+                    confirm_code,
+                    &headers,
+                );
+                let result = if cmdrunner::is_long_command(&line) {
+                    Ok(future.await)
+                } else {
+                    tokio::time::timeout(Duration::from_secs(60), future).await
+                };
                 match result {
-                    Ok(Ok(output)) => {
+                    Ok(Ok(cmdrunner::ExecOutcome::Output(output))) => {
                         if is_cd {
                             // `cd` returns the new path relative to the authorized root.
                             cwd = output.clone();
@@ -158,6 +188,17 @@ async fn session(
                             &ServerMessage::Result {
                                 output,
                                 cwd: cwd.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(Ok(cmdrunner::ExecOutcome::Confirm(prompt))) => {
+                        let _ = send(
+                            &mut sender,
+                            &ServerMessage::Confirm {
+                                prompt: prompt.prompt,
+                                code: prompt.code,
+                                expires_at: prompt.expires_at,
                             },
                         )
                         .await;

@@ -5,6 +5,7 @@
   import PreviewModal from './PreviewModal.svelte';
   import { api, ApiError, type Entry, type ShareEntry, type ShareMeta } from '../api';
   import { language, t } from '../i18n';
+  import { classifyFile } from '../fileKind';
   import { branding, brandMark } from '../branding';
   import { playAudio, type AudioTrack } from '../audio';
 
@@ -287,6 +288,10 @@
 
   async function refreshZipInfo(): Promise<void> {
     if (!data?.is_dir) return;
+    if (data.zip_allowed === false) {
+      zipInfo = { checked: true, allowed: false, files: 0, bytes: 0, message: '' };
+      return;
+    }
     try {
       const result = await api.publicZipPreflight(
         token,
@@ -346,15 +351,15 @@
   }
 
   function isImage(name: string): boolean {
-    return /\.(jpe?g|png|gif|webp|bmp|tiff?)$/i.test(name);
+    return classifyFile(name) === 'image';
   }
 
   function isVideo(name: string): boolean {
-    return /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(name);
+    return classifyFile(name) === 'video';
   }
 
   function isAudio(name: string): boolean {
-    return /\.(mp3|wav|ogg|m4a|flac|aac)$/i.test(name);
+    return classifyFile(name) === 'audio';
   }
 
   function previewable(entry: ShareEntry): boolean {
@@ -566,7 +571,7 @@
   <section class="share-card">
     <header class="share-header">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">
+        <span class="brand-mark" class:has-icon={$branding.iconUrl} aria-hidden="true">
           {#if $branding.iconUrl}<img src={$branding.iconUrl} alt="" />{:else}{brandMark(
               $branding.name,
             )}{/if}
@@ -959,6 +964,10 @@
     background: var(--accent);
     color: var(--on-accent);
     font-size: 14.5px;
+  }
+
+  .brand-mark.has-icon {
+    background: transparent;
   }
 
   h1 {

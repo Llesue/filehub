@@ -926,6 +926,7 @@ async fn usage_delta_updates_cached_snapshot() {
         1,
         filehub::state::UsageSnapshot {
             used_bytes: 100,
+            entry_count: 0,
             quota_bytes: None,
             disks: Vec::new(),
             computed_at: 42,
@@ -1136,4 +1137,70 @@ async fn inline_aac_skips_wechat_primer_frame_and_maps_ranges() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(&body[..], &data[..]);
+}
+
+#[tokio::test]
+async fn terminal_rejects_root_deletion_and_self_copy() {
+    let app = setup_app().await;
+    std::fs::create_dir_all(app.home.join("work/sub")).unwrap();
+    std::fs::write(app.home.join("work/a.txt"), b"a").unwrap();
+
+    let run = |line: &str| {
+        let app = &app;
+        let line = line.to_owned();
+        async move {
+            send_json(
+                &app.router,
+                Method::POST,
+                "/api/v1/cmd",
+                Some(&app.cookie),
+                Some(&app.csrf),
+                json!({
+                    "root": app.root_id,
+                    "cwd": "",
+                    "line": line,
+                    "confirm": true,
+                }),
+            )
+            .await
+        }
+    };
+
+    for line in ["rm -r .", "rm -r /", "cp -r . work/sub", "mv . work/sub"] {
+        let response = run(line).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{line} should be rejected"
+        );
+    }
+    assert!(app.home.exists());
+    assert!(app.home.join("work/a.txt").exists());
+
+    let response = run("cp -r work work/sub").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = run("rm -r work -y").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let code = body["confirm"]["code"].as_str().unwrap().to_owned();
+    assert!(app.home.join("work").exists());
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/cmd",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "cwd": "",
+            "line": "rm -r work -y",
+            "confirm": true,
+            "confirm_code": code,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!app.home.join("work").exists());
 }

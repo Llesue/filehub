@@ -53,6 +53,7 @@
     type AuthResponse,
     type Entry,
     type Root,
+    type Capabilities,
     type JobInfo,
     type SystemFeatures,
     type TransferJobResult,
@@ -63,6 +64,7 @@
   } from './lib/api';
   import { applyTheme, resolveTheme, type Theme, type ThemePreference } from './lib/theme';
   import { splitFileName } from './lib/filename';
+  import { classifyFile } from './lib/fileKind';
 
   let theme = $state<Theme>('light');
   function storedView(): 'list' | 'thumb' | 'tile' {
@@ -83,6 +85,7 @@
   let user = $state<User | null>(null);
   let preferences = $state<UserPreferences | null>(null);
   let systemFeatures = $state<SystemFeatures>({ thumbnails: true, editor: true, terminal: true });
+  let capabilities = $state<Capabilities>({ terminal: true, zip: true, unzip: true });
   let csrf = $state('');
   let loggingOut = $state(false);
   let roots = $state<Root[]>([]);
@@ -92,7 +95,9 @@
   let currentReadOnlyReason = $state<'policy' | 'filesystem' | null>(null);
   let viewRootId = $state<number | null>(null);
   let viewPath = $state('');
-  let pathElement = $state<HTMLElement | null>(null);
+  let pathBarEl = $state<HTMLElement | null>(null);
+  let collapsedCount = $state(0);
+  let pathMenuOpen = $state(false);
   let clock = $state(Date.now());
   let entries = $state<Entry[]>([]);
   let selected = $state<string[]>([]);
@@ -139,6 +144,17 @@
   let searchLoadingMore = $state(false);
   let searchNextCursor = $state<string | null>(null);
   let searchTooShort = $state(false);
+  let searchFailed = $state(false);
+  let searchView = $state<'list' | 'grid'>('list');
+  let searchSort = $state<'name' | 'size' | 'modified'>('name');
+  let searchSortOrder = $state<'asc' | 'desc'>('asc');
+  let searchSelected = $state<string[]>([]);
+  let searchShare = $state<{
+    rootId: number;
+    paths: string[];
+    name: string;
+    isDir: boolean;
+  } | null>(null);
   let searchMoreAbort: AbortController | null = null;
   let searchInput = $state<HTMLInputElement | null>(null);
   let searchFiltersOpen = $state(false);
@@ -206,7 +222,9 @@
   let terminalOpen = $state(false);
   let jobProgressRestored = $state(false);
   let terminalAvailable = $derived(
-    systemFeatures.terminal && preferences?.terminal_enabled !== false,
+    capabilities.terminal &&
+      systemFeatures.terminal &&
+      preferences?.terminal_enabled !== false,
   );
 
   $effect(() => {
@@ -217,12 +235,13 @@
   let dragOverKey = $state<string | null>(null);
   let dragOverValid = $state(true);
   let nameDialog = $state<{
-    mode: 'mkdir' | 'touch' | 'rename';
+    mode: 'mkdir' | 'touch' | 'rename' | 'archive';
     entry: Entry | null;
     title: string;
     label: string;
     initialValue: string;
   } | null>(null);
+  let archiveTargets = $state<Entry[]>([]);
   let preview = $state<{ items: Entry[]; index: number } | null>(null);
   let properties = $state<{
     data: Awaited<ReturnType<typeof api.properties>> | null;
@@ -262,6 +281,33 @@
       (entry) => !entry.is_dir && (isImageName(entry.name) || isVideoName(entry.name)),
     ),
   );
+
+  let selectionSummary = $derived.by(() => {
+    const picked = entries.filter((entry) => selected.includes(entry.name));
+    const counts: Record<string, number> = {};
+    let bytes = 0;
+    for (const entry of picked) {
+      const kind = classifyFile(entry.name, entry.is_dir, entry.mime_type);
+      const label =
+        kind === 'folder'
+          ? t($language, '目录')
+          : kind === 'image'
+            ? t($language, '图片')
+            : kind === 'video'
+              ? t($language, '视频')
+              : kind === 'audio'
+                ? t($language, '音频')
+                : kind === 'pdf' || kind === 'text'
+                  ? t($language, '文档')
+                  : t($language, '其他');
+      counts[label] = (counts[label] ?? 0) + 1;
+      if (!entry.is_dir) bytes += entry.size;
+    }
+    return {
+      bytes,
+      parts: Object.entries(counts).map(([label, count]) => `${label} ${count}`),
+    };
+  });
 
   let activeRoot = $derived(roots.find((root) => root.id === activeRootId) ?? null);
   let pathSegments = $derived(currentPath.split('/').filter(Boolean));
@@ -348,7 +394,9 @@
         return;
       }
       if (event.key === 'Escape') {
-        if (editorOpen) {
+        if (pathMenuOpen) {
+          pathMenuOpen = false;
+        } else if (editorOpen) {
           closeEditor();
         } else if (searchActive) {
           exitSearch();
@@ -385,6 +433,9 @@
       }
       if (event.type === 'edit.presence') {
         handlePresenceEvent(event.data);
+      }
+      if (event.type === 'user.features_changed') {
+        void loadPreferences();
       }
       if (event.type === 'notification') {
         const kind = String(event.data.kind ?? 'notice');
@@ -754,6 +805,7 @@
     try {
       const result = await api.getPreferences();
       systemFeatures = result.system;
+      capabilities = result.capabilities;
       applyPreferences(result.preferences, false);
     } catch (error) {
       if (!(error instanceof ApiError && error.status === 401)) {
@@ -779,6 +831,7 @@
     try {
       const result = await api.updatePreferences(patch, csrf);
       systemFeatures = result.system;
+      capabilities = result.capabilities;
       applyPreferences(result.preferences);
     } catch (error) {
       showNotice(error instanceof Error ? error.message : t($language, '偏好保存失败'));
@@ -987,7 +1040,6 @@
       }
       void loadUsage();
       await tick();
-      if (pathElement) pathElement.scrollLeft = pathElement.scrollWidth;
       return true;
     } catch (error) {
       if (isAbortError(error)) return false;
@@ -1381,6 +1433,7 @@
   }
 
   function navigate(path: string): void {
+    pathMenuOpen = false;
     searchActive = false;
     searchQuery = '';
     searchResults = [];
@@ -1419,10 +1472,13 @@
       searchLoadingMore = false;
       searchNextCursor = null;
       searchTooShort = true;
+      searchFailed = false;
       searchResults = [];
       return;
     }
     searchTooShort = false;
+    searchFailed = false;
+    searchSelected = [];
     searchActive = true;
     searchLoading = true;
     searchLoadingMore = false;
@@ -1472,6 +1528,149 @@
     searchModified = '';
   }
 
+  let searchSortedResults = $derived.by(() => {
+    const direction = searchSortOrder === 'asc' ? 1 : -1;
+    const sorted = [...searchResults];
+    sorted.sort((left, right) => {
+      if (left.is_dir !== right.is_dir) return left.is_dir ? -1 : 1;
+      let compared: number;
+      if (searchSort === 'name') {
+        compared = left.name.localeCompare(right.name, undefined, {
+          numeric: true,
+          sensitivity: 'base',
+        });
+      } else if (searchSort === 'size') {
+        compared = left.size - right.size;
+      } else {
+        compared = left.modified - right.modified;
+      }
+      if (compared === 0) {
+        compared = left.name.localeCompare(right.name, undefined, {
+          numeric: true,
+          sensitivity: 'base',
+        });
+      } else {
+        compared *= direction;
+      }
+      return compared;
+    });
+    return sorted;
+  });
+
+  let searchSelectedRoot = $derived.by(() => {
+    if (searchSelected.length === 0) return null;
+    const selected = new Set(searchSelected);
+    const roots = new Set(
+      searchResults
+        .filter((entry) => selected.has(searchEntryKey(entry)))
+        .map((entry) => entry.rootId),
+    );
+    return roots.size === 1 ? Array.from(roots)[0] ?? null : undefined;
+  });
+
+  let searchSelectedReadOnly = $derived.by(() => {
+    if (searchSelectedRoot === null || searchSelectedRoot === undefined) return true;
+    return roots.find((root) => root.id === searchSelectedRoot)?.read_only ?? true;
+  });
+
+  function searchSelectedEntries(): SearchEntry[] {
+    const selected = new Set(searchSelected);
+    return searchSortedResults.filter((entry) => selected.has(searchEntryKey(entry)));
+  }
+
+  function toggleSearchSelection(entry: SearchEntry): void {
+    const key = searchEntryKey(entry);
+    searchSelected = searchSelected.includes(key)
+      ? searchSelected.filter((value) => value !== key)
+      : [...searchSelected, key];
+  }
+
+  function toggleSearchSelectAll(): void {
+    if (
+      searchSelected.length === searchSortedResults.length &&
+      searchSortedResults.length > 0
+    ) {
+      searchSelected = [];
+      return;
+    }
+    searchSelected = searchSortedResults.map(searchEntryKey);
+  }
+
+  async function deleteSearchSelected(): Promise<void> {
+    const items = searchSelectedEntries();
+    const rootId = searchSelectedRoot;
+    if (items.length === 0 || rootId === null || rootId === undefined) return;
+    const keys = new Set(searchSelected);
+    try {
+      const preview = await api.deletePreview(
+        rootId,
+        items.map((item) => item.path),
+        csrf,
+      );
+      const totalSize = items.reduce((sum, item) => sum + (item.is_dir ? 0 : item.size), 0);
+      const needsCode =
+        preview.requires_code ??
+        (items.some((item) => item.is_dir) ||
+          items.length > 5 ||
+          totalSize > 10 * 1024 * 1024);
+      confirmState = {
+        title: t($language, '永久删除'),
+        message: t($language, '以下文件将被永久删除：'),
+        items: items.map((item) => ({ name: item.name, isDir: item.is_dir })),
+        requireText: needsCode ? preview.confirm_code : null,
+        action: (value) => {
+          void (async () => {
+            startProgress(t($language, '删除文件'), items.length, t($language, '正在删除…'));
+            try {
+              await api.deletePaths(
+                preview.token,
+                undefined,
+                csrf,
+                needsCode ? value : undefined,
+              );
+              searchResults = searchResults.filter(
+                (entry) => !keys.has(searchEntryKey(entry)),
+              );
+              searchSelected = [];
+              updateProgress(items.length, t($language, '完成'));
+              finishProgress();
+              confirmState = null;
+            } catch (error) {
+              finishProgress();
+              showNotice(error instanceof Error ? error.message : t($language, '删除失败'));
+            }
+          })();
+        },
+      };
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '删除失败'));
+    }
+  }
+
+  function shareSearchSelected(): void {
+    const items = searchSelectedEntries();
+    const rootId = searchSelectedRoot;
+    if (items.length === 0 || rootId === null || rootId === undefined) return;
+    searchShare = {
+      rootId,
+      paths: items.map((item) => item.path),
+      name:
+        items.length === 1
+          ? items[0]?.name ?? ''
+          : t($language, '分享 {count} 个文件', { count: items.length }),
+      isDir: items.length === 1 ? (items[0]?.is_dir ?? false) : false,
+    };
+  }
+
+  function setSearchSort(field: 'name' | 'size' | 'modified'): void {
+    if (searchSort === field) {
+      searchSortOrder = searchSortOrder === 'asc' ? 'desc' : 'asc';
+    } else {
+      searchSort = field;
+      searchSortOrder = field === 'name' ? 'asc' : 'desc';
+    }
+  }
+
   function searchEntryKey(entry: SearchEntry): string {
     return `${entry.rootId ?? 0}:${entry.path}`;
   }
@@ -1479,7 +1678,7 @@
   function mapSearchEntries(entries: SearchEntry[]): SearchEntry[] {
     return entries.map((entry) => ({
       ...entry,
-      rootId: entry.root_id ?? entry.rootId,
+      rootId: entry.root_id ?? entry.rootId ?? 0,
     }));
   }
 
@@ -1514,7 +1713,10 @@
       searchActive = true;
       searchLoading = false;
     } catch (error) {
-      if (token === searchToken && !isAbortError(error)) handleFilesError(error);
+      if (token === searchToken && !isAbortError(error)) {
+        searchFailed = true;
+        handleFilesError(error);
+      }
     } finally {
       if (token === searchToken) searchLoading = false;
     }
@@ -1639,6 +1841,109 @@
     return base ? `${base}/${name}` : name;
   }
 
+  let pathMeasureCanvas: HTMLCanvasElement | null = null;
+
+  function measurePathText(text: string, element: HTMLElement): number {
+    pathMeasureCanvas ??= document.createElement('canvas');
+    const context = pathMeasureCanvas.getContext('2d');
+    if (!context) return text.length * 8;
+    const style = getComputedStyle(element);
+    context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+    return context.measureText(text).width;
+  }
+
+  function recomputePathCollapse(): void {
+    const element = pathBarEl;
+    if (!element || searchActive || pathSegments.length === 0) {
+      collapsedCount = 0;
+      return;
+    }
+    const available = element.clientWidth;
+    if (available <= 16) return;
+    const gap = 8;
+    const separator = measurePathText('/', element) + gap * 2;
+    const rootText = activeRoot ? rootLabel(activeRoot.alias) : t($language, '文件');
+    const rootWidth = Math.min(measurePathText(rootText, element), 200);
+    const widths = pathSegments.map((segment) =>
+      Math.min(measurePathText(segment, element), 220),
+    );
+    let total = rootWidth;
+    for (const width of widths) total += separator + width;
+    if (total <= available) {
+      collapsedCount = 0;
+      return;
+    }
+    const moreWidth = measurePathText('…', element) + 24;
+    const last = widths.length - 1;
+    let used = rootWidth + separator + moreWidth + separator + (widths[last] ?? 0);
+    let keepFrom = last;
+    for (let index = last - 1; index >= 0; index -= 1) {
+      const extra = separator + (widths[index] ?? 0);
+      if (used + extra > available) break;
+      used += extra;
+      keepFrom = index;
+    }
+    collapsedCount = keepFrom;
+  }
+
+  function searchKindLabel(kind: string): string {
+    const keys: Record<string, string> = {
+      image: '图片',
+      video: '视频',
+      audio: '音频',
+      text: '文本',
+      pdf: 'PDF',
+      dir: '目录',
+      file: '文件',
+    };
+    const label = keys[kind];
+    return label ? t($language, label) : kind;
+  }
+
+  function searchFilterTags(): string[] {
+    const tags: string[] = [];
+    if (searchKind) tags.push(searchKindLabel(searchKind));
+    if (searchMinMb.trim()) tags.push(`> ${searchMinMb.trim()} MB`);
+    if (searchMaxMb.trim()) tags.push(`< ${searchMaxMb.trim()} MB`);
+    if (searchModified) {
+      const keys: Record<string, string> = {
+        '86400': '今天',
+        '604800': '最近 7 天',
+        '2592000': '最近 30 天',
+        '31536000': '最近一年',
+      };
+      const label = keys[searchModified];
+      if (label) tags.push(t($language, label));
+    }
+    return tags;
+  }
+
+  function searchStatusText(): string {
+    if (searchLoading) return t($language, '搜索中…');
+    if (searchTooShort) return t($language, '请输入至少 3 个字符（中文可输入 2 个）');
+    if (searchFailed) return t($language, '搜索失败');
+    if (searchResults.length === 0) return t($language, '没有结果');
+    const loaded = t($language, '已加载 {count} 条', { count: searchResults.length });
+    return searchNextCursor ? `${loaded} · ${t($language, '还有更多')}` : loaded;
+  }
+
+  $effect(() => {
+    const element = pathBarEl;
+    if (!element) return;
+    const observer = new ResizeObserver(() => recomputePathCollapse());
+    observer.observe(element);
+    recomputePathCollapse();
+    return () => observer.disconnect();
+  });
+
+  $effect(() => {
+    void pathSegments.join('\u0000');
+    void selected.length;
+    void $language;
+    void searchActive;
+    requestAnimationFrame(() => recomputePathCollapse());
+  });
+
   function rootLabel(alias: string): string {
     return rootAlias($language, alias);
   }
@@ -1656,24 +1961,54 @@
   }
 
   function enterEntry(entry: Entry): void {
+    void openEntry(entry);
+  }
+
+  async function openEntry(entry: Entry): Promise<void> {
     if (symlinkBlocked(entry)) {
       showToast(symlinkTitle(entry));
       return;
     }
     if (entry.is_dir) {
       navigate(joinPath(currentPath, entry.name));
-    } else if (isAudioName(entry.name)) {
-      startAudio(entry);
-    } else if (isTextFile(entry.name)) {
-      if (systemFeatures.editor && preferences?.editor_enabled !== false) void openEditor(entry);
-      else showUnsupported(entry);
-    } else if (isPdfName(entry.name)) {
-      openPdf(entry);
-    } else if (isLightboxPreview(entry.name)) {
-      void openPreview(entry);
-    } else {
-      showUnsupported(entry);
+      return;
     }
+    const kind = classifyFile(entry.name, false, entry.mime_type);
+    if (kind === 'text') {
+      if (systemFeatures.editor && preferences?.editor_enabled !== false) await openEditor(entry);
+      else showUnsupported(entry);
+      return;
+    }
+    if (kind === 'audio') {
+      startAudio(entry);
+      return;
+    }
+    if (kind === 'pdf') {
+      openPdf(entry);
+      return;
+    }
+    if (kind === 'image' || kind === 'video') {
+      void openPreview(entry);
+      return;
+    }
+    if (kind === 'unknown' && activeRootId !== null) {
+      if (!systemFeatures.editor || preferences?.editor_enabled === false) {
+        showUnsupported(entry);
+        return;
+      }
+      try {
+        const probe = await api.probeFile(
+          activeRootId,
+          joinPath(currentPath, entry.name),
+        );
+        if (probe.is_text) await openEditor(entry);
+        else showUnsupported(entry);
+      } catch {
+        showUnsupported(entry);
+      }
+      return;
+    }
+    showUnsupported(entry);
   }
 
   function showUnsupported(entry: Entry): void {
@@ -1684,10 +2019,6 @@
       () => downloadEntry(entry),
       'info',
     );
-  }
-
-  function isLightboxPreview(name: string): boolean {
-    return isImageName(name) || isVideoName(name) || isAudioName(name);
   }
 
   function openPdf(entry: Entry): void {
@@ -1727,15 +2058,11 @@
   }
 
   function isAudioName(name: string): boolean {
-    return /\.(mp3|wav|ogg|m4a|flac|aac)$/i.test(name);
-  }
-
-  function isPdfName(name: string): boolean {
-    return /\.pdf$/i.test(name);
+    return classifyFile(name) === 'audio';
   }
 
   function isVideoName(name: string): boolean {
-    return /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(name);
+    return classifyFile(name) === 'video';
   }
 
   function handleEntryClick(event: MouseEvent, entry: Entry): void {
@@ -1927,18 +2254,7 @@
   }
 
   function previewEntry(entry: Entry): void {
-    if (isAudioName(entry.name)) {
-      startAudio(entry);
-    } else if (isTextFile(entry.name)) {
-      if (systemFeatures.editor && preferences?.editor_enabled !== false) void openEditor(entry);
-      else showUnsupported(entry);
-    } else if (isPdfName(entry.name)) {
-      openPdf(entry);
-    } else if (isLightboxPreview(entry.name)) {
-      void openPreview(entry);
-    } else {
-      showUnsupported(entry);
-    }
+    void openEntry(entry);
   }
 
   function runContextAction(
@@ -1949,6 +2265,7 @@
       | 'rename'
       | 'copy-to'
       | 'move-to'
+      | 'archive-zip'
       | 'delete'
       | 'play'
       | 'properties'
@@ -1998,6 +2315,16 @@
         initialValue: entry.name,
       };
     }
+    if (action === 'archive-zip') {
+      archiveTargets = targets;
+      nameDialog = {
+        mode: 'archive',
+        entry: null,
+        title: t($language, '打包为ZIP'),
+        label: t($language, '压缩包名称'),
+        initialValue: 'archive.zip',
+      };
+    }
     if (action === 'copy-to') transfer = { mode: 'copy', entries: targets };
     if (action === 'move-to') transfer = { mode: 'move', entries: targets };
     if (action === 'delete') void requestDelete(targets);
@@ -2029,6 +2356,25 @@
         await api.mkdir(rootId, currentPath, value, csrf);
       } else if (dialog.mode === 'touch') {
         await api.touch(rootId, currentPath, value, csrf);
+      } else if (dialog.mode === 'archive') {
+        const paths = archiveTargets.map((entry) => entry.name);
+        startProgress(t($language, '打包为ZIP'), paths.length, t($language, '正在打包…'));
+        try {
+          const job = await api.archiveZip(rootId, currentPath, paths, value, csrf);
+          const result = await waitForTransferJob(job.job_id);
+          const name =
+            result && typeof (result as { name?: unknown }).name === 'string'
+              ? String((result as { name?: unknown }).name)
+              : job.name;
+          await loadList(rootId, currentPath);
+          selected = name ? [name] : [];
+          finishProgress();
+          showNotice(t($language, '已创建 {name}', { name }), 'info', t($language, '打包完成'));
+        } catch (error) {
+          finishProgress();
+          throw error;
+        }
+        return;
       } else if (dialog.entry) {
         await api.rename(rootId, joinPath(currentPath, dialog.entry.name), value, csrf);
       }
@@ -2246,62 +2592,6 @@
         target.tagName === 'SELECT' ||
         target.isContentEditable)
     );
-  }
-
-  function isTextFile(name: string): boolean {
-    const lower = name.toLowerCase();
-    const dot = lower.lastIndexOf('.');
-    const extension = dot > 0 ? lower.slice(dot + 1) : '';
-    const binaryExtensions = new Set([
-      'jpg',
-      'jpeg',
-      'png',
-      'gif',
-      'webp',
-      'bmp',
-      'tif',
-      'tiff',
-      'avif',
-      'svg',
-      'heic',
-      'heif',
-      'mp4',
-      'mov',
-      'mkv',
-      'webm',
-      'avi',
-      'm4v',
-      'mp3',
-      'wav',
-      'ogg',
-      'flac',
-      'aac',
-      'm4a',
-      'zip',
-      'rar',
-      '7z',
-      'tar',
-      'gz',
-      'bz2',
-      'xz',
-      'pdf',
-      'doc',
-      'docx',
-      'xls',
-      'xlsx',
-      'ppt',
-      'pptx',
-      'exe',
-      'dll',
-      'so',
-      'dylib',
-      'bin',
-      'woff',
-      'woff2',
-      'ttf',
-      'otf',
-    ]);
-    return !binaryExtensions.has(extension);
   }
 
   function isMarkdown(name: string): boolean {
@@ -3015,7 +3305,7 @@
         <Icon name="menu" size={20} />
       </button>
       <div class="topbar-brand">
-        <span class="brand-mark" aria-hidden="true">
+        <span class="brand-mark" class:has-icon={$branding.iconUrl} aria-hidden="true">
           {#if $branding.iconUrl}
             <img src={$branding.iconUrl} alt="" />
           {:else}
@@ -3298,31 +3588,101 @@
                 >
               {/if}
             </div>
-            <div class="path" bind:this={pathElement}>
-              <button type="button" class="path-link" onclick={() => navigate('')}>
-                {activeRoot ? rootLabel(activeRoot.alias) : t($language, '文件')}
-              </button>
-              {#each pathSegments as segment, index (index)}
-                <span class="sep">/</span>
-                <button type="button" class="path-link" onclick={() => navigateToSegment(index)}>
-                  {segment}
+            {#if searchActive}
+              <div class="path search-path">
+                <Icon name="search" size={15} />
+                <span class="search-query" title={searchQuery}>“{searchQuery.trim()}”</span>
+                {#each searchFilterTags() as tag, index (index)}
+                  <span class="search-filter-tag">{tag}</span>
+                {/each}
+                <span class="sep">·</span>
+                <span class="search-state">{searchStatusText()}</span>
+                <button
+                  type="button"
+                  class="icon-button path-clear"
+                  aria-label={t($language, '清除搜索')}
+                  title={t($language, '清除搜索')}
+                  onclick={exitSearch}
+                >
+                  <Icon name="close" size={14} />
                 </button>
-              {/each}
-            </div>
+              </div>
+            {:else}
+              <div class="path" bind:this={pathBarEl}>
+                <button
+                  type="button"
+                  class="path-link path-root"
+                  onclick={() => navigate('')}
+                >
+                  {activeRoot ? rootLabel(activeRoot.alias) : t($language, '文件')}
+                </button>
+                {#if collapsedCount > 0}
+                  <span class="sep">/</span>
+                  <div class="path-more">
+                    <button
+                      type="button"
+                      class="path-link path-more-button"
+                      aria-label={t($language, '显示隐藏的 {count} 个路径段', {
+                        count: collapsedCount,
+                      })}
+                      title={t($language, '显示隐藏的 {count} 个路径段', {
+                        count: collapsedCount,
+                      })}
+                      aria-expanded={pathMenuOpen}
+                      onclick={() => (pathMenuOpen = !pathMenuOpen)}
+                    >
+                      …
+                    </button>
+                    {#if pathMenuOpen}
+                      <div class="path-menu" role="menu">
+                        {#each pathSegments.slice(0, collapsedCount) as segment, index (index)}
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onclick={() => {
+                              pathMenuOpen = false;
+                              navigateToSegment(index);
+                            }}
+                          >
+                            {segment}
+                          </button>
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+                {#each pathSegments.slice(collapsedCount) as segment, offset (offset)}
+                  <span class="sep">/</span>
+                  <button
+                    type="button"
+                    class="path-link"
+                    onclick={() => navigateToSegment(collapsedCount + offset)}
+                  >
+                    {segment}
+                  </button>
+                {/each}
+              </div>
+            {/if}
             {#if selected.length > 0}
               <div class="pathbar-actions">
                 <span class="selection-count"
                   >{t($language, '已选 {count} 项', { count: selected.length })}</span
                 >
-                <button
-                  type="button"
-                  class="icon-button"
-                  aria-label={t($language, '下载 ZIP')}
-                  title={t($language, '下载 ZIP')}
-                  onclick={() => void downloadSelectedZip()}
-                >
-                  <Icon name="download" size={16} />
-                </button>
+                <span class="selection-size">{formatSize(selectionSummary.bytes)}</span>
+                {#each selectionSummary.parts as part, index (index)}
+                  <span class="selection-kind">{part}</span>
+                {/each}
+                {#if capabilities.zip}
+                  <button
+                    type="button"
+                    class="icon-button"
+                    aria-label={t($language, '下载 ZIP')}
+                    title={t($language, '下载 ZIP')}
+                    onclick={() => void downloadSelectedZip()}
+                  >
+                    <Icon name="download" size={16} />
+                  </button>
+                {/if}
                 <button
                   type="button"
                   class="icon-button"
@@ -3395,6 +3755,7 @@
                     {user}
                     {csrf}
                     {preferences}
+                    {capabilities}
                     system={systemFeatures}
                     onPreferences={applyPreferences}
                   />
@@ -3490,31 +3851,205 @@
                     </label>
                   </div>
                 {/if}
+                <div class="search-controls">
+                  {#each [
+                    ['name', t($language, '名称')],
+                    ['size', t($language, '大小')],
+                    ['modified', t($language, '修改时间')],
+                  ] as [field, label] (field)}
+                    <button
+                      type="button"
+                      class="sort-button"
+                      class:active={searchSort === field}
+                      onclick={() => setSearchSort(field as 'name' | 'size' | 'modified')}
+                    >
+                      {label}{#if searchSort === field}{searchSortOrder === 'asc' ? ' ↑' : ' ↓'}{/if}
+                    </button>
+                  {/each}
+                  <button
+                    type="button"
+                    class="sort-button"
+                    title={searchView === 'list'
+                      ? t($language, '网格视图')
+                      : t($language, '列表视图')}
+                    aria-label={searchView === 'list'
+                      ? t($language, '网格视图')
+                      : t($language, '列表视图')}
+                    onclick={() => (searchView = searchView === 'list' ? 'grid' : 'list')}
+                  >
+                    {searchView === 'list' ? t($language, '网格视图') : t($language, '列表视图')}
+                  </button>
+                  <button type="button" class="sort-button" onclick={toggleSearchSelectAll}>
+                    {searchSelected.length === searchSortedResults.length &&
+                    searchSortedResults.length > 0
+                      ? t($language, '清空选择')
+                      : t($language, '全选')}
+                  </button>
+                  {#if searchSelected.length > 0}
+                    <span class="selection-count"
+                      >{t($language, '已选 {count} 项', { count: searchSelected.length })}</span
+                    >
+                    {#if searchSelectedRoot === undefined}
+                      <span class="danger-text">{t($language, '跨 root 选择不能批量操作')}</span>
+                    {:else}
+                      <button
+                        type="button"
+                        class="sort-button danger-text"
+                        disabled={searchSelectedReadOnly}
+                        onclick={() => void deleteSearchSelected()}
+                      >
+                        {t($language, '删除')}
+                      </button>
+                      <button
+                        type="button"
+                        class="sort-button"
+                        onclick={shareSearchSelected}
+                      >
+                        {t($language, '分享')}
+                      </button>
+                    {/if}
+                    <button type="button" class="sort-button" onclick={() => (searchSelected = [])}>
+                      {t($language, '清空选择')}
+                    </button>
+                  {/if}
+                </div>
                 {#if searchResults.length === 0}
                   <div class="files-state">
                     {searchLoading
                       ? t($language, '搜索中…')
                       : searchTooShort
                         ? t($language, '请输入至少 3 个字符（中文可输入 2 个）')
-                        : t($language, '没有找到匹配的文件')}
+                        : searchFailed
+                          ? t($language, '搜索失败')
+                          : t($language, '没有找到匹配的文件')}
                   </div>
                 {:else}
-                  <div class="search-results">
-                    {#each searchResults as result (searchEntryKey(result))}
-                      <button
-                        type="button"
-                        class="search-result"
-                        onclick={() => openSearchResult(result)}
-                      >
-                        <Icon name={result.is_dir ? 'folder' : 'file'} size={18} />
-                        <span class="file-name">{result.name}</span>
-                        <span class="search-path">{result.path}</span>
-                        <span class="search-size">
-                          {result.is_dir ? '—' : formatSize(result.size)}
-                        </span>
-                      </button>
-                    {/each}
-                  </div>
+                  {#if searchView === 'grid'}
+                    <div class="search-grid">
+                      {#each searchSortedResults as result (searchEntryKey(result))}
+                        {@const key = searchEntryKey(result)}
+                        {@const thumbId = thumbKey(result.rootId, result.path)}
+                        <div class="search-card" class:selected={searchSelected.includes(key)}>
+                          <input
+                            class="search-check"
+                            type="checkbox"
+                            aria-label={t($language, '选择 {name}', { name: result.name })}
+                            checked={searchSelected.includes(key)}
+                            onchange={() => toggleSearchSelection(result)}
+                          />
+                          <button
+                            type="button"
+                            class="search-card-open"
+                            onclick={() => openSearchResult(result)}
+                          >
+                            <div class="search-thumb">
+                              <FileTypeIcon
+                                name={result.name}
+                                isDir={result.is_dir}
+                                size={44}
+                              />
+                              {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !result.is_dir && result.has_preview && !thumbFailures[thumbId]}
+                                <img
+                                  class="thumb-image"
+                                  src={api.thumbUrl(
+                                    result.rootId,
+                                    result.path,
+                                    320,
+                                    thumbVersions[thumbId],
+                                    !$realtimeActive,
+                                  )}
+                                  alt=""
+                                  loading="lazy"
+                                  decoding="async"
+                                  fetchpriority="low"
+                                  onerror={(event) => hideBrokenThumb(event, thumbId)}
+                                />
+                              {/if}
+                            </div>
+                            <span class="file-name" title={result.name}>{result.name}</span>
+                            <span class="search-path">{result.path}</span>
+                            <span
+                              class="search-size"
+                              title={result.dir_size_stale
+                                ? t($language, '可能过期')
+                                : undefined}
+                            >
+                              {#if result.is_dir}
+                                {result.dir_size != null ? formatSize(result.dir_size) : '—'}
+                                {#if result.entry_count != null}
+                                  <span class="search-count">{result.entry_count}</span>
+                                {/if}
+                              {:else}
+                                {formatSize(result.size)}
+                              {/if}
+                            </span>
+                          </button>
+                        </div>
+                      {/each}
+                    </div>
+                  {:else}
+                    <div class="search-results">
+                      {#each searchSortedResults as result (searchEntryKey(result))}
+                        {@const key = searchEntryKey(result)}
+                        {@const thumbId = thumbKey(result.rootId, result.path)}
+                        <div class="search-row" class:selected={searchSelected.includes(key)}>
+                          <input
+                            type="checkbox"
+                            aria-label={t($language, '选择 {name}', { name: result.name })}
+                            checked={searchSelected.includes(key)}
+                            onchange={() => toggleSearchSelection(result)}
+                          />
+                          <button
+                            type="button"
+                            class="search-result"
+                            onclick={() => openSearchResult(result)}
+                          >
+                            <span class="search-thumb small">
+                              <FileTypeIcon
+                                name={result.name}
+                                isDir={result.is_dir}
+                                size={18}
+                              />
+                              {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !result.is_dir && result.has_preview && !thumbFailures[thumbId]}
+                                <img
+                                  class="thumb-image"
+                                  src={api.thumbUrl(
+                                    result.rootId,
+                                    result.path,
+                                    96,
+                                    thumbVersions[thumbId],
+                                    !$realtimeActive,
+                                  )}
+                                  alt=""
+                                  loading="lazy"
+                                  decoding="async"
+                                  fetchpriority="low"
+                                  onerror={(event) => hideBrokenThumb(event, thumbId)}
+                                />
+                              {/if}
+                            </span>
+                            <span class="file-name" title={result.name}>{result.name}</span>
+                            <span class="search-path">{result.path}</span>
+                            <span
+                              class="search-size"
+                              title={result.dir_size_stale
+                                ? t($language, '可能过期')
+                                : undefined}
+                            >
+                              {#if result.is_dir}
+                                {result.dir_size != null ? formatSize(result.dir_size) : '—'}
+                                {#if result.entry_count != null}
+                                  <span class="search-count">{result.entry_count}</span>
+                                {/if}
+                              {:else}
+                                {formatSize(result.size)}
+                              {/if}
+                            </span>
+                          </button>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
                   {#if searchNextCursor}
                     <div class="search-more">
                       <button
@@ -3665,7 +4200,7 @@
                           </tr>
                         {/if}
                         {#each visibleEntries as entry (entry.name)}
-                          {@const nameParts = splitFileName(entry.name)}
+                          {@const nameParts = splitFileName(entry.name, { isDir: entry.is_dir })}
                           <tr
                             data-entry-name={entry.name}
                             class:selected={isSelected(entry.name)}
@@ -3744,7 +4279,7 @@
                               >{formatRelativeDate(entry.modified)}</td
                             >
                             <td class="actions">
-                              {#if isAudioName(entry.name)}
+                              {#if !entry.is_dir && isAudioName(entry.name)}
                                 <button
                                   type="button"
                                   class="row-action"
@@ -3793,7 +4328,7 @@
                       style={`--virtual-pad-top:${virtualPadTop}px;--virtual-pad-bottom:${virtualPadBottom}px`}
                     >
                       {#each visibleEntries as entry (entry.name)}
-                        {@const nameParts = splitFileName(entry.name)}
+                        {@const nameParts = splitFileName(entry.name, { isDir: entry.is_dir })}
                         {@const thumbPath = joinPath(currentPath, entry.name)}
                         {@const thumbId = thumbKey(activeRootId ?? 0, thumbPath)}
                         <div
@@ -3898,7 +4433,7 @@
                       style={`--virtual-pad-top:${virtualPadTop}px;--virtual-pad-bottom:${virtualPadBottom}px`}
                     >
                       {#each visibleEntries as entry (entry.name)}
-                        {@const nameParts = splitFileName(entry.name)}
+                        {@const nameParts = splitFileName(entry.name, { isDir: entry.is_dir })}
                         {@const thumbPath = joinPath(currentPath, entry.name)}
                         {@const thumbId = thumbKey(activeRootId ?? 0, thumbPath)}
                         <div
@@ -4072,11 +4607,18 @@
           >{t($language, '详情')}</button
         >
       {/if}
-      <button type="button" role="menuitem" onclick={() => runContextAction('download')}
-        >{menuTargets.length > 1
-          ? t($language, '下载（ZIP）')
-          : t($language, '下载')}</button
-      >
+      {#if menuTargets.length === 1 || capabilities.zip}
+        <button type="button" role="menuitem" onclick={() => runContextAction('download')}
+          >{menuTargets.length > 1
+            ? t($language, '下载（ZIP）')
+            : t($language, '下载')}</button
+        >
+      {/if}
+      {#if capabilities.zip && (menuTargets.length > 1 || menuTargets.some((entry) => entry.is_dir))}
+        <button type="button" role="menuitem" onclick={() => runContextAction('archive-zip')}
+          >{t($language, '打包为ZIP')}</button
+        >
+      {/if}
       <button type="button" role="menuitem" onclick={() => runContextAction('share')}
         >{t($language, '分享')}</button
       >
@@ -4252,6 +4794,7 @@
       {currentPath}
       items={preview.items}
       index={preview.index}
+      {csrf}
       onClose={() => {
         const entry = preview ? preview.items[preview.index] : undefined;
         if (entry && activeRootId !== null) {
@@ -4280,7 +4823,11 @@
       title={nameDialog.title}
       label={nameDialog.label}
       initialValue={nameDialog.initialValue}
-      confirmLabel={nameDialog.mode === 'mkdir' ? t($language, '创建') : t($language, '重命名')}
+      confirmLabel={nameDialog.mode === 'mkdir'
+        ? t($language, '创建')
+        : nameDialog.mode === 'archive'
+          ? t($language, '打包')
+          : t($language, '重命名')}
       onConfirm={(value) => void submitName(value)}
       onClose={() => (nameDialog = null)}
     />
@@ -4321,6 +4868,17 @@
       isDir={shareTargets.length === 1 ? (shareTargets[0]?.is_dir ?? false) : false}
       {csrf}
       onClose={() => (shareTargets = null)}
+    />
+  {/if}
+
+  {#if searchShare}
+    <ShareDialog
+      root={searchShare.rootId}
+      paths={searchShare.paths}
+      name={searchShare.name}
+      isDir={searchShare.isDir}
+      {csrf}
+      onClose={() => (searchShare = null)}
     />
   {/if}
 
@@ -4529,6 +5087,10 @@
     color: var(--on-accent);
     font-size: 14.5px;
     font-weight: 600;
+  }
+
+  .brand-mark.has-icon {
+    background: transparent;
   }
 
   .brand-name {
@@ -4981,12 +5543,110 @@
     flex: 1;
     align-items: center;
     gap: 8px;
-    overflow-x: auto;
-    overflow-y: hidden;
+    overflow: hidden;
     color: var(--text-2);
     font-family: var(--font-mono);
     font-size: 14px;
     white-space: nowrap;
+  }
+
+  .path-root {
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 0 1 auto;
+  }
+
+  .path > .path-link:not(.path-root) {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 0 1 auto;
+  }
+
+  .path-more {
+    position: relative;
+    flex: 0 0 auto;
+  }
+
+  .path-more-button {
+    padding: 0 4px;
+    border-radius: 4px;
+  }
+
+  .path-more-button:hover,
+  .path-more-button[aria-expanded='true'] {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
+  .path-menu {
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + 6px);
+    left: 0;
+    display: flex;
+    min-width: 160px;
+    max-width: 320px;
+    max-height: 280px;
+    flex-direction: column;
+    overflow-y: auto;
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .path-menu button {
+    padding: 6px 10px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .path-menu button:hover {
+    background: var(--surface-2);
+  }
+
+  .search-path {
+    gap: 6px;
+    font-family: var(--font-ui);
+    font-size: 13px;
+  }
+
+  .search-query {
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .search-filter-tag {
+    flex: 0 0 auto;
+    padding: 1px 7px;
+    border-radius: 99px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 12px;
+  }
+
+  .search-state {
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+
+  .path-clear {
+    flex: 0 0 auto;
+    margin-left: auto;
   }
 
   .sep {
@@ -5004,6 +5664,28 @@
 
   .path-link:hover {
     color: var(--text);
+  }
+
+  .selection-size {
+    flex: 0 0 auto;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .selection-kind {
+    flex: 0 0 auto;
+    padding: 1px 6px;
+    border-radius: 99px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 11px;
+  }
+
+  @media (max-width: 760px) {
+    .selection-kind {
+      display: none;
+    }
   }
 
   .readonly-tag {
@@ -5161,6 +5843,8 @@
   }
 
   .name-stem {
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
   }
@@ -5179,6 +5863,9 @@
 
   .name-ext {
     flex: 0 0 auto;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .file-icon :global(svg) {
@@ -5355,6 +6042,129 @@
     color: var(--text-2);
     font-size: 12.5px;
     text-align: right;
+  }
+
+  .search-count {
+    margin-left: 4px;
+    opacity: 0.7;
+  }
+
+  .search-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+  }
+
+  .sort-button {
+    height: 28px;
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 12px;
+  }
+
+  .sort-button.active,
+  .sort-button:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+
+  .sort-button:disabled {
+    opacity: 0.5;
+  }
+
+  .search-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 6px;
+  }
+
+  .search-row.selected,
+  .search-card.selected {
+    background: var(--surface-2);
+    border-radius: var(--radius-sm);
+  }
+
+  .search-row .search-result {
+    flex: 1;
+  }
+
+  .search-thumb {
+    position: relative;
+    display: grid;
+    width: 100%;
+    aspect-ratio: 1;
+    place-items: center;
+    overflow: hidden;
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text-2);
+  }
+
+  .search-thumb.small {
+    display: grid;
+    width: 24px;
+    height: 24px;
+    aspect-ratio: auto;
+    background: transparent;
+  }
+
+  .search-thumb .thumb-image {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .search-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .search-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .search-card-open {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+  }
+
+  .search-card-open .file-name {
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .search-check {
+    position: absolute;
+    z-index: 1;
+    top: 6px;
+    left: 6px;
+    width: 16px;
+    height: 16px;
   }
 
   .files-state {

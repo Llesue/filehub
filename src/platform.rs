@@ -1,4 +1,5 @@
 use std::fs::{Metadata, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
@@ -67,6 +68,33 @@ pub fn prune_service_logs(retention_days: u64) -> usize {
         }
     }
     removed
+}
+
+/// Create `path` (and parents) and restrict the directory to the owner.
+pub fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Write `data` to `path`, forcing owner-only permissions.
+pub fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    set_private_mode(&mut options);
+    let mut file = options.open(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 pub fn set_private_mode(options: &mut OpenOptions) {

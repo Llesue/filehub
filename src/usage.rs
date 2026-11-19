@@ -26,6 +26,8 @@ pub async fn usage(
         return Ok(Json(json!({
             "quota_bytes": current.user.quota_bytes,
             "used_bytes": snapshot.used_bytes,
+            "entry_count": snapshot.entry_count,
+            "max_entries": state.settings().settings.max_entries_per_user,
             "disks": snapshot.disks,
             "computed_at": snapshot.computed_at,
             "stale": stale,
@@ -36,6 +38,8 @@ pub async fn usage(
     Ok(Json(json!({
         "quota_bytes": current.user.quota_bytes,
         "used_bytes": null,
+        "entry_count": null,
+        "max_entries": state.settings().settings.max_entries_per_user,
         "disks": [],
         "computed_at": null,
         "stale": false,
@@ -64,6 +68,7 @@ pub async fn admin_batch(
                     user.id.to_string(),
                     json!({
                         "used_bytes": snapshot.used_bytes,
+                        "entry_count": snapshot.entry_count,
                         "quota_bytes": snapshot.quota_bytes,
                         "computed_at": snapshot.computed_at,
                         "computing": stale,
@@ -76,6 +81,7 @@ pub async fn admin_batch(
                     user.id.to_string(),
                     json!({
                         "used_bytes": null,
+                        "entry_count": null,
                         "quota_bytes": user.quota_bytes,
                         "computed_at": null,
                         "computing": true,
@@ -94,6 +100,27 @@ pub async fn cached_or_scan(state: &Arc<AppState>, user: &User) -> Result<u64, A
     let ttl = state.settings().settings.jobs.usage_cache_seconds as i64;
     let snapshot = load_snapshot(state, user, ttl).await?;
     Ok(snapshot.used_bytes)
+}
+
+/// Reject new entries once the per-user entry budget is exhausted.
+///
+/// The count comes from the same cached scan as byte usage, so a create does
+/// not walk the whole home on every request.
+pub async fn ensure_entry_capacity(
+    state: &Arc<AppState>,
+    user: &User,
+    additional: u64,
+) -> Result<(), AppError> {
+    let max = state.settings().settings.max_entries_per_user;
+    if max == 0 {
+        return Ok(());
+    }
+    let ttl = state.settings().settings.jobs.usage_cache_seconds as i64;
+    let snapshot = load_snapshot(state, user, ttl).await?;
+    if snapshot.entry_count.saturating_add(additional) > max {
+        return Err(AppError::EntryLimitExceeded);
+    }
+    Ok(())
 }
 
 pub async fn load_snapshot(
@@ -187,16 +214,17 @@ async fn compute_snapshot(state: &Arc<AppState>, user: &User) -> Result<UsageSna
         .filter(|root| !crate::platform::paths_equal(Path::new(&root.real_path), &home))
         .collect();
     let home_for_task = home.clone();
-    let (used_bytes, disks) = tokio::task::spawn_blocking(move || {
-        let used = fsops::path_size(&home_for_task)?;
+    let (used_bytes, entry_count, disks) = tokio::task::spawn_blocking(move || {
+        let (used, entries) = fsops::path_usage(&home_for_task)?;
         let disks = fsops::disk_usage(&roots_for_task)?;
-        Ok::<_, AppError>((used, disks))
+        Ok::<_, AppError>((used, entries, disks))
     })
     .await
     .map_err(|err| AppError::internal(anyhow::anyhow!("usage task failed: {err}")))??;
 
     Ok(UsageSnapshot {
         used_bytes,
+        entry_count,
         quota_bytes: user.quota_bytes,
         disks,
         computed_at: unix_now(),

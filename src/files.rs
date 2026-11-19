@@ -1,3 +1,4 @@
+use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -672,6 +673,7 @@ pub async fn zip(
     Json(request): Json<ZipRequest>,
 ) -> Result<Response, AppError> {
     let current = auth::current_user(&state, &headers).await?;
+    crate::capabilities::require_zip(&state, &current.user).await?;
     let root = load_root(&state, current.user.id, request.root).await?;
     if request.paths.is_empty() || request.paths.len() > 1000 {
         return Err(AppError::bad_request("select between 1 and 1000 paths"));
@@ -752,21 +754,7 @@ pub(crate) fn zip_response(
         let started = std::time::Instant::now();
         let sync_writer = SyncIoBridge::new(writer);
         let mut zip = ZipWriter::new_stream(sync_writer);
-        for entry in entries {
-            let Ok(mut file) = std::fs::File::open(&entry.path) else {
-                continue;
-            };
-            if zip
-                .start_file(&entry.name, zip_options(&entry.name))
-                .is_err()
-            {
-                return;
-            }
-            if std::io::copy(&mut file, &mut zip).is_err() {
-                return;
-            }
-        }
-        let _ = zip.finish();
+        let _ = write_zip_entries(&mut zip, &entries, None);
         tracing::debug!(
             files = count,
             duration_ms = started.elapsed().as_millis() as u64,
@@ -787,6 +775,401 @@ pub(crate) fn zip_response(
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(ReaderStream::new(reader)))
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))
+}
+
+fn write_zip_entries<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    entries: &[fsops::ZipEntry],
+    mut progress: Option<&mut dyn FnMut(usize, u64)>,
+) -> Result<(), AppError> {
+    let mut done = 0_usize;
+    let mut bytes = 0_u64;
+    for entry in entries {
+        let mut file = match std::fs::File::open(&entry.path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        zip.start_file(&entry.name, zip_options(&entry.name))
+            .map_err(|err| AppError::internal(anyhow::anyhow!("zip entry failed: {err}")))?;
+        std::io::copy(&mut file, zip)
+            .map_err(|err| AppError::internal(anyhow::anyhow!("zip write failed: {err}")))?;
+        done += 1;
+        bytes = bytes.saturating_add(entry.size);
+        if let Some(progress) = progress.as_deref_mut() {
+            progress(done, bytes);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArchiveZipRequest {
+    root: i64,
+    dir: Option<String>,
+    paths: Vec<String>,
+    name: String,
+}
+
+pub async fn archive_zip(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ArchiveZipRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    crate::capabilities::require_zip(&state, &current.user).await?;
+    let root = load_root(&state, current.user.id, request.root).await?;
+    if request.paths.is_empty() || request.paths.len() > 1000 {
+        return Err(AppError::bad_request("select between 1 and 1000 paths"));
+    }
+    let dir = request.dir.unwrap_or_default();
+    let resolved = authz::resolve(&state, current.user.id, root.id, &dir, true).await?;
+    if !resolved.absolute.is_dir() {
+        return Err(AppError::bad_request(
+            "archive destination is not a directory",
+        ));
+    }
+    let mut name = request.name.trim().to_owned();
+    if !name.to_ascii_lowercase().ends_with(".zip") {
+        name.push_str(".zip");
+    }
+    let name = validate_filename(&name)?;
+    for path in &request.paths {
+        if path.is_empty()
+            || path == "."
+            || path == ".."
+            || path.contains('/')
+            || path.contains('\\')
+            || path.contains('\0')
+        {
+            return Err(AppError::invalid_path("invalid archive entry"));
+        }
+    }
+    let joined: Vec<String> = request
+        .paths
+        .iter()
+        .map(|path| join_relative(&dir, path))
+        .collect();
+    let selected = authz::resolve_many(&state, current.user.id, root.id, joined, false).await?;
+    if selected.iter().any(|item| item.relative.is_empty()) {
+        return Err(AppError::invalid_path("cannot archive the root directory"));
+    }
+    let settings = state.settings();
+    let max_bytes = settings.settings.downloads.zip_max_bytes;
+    let max_files = settings.settings.downloads.zip_max_files;
+    let names = request.paths.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let mut entries = Vec::new();
+        let mut total = 0_u64;
+        for (resolved, name) in selected.iter().zip(names.iter()) {
+            fsops::collect_zip_named(
+                &resolved.absolute,
+                name,
+                &mut entries,
+                &mut total,
+                max_bytes,
+                max_files,
+                false,
+            )?;
+        }
+        Ok::<_, AppError>(entries)
+    })
+    .await
+    .map_err(|err| AppError::internal(anyhow::anyhow!("zip preparation failed: {err}")))??;
+    if entries.is_empty() {
+        return Err(AppError::bad_request("nothing to archive"));
+    }
+    if let Some(quota_bytes) = current.user.quota_bytes
+        && crate::platform::path_within(
+            &resolved.absolute,
+            std::path::Path::new(&current.user.home_dir),
+        )
+    {
+        let used = usage::cached_or_scan(&state, &current.user).await?;
+        let source_bytes: u64 = entries.iter().map(|entry| entry.size).sum();
+        if used.saturating_add(source_bytes) > quota_bytes.max(0) as u64 {
+            return Err(AppError::QuotaExceeded);
+        }
+    }
+
+    let outcome = submit_zip_job(
+        &state,
+        current.user.id,
+        root.id,
+        resolved.relative,
+        request.paths,
+        name.clone(),
+        entries.len(),
+    )
+    .await?;
+    let status = if outcome.job.status == "running" {
+        "running"
+    } else {
+        "queued"
+    };
+    Ok(Json(json!({
+        "job_id": outcome.job.id,
+        "status": status,
+        "created": outcome.created,
+        "name": name,
+    })))
+}
+
+pub(crate) async fn submit_zip_job(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root_id: i64,
+    dir: String,
+    paths: Vec<String>,
+    name: String,
+    total: usize,
+) -> Result<SubmitOutcome, AppError> {
+    let settings = state.settings();
+    let max_bytes = settings.settings.downloads.zip_max_bytes;
+    let max_files = settings.settings.downloads.zip_max_files;
+    let payload = json!({
+        "root": root_id,
+        "dir": dir.clone(),
+        "paths": paths.clone(),
+        "name": name.clone(),
+    });
+    let key = auth::sha256_hex(&format!(
+        "{}:{}:{}:{}",
+        root_id,
+        dir,
+        name,
+        paths.join("\u{1f}")
+    ));
+    let job_state = Arc::clone(state);
+    let job_payload = payload.clone();
+    state
+        .jobs
+        .submit(
+            JobKind::Archive,
+            key,
+            user_id,
+            payload,
+            total,
+            false,
+            move |ctx| async move {
+                run_zip_job(
+                    job_state,
+                    user_id,
+                    job_payload,
+                    ctx,
+                    total,
+                    max_bytes,
+                    max_files,
+                )
+                .await
+            },
+        )
+        .await
+}
+
+async fn run_zip_job(
+    state: Arc<AppState>,
+    user_id: i64,
+    payload: Value,
+    ctx: JobContext,
+    total: usize,
+    max_bytes: u64,
+    max_files: usize,
+) -> Result<JobOutcome, AppError> {
+    let user = state
+        .db
+        .find_user_by_id(user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::Unauthorized)?;
+    let root_id = payload
+        .get("root")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("archive payload missing root")))?;
+    let dir = payload
+        .get("dir")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("archive payload missing name")))?
+        .to_owned();
+    let paths: Vec<String> = payload
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let root = crate::cmdrunner::load_root(&state, user_id, root_id).await?;
+    let dir_resolved = authz::resolve(&state, user_id, root.id, &dir, true).await?;
+    if !dir_resolved.absolute.is_dir() {
+        return Err(AppError::bad_request(
+            "archive destination is not a directory",
+        ));
+    }
+    let joined: Vec<String> = paths.iter().map(|path| join_relative(&dir, path)).collect();
+    let selected = authz::resolve_many(&state, user_id, root.id, joined, false).await?;
+    let names = paths.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let mut entries = Vec::new();
+        let mut total = 0_u64;
+        for (resolved, name) in selected.iter().zip(names.iter()) {
+            fsops::collect_zip_named(
+                &resolved.absolute,
+                name,
+                &mut entries,
+                &mut total,
+                max_bytes,
+                max_files,
+                false,
+            )?;
+        }
+        Ok::<_, AppError>(entries)
+    })
+    .await
+    .map_err(|err| AppError::internal(anyhow::anyhow!("zip preparation failed: {err}")))??;
+    if entries.is_empty() {
+        return Err(AppError::bad_request("nothing to archive"));
+    }
+    let source_bytes: u64 = entries.iter().map(|entry| entry.size).sum();
+    if let Some(quota_bytes) = user.quota_bytes
+        && crate::platform::path_within(
+            &dir_resolved.absolute,
+            std::path::Path::new(&user.home_dir),
+        )
+    {
+        let used = usage::cached_or_scan(&state, &user).await?;
+        if used.saturating_add(source_bytes) > quota_bytes.max(0) as u64 {
+            return Err(AppError::QuotaExceeded);
+        }
+    }
+    let total = total.max(entries.len());
+    let base = dir_resolved.absolute.clone();
+    let temp = base.join(format!(".filehub-zip-{}.part", auth::random_token(8)));
+    let create = {
+        let temp = temp.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            crate::platform::set_private_mode(&mut options);
+            options.open(temp)
+        })
+        .await
+        .map_err(|err| AppError::internal(anyhow::anyhow!("zip temp task failed: {err}")))?
+    };
+    let file = match create {
+        Ok(file) => file,
+        Err(error) => return Err(AppError::internal(anyhow::Error::from(error))),
+    };
+    let worker_temp = temp.clone();
+    let worker_entries = entries.clone();
+    let worker_name = name.clone();
+    let worker_base = base.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(PathBuf, u64), AppError> {
+        let mut zip = ZipWriter::new(file);
+        let mut scratch = std::io::BufWriter::new(std::io::sink());
+        let _ = &mut scratch;
+        let mut last_progress = 0_usize;
+        let mut written = 0_u64;
+        for (index, entry) in worker_entries.iter().enumerate() {
+            if ctx.check_cancelled().is_err() {
+                let _ = std::fs::remove_file(&worker_temp);
+                return Err(AppError::Cancelled);
+            }
+            let mut input = std::fs::File::open(&entry.path)
+                .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+            zip.start_file(&entry.name, zip_options(&entry.name))
+                .map_err(|err| AppError::internal(anyhow::anyhow!("zip entry failed: {err}")))?;
+            std::io::copy(&mut input, &mut zip)
+                .map_err(|err| AppError::internal(anyhow::anyhow!("zip write failed: {err}")))?;
+            written = written.saturating_add(entry.size);
+            if index + 1 > last_progress {
+                last_progress = index + 1;
+                ctx.report(index + 1, total, written, source_bytes);
+            }
+        }
+        let file = zip
+            .finish()
+            .map_err(|err| AppError::internal(anyhow::anyhow!("zip finish failed: {err}")))?;
+        file.sync_all()
+            .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+        drop(file);
+        let mut target = crate::fsops::unique_target(&worker_base.join(&worker_name));
+        let mut linked = false;
+        for _ in 0..100 {
+            match std::fs::hard_link(&worker_temp, &target) {
+                Ok(()) => {
+                    linked = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    target = crate::fsops::unique_target(&target);
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&worker_temp);
+                    return Err(AppError::internal(anyhow::Error::from(error)));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&worker_temp);
+        if !linked {
+            return Err(AppError::conflict("could not allocate an archive name"));
+        }
+        let size = std::fs::metadata(&target)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Ok((target, size))
+    })
+    .await
+    .map_err(|err| AppError::internal(anyhow::anyhow!("zip task failed: {err}")))?;
+    let (target, size) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+    };
+    let relative = target
+        .strip_prefix(&base)
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.clone());
+    state.adjust_entries(user_id, 1);
+    state.adjust_usage(user_id, size as i64);
+    state
+        .invalidate_path_caches_with_usage(
+            &target,
+            Some(user_id),
+            false,
+            UsageInvalidation::Delta(size as i64),
+        )
+        .await;
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&name)
+        .to_owned();
+    let _ = &user;
+    Ok(JobOutcome {
+        result: json!({
+            "path": relative,
+            "name": name,
+            "size": size,
+            "files": entries.len(),
+            "bytes": source_bytes,
+        }),
+        progress: entries.len(),
+        total,
+        bytes_done: source_bytes,
+        bytes_total: source_bytes,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -850,6 +1233,13 @@ pub async fn create_upload(
             warn_upload(current.user.id, &filename, "quota", &error);
             return Err(error);
         }
+    }
+    if std::fs::symlink_metadata(resolved.absolute.join(&filename)).is_err() {
+        crate::usage::ensure_entry_capacity(&state, &current.user, 1)
+            .await
+            .inspect_err(|error| {
+                warn_upload(current.user.id, &filename, "entry_limit", error);
+            })?;
     }
 
     let chunk_size = request
@@ -1052,7 +1442,8 @@ pub async fn complete_upload(
         .upload_conflict;
     let mut target_path = target.absolute.clone();
     let mut target_relative = target_relative;
-    if target_path.exists() {
+    let target_existed = target_path.exists();
+    if target_existed {
         match conflict.as_str() {
             "skip" => {
                 fsops::delete_temp(&temp);
@@ -1099,6 +1490,9 @@ pub async fn complete_upload(
         warn_upload(current.user.id, &upload.filename, "finalize", &error);
         return Err(error);
     }
+    if !target_existed {
+        state.adjust_entries(current.user.id, 1);
+    }
 
     state
         .db
@@ -1138,6 +1532,14 @@ pub struct DeleteRequest {
     paths: Vec<String>,
 }
 
+pub(crate) fn delete_requires_code(items: &[(bool, u64)]) -> bool {
+    const ITEM_LIMIT: usize = 5;
+    const SIZE_LIMIT: u64 = 10 * 1024 * 1024;
+    items.iter().any(|(is_dir, _)| *is_dir)
+        || items.len() > ITEM_LIMIT
+        || items.iter().map(|(_, size)| *size).sum::<u64>() > SIZE_LIMIT
+}
+
 pub async fn delete_preview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1169,12 +1571,24 @@ pub async fn delete_preview(
         if !resolved.absolute.exists() {
             return Err(AppError::NotFound);
         }
+        let metadata = std::fs::symlink_metadata(&resolved.absolute).map_err(AppError::internal)?;
         items.push(DeleteItem {
             relative: resolved.relative,
-            is_dir: resolved.absolute.is_dir(),
+            is_dir: metadata.is_dir(),
+            size: if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            },
         });
     }
 
+    let requires_code = delete_requires_code(
+        &items
+            .iter()
+            .map(|item| (item.is_dir, item.size))
+            .collect::<Vec<_>>(),
+    );
     let token = auth::random_token(24);
     let expires_at = unix_now() + 300;
     let random = auth::sha256_hex(&auth::random_token(8));
@@ -1192,6 +1606,7 @@ pub async fn delete_preview(
             items: items.clone(),
             expires_at,
             confirm_code: confirm_code.clone(),
+            requires_code,
         },
     );
     drop(tokens);
@@ -1201,13 +1616,13 @@ pub async fn delete_preview(
         "expires_at": expires_at,
         "items": items,
         "confirm_code": confirm_code,
+        "requires_code": requires_code,
     })))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DeleteConfirmRequest {
     token: String,
-    confirm_name: Option<String>,
     confirm_code: Option<String>,
 }
 
@@ -1227,17 +1642,8 @@ pub async fn delete_confirm(
         return Err(AppError::NotFound);
     }
 
-    let directories: Vec<&DeleteItem> = preview.items.iter().filter(|item| item.is_dir).collect();
-    if !directories.is_empty()
+    if preview.requires_code
         && request.confirm_code.as_deref() != Some(preview.confirm_code.as_str())
-        && (directories.len() != 1
-            || request.confirm_name.as_deref()
-                != Some(
-                    std::path::Path::new(&directories[0].relative)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default(),
-                ))
     {
         return Err(AppError::bad_request("confirmation code is required"));
     }
@@ -1864,6 +2270,7 @@ pub async fn mkdir(
     let name = validate_filename(&request.name)?;
     let target = join_relative(&request.path, &name);
     let resolved = authz::resolve(&state, current.user.id, root.id, &target, true).await?;
+    crate::usage::ensure_entry_capacity(&state, &current.user, 1).await?;
     let absolute = resolved.absolute.clone();
     let recursive = request.recursive.unwrap_or(false);
     tokio::task::spawn_blocking(move || {
@@ -1875,6 +2282,7 @@ pub async fn mkdir(
     })
     .await
     .map_err(|err| AppError::internal(anyhow::anyhow!("mkdir task failed: {err}")))??;
+    state.adjust_entries(current.user.id, 1);
     state
         .invalidate_path_caches_with_usage(
             &resolved.absolute,
@@ -1911,10 +2319,12 @@ pub async fn touch(
     let name = validate_filename(&request.name)?;
     let target = join_relative(&request.path, &name);
     let resolved = authz::resolve(&state, current.user.id, root.id, &target, true).await?;
+    crate::usage::ensure_entry_capacity(&state, &current.user, 1).await?;
     let absolute = resolved.absolute.clone();
     tokio::task::spawn_blocking(move || fsops::touch_file(&absolute))
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("touch task failed: {err}")))??;
+    state.adjust_entries(current.user.id, 1);
     state
         .invalidate_path_caches_with_usage(
             &resolved.absolute,
@@ -1995,12 +2405,12 @@ pub struct TransferRequest {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct TransferJobPayload {
-    source_root: i64,
-    paths: Vec<String>,
-    dest_root: i64,
-    dest_path: Option<String>,
-    move_items: bool,
+pub(crate) struct TransferJobPayload {
+    pub(crate) source_root: i64,
+    pub(crate) paths: Vec<String>,
+    pub(crate) dest_root: i64,
+    pub(crate) dest_path: Option<String>,
+    pub(crate) move_items: bool,
 }
 
 pub async fn copy(
@@ -2079,6 +2489,28 @@ async fn submit_transfer(
     if payload.paths.is_empty() || payload.paths.len() > 1000 {
         return Err(AppError::bad_request("paths must contain 1-1000 items"));
     }
+    let user_id = current.user.id;
+    let outcome = submit_transfer_job(&state, user_id, payload).await?;
+    let status = if outcome.job.status == "running" {
+        "running"
+    } else {
+        "queued"
+    };
+    Ok(Json(json!({
+        "job_id": outcome.job.id,
+        "status": status,
+        "created": outcome.created,
+    })))
+}
+
+pub(crate) async fn submit_transfer_job(
+    state: &Arc<AppState>,
+    user_id: i64,
+    payload: TransferJobPayload,
+) -> Result<SubmitOutcome, AppError> {
+    if payload.paths.is_empty() || payload.paths.len() > 1000 {
+        return Err(AppError::bad_request("paths must contain 1-1000 items"));
+    }
     let kind = if payload.move_items {
         JobKind::Move
     } else {
@@ -2094,35 +2526,23 @@ async fn submit_transfer(
     ));
     let payload_value = serde_json::to_value(&payload)
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
-    let user_id = current.user.id;
     let total = payload.paths.len();
-    let job_state = Arc::clone(&state);
+    let job_state = Arc::clone(state);
     let job_payload = payload;
-    let outcome =
-        state
-            .jobs
-            .submit(
-                kind,
-                key,
-                user_id,
-                payload_value,
-                total,
-                false,
-                move |ctx| async move {
-                    execute_transfer_job(job_state, user_id, job_payload, ctx).await
-                },
-            )
-            .await?;
-    let status = if outcome.job.status == "running" {
-        "running"
-    } else {
-        "queued"
-    };
-    Ok(Json(json!({
-        "job_id": outcome.job.id,
-        "status": status,
-        "created": outcome.created,
-    })))
+    state
+        .jobs
+        .submit(
+            kind,
+            key,
+            user_id,
+            payload_value,
+            total,
+            false,
+            move |ctx| async move {
+                execute_transfer_job(job_state, user_id, job_payload, ctx).await
+            },
+        )
+        .await
 }
 
 async fn execute_transfer_job(
@@ -2173,6 +2593,14 @@ async fn execute_transfer_job(
         ctx.check_cancelled()?;
     }
 
+    if !payload.move_items {
+        let mut wanted = 0_u64;
+        for source in &sources {
+            wanted = wanted.saturating_add(fsops::count_entries_limited(&source.absolute, 10_000));
+        }
+        usage::ensure_entry_capacity(&state, &user, wanted).await?;
+        state.adjust_entries(user_id, wanted as i64);
+    }
     if !payload.move_items && user.quota_bytes.is_some() {
         let used = usage::cached_or_scan(&state, &user).await?;
         if used.saturating_add(total_bytes) > user.quota_bytes.unwrap_or_default().max(0) as u64 {

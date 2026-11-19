@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.1.9 - 2026-11-19
+
+### Security
+
+- Terminal `rm`/`cp`/`mv` reject the storage root and self-recursive copies; destructive deletes invalidate usage and path caches.
+- Public-share uploads no longer write through dangling symlink leaves: exclusive `create_new` writes, conflict suffixing, and symlink-aware target selection.
+- Login runs a dummy Argon2 verification for unknown users and verifies disabled users before returning 401, removing username enumeration.
+- Per-user feature policies for terminal, ZIP, and extraction are enforced server-side (API, WebSocket, public share ZIP).
+- Cache/avatar directories use `0700`, temp/thumbnail/avatar files and the SQLite database use `0600`.
+- Per-user entry limit (`max_entries_per_user`, default 1,000,000) blocks inode exhaustion from uploads, mkdir/touch/cp/ln, and extraction.
+
+### Added
+
+- ZIP archive jobs (`POST /archive/zip`) with progress, cancellation, quota checks, temp file + atomic rename, and numeric conflict suffixes.
+- Terminal `help`, `-h`/`--help`, `zip`, `unzip`, `job`/`jobs`, long-format `ls` with cached directory sizes and summaries, and a 4-digit code for high-risk deletes.
+- Safe unzip: zip-slip/symlink/duplicate/encryption rejection, entry/size/ratio limits, temp directory + atomic rename, and terminal integration.
+- Search result sorting, list/grid views, thumbnails, multi-select, and single-root bulk delete/share.
+- Search pathbar shows the query, filters, loading state, and loaded result count instead of the current directory.
+- Pathbar collapses middle segments into a `…` menu; no horizontal scrollbar.
+- File-name display only keeps short ASCII extensions; directories and odd suffixes are never split.
+- Central file classifier: directories always win, text uses an allowlist, unknown types are probed before opening the editor.
+- Transparent brand icons no longer show the accent background.
+- Video audio detection and audio-only transcoding (AC3/EAC3/DTS/TrueHD) with cached AAC output when ffmpeg is available.
+- Selection summary (count, total size, type distribution) and directory sizes in search results from the index/cache.
+
 ## v0.1.8 - 2026-11-19
 
 ### Added

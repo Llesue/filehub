@@ -23,7 +23,10 @@ pub struct Settings {
     pub security: SecuritySettings,
     pub jobs: JobsSettings,
     pub log: LogSettings,
+    pub media: MediaSettings,
     pub default_quota_bytes: i64,
+    /// Maximum number of files+directories per user home. 0 disables the limit.
+    pub max_entries_per_user: u64,
     pub terminal_enabled: bool,
     pub show_hidden_default: bool,
     pub upload_conflict_default: String,
@@ -46,7 +49,9 @@ impl Default for Settings {
             security: SecuritySettings::default(),
             jobs: JobsSettings::default(),
             log: LogSettings::default(),
+            media: MediaSettings::default(),
             default_quota_bytes: 15 * 1024 * 1024 * 1024,
+            max_entries_per_user: 1_000_000,
             terminal_enabled: true,
             show_hidden_default: true,
             upload_conflict_default: "rename".to_owned(),
@@ -167,6 +172,11 @@ pub struct DownloadSettings {
     pub zip_max_bytes: u64,
     pub zip_max_files: usize,
     pub zip_concurrency: usize,
+    pub unzip_max_entries: usize,
+    pub unzip_max_bytes: u64,
+    pub unzip_max_entry_bytes: u64,
+    pub unzip_max_ratio: u64,
+    pub unzip_ratio_check_bytes: u64,
 }
 
 impl Default for DownloadSettings {
@@ -175,6 +185,27 @@ impl Default for DownloadSettings {
             zip_max_bytes: 2 * 1024 * 1024 * 1024,
             zip_max_files: 1000,
             zip_concurrency: 1,
+            unzip_max_entries: 1000,
+            unzip_max_bytes: 2 * 1024 * 1024 * 1024,
+            unzip_max_entry_bytes: 2 * 1024 * 1024 * 1024,
+            unzip_max_ratio: 200,
+            unzip_ratio_check_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaSettings {
+    pub audio_transcode: bool,
+    pub audio_cache_max_bytes: u64,
+}
+
+impl Default for MediaSettings {
+    fn default() -> Self {
+        Self {
+            audio_transcode: true,
+            audio_cache_max_bytes: 5 * 1024 * 1024 * 1024,
         }
     }
 }

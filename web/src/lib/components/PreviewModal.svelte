@@ -5,6 +5,8 @@
   import Icon from './Icon.svelte';
   import FileName from './FileName.svelte';
   import { language, t } from '../i18n';
+  import { classifyFile } from '../fileKind';
+  import type { AudioInfo } from '../api';
 
   let {
     root,
@@ -18,6 +20,7 @@
     downloadHref,
     previewEdge = 2048,
     onEditSource,
+    csrf,
   }: {
     root: number;
     currentPath: string;
@@ -30,6 +33,7 @@
     downloadHref?: (entry: Entry) => string;
     previewEdge?: number;
     onEditSource?: (entry: Entry) => void;
+    csrf?: string;
   } = $props();
 
   let current = $derived(items[index]);
@@ -122,6 +126,65 @@
   let isSvgPreview = $derived(current ? isSvgName(current.name) : false);
   let isGifPreview = $derived(current ? /\.gif$/i.test(current.name) : false);
   let url = $derived(current ? (srcFor ? srcFor(current) : api.previewUrl(root, entryPath)) : '');
+  let audioInfo = $state<AudioInfo | null>(null);
+  let audioInfoToken = 0;
+  let transcodeBusy = $state(false);
+  let transcodeError = $state('');
+  let transcodedUrl = $state('');
+  let playUrl = $derived(transcodedUrl || url);
+  let warningTrack = $derived(
+    audioInfo?.ffmpeg && audioInfo.tracks.length > 0
+      ? (audioInfo.default_track !== null
+          ? audioInfo.tracks[audioInfo.default_track]
+          : audioInfo.tracks[0])
+      : undefined,
+  );
+
+  $effect(() => {
+    const entry = current;
+    transcodedUrl = '';
+    transcodeError = '';
+    audioInfo = null;
+    if (!entry || !isVideo(entry.name) || !csrf) return;
+    const token = ++audioInfoToken;
+    void api
+      .audioInfo(root, entryPath)
+      .then((info) => {
+        if (token === audioInfoToken) audioInfo = info;
+      })
+      .catch(() => {
+        if (token === audioInfoToken) audioInfo = null;
+      });
+  });
+
+  async function startTranscode(): Promise<void> {
+    if (!current || !csrf || transcodeBusy) return;
+    transcodeBusy = true;
+    transcodeError = '';
+    const track = audioInfo?.default_track ?? warningTrack?.index ?? 0;
+    try {
+      const result = await api.transcodeAudio(root, entryPath, track, csrf);
+      if (result.ready) {
+        transcodedUrl = api.transcodedUrl(root, entryPath, track);
+        return;
+      }
+      if (!result.job_id) throw new Error(t($language, '转码失败'));
+      for (;;) {
+        const job = await api.job(result.job_id);
+        if (job.status === 'completed') {
+          transcodedUrl = api.transcodedUrl(root, entryPath, track);
+          return;
+        }
+        if (job.status === 'failed') throw new Error(job.error ?? t($language, '转码失败'));
+        if (job.status === 'cancelled') throw new Error(t($language, '操作已取消'));
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    } catch (error) {
+      transcodeError = error instanceof Error ? error.message : t($language, '转码失败');
+    } finally {
+      transcodeBusy = false;
+    }
+  }
   let lowResUrl = $derived(
     current
       ? thumbSrcFor
@@ -484,15 +547,15 @@
   }
 
   function isVideo(name: string): boolean {
-    return /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(name);
+    return classifyFile(name) === 'video';
   }
 
   function isAudio(name: string): boolean {
-    return /\.(mp3|wav|ogg|m4a|flac|aac)$/i.test(name);
+    return classifyFile(name) === 'audio';
   }
 
   function isPdf(name: string): boolean {
-    return /\.pdf$/i.test(name);
+    return classifyFile(name) === 'pdf';
   }
 
   function isSvgName(name: string): boolean {
@@ -550,7 +613,7 @@
     {#if current}
       {#if isVideo(current.name)}
         <video
-          src={url}
+          src={playUrl}
           controls
           autoplay
           playsinline
@@ -558,6 +621,22 @@
           onloadedmetadata={applyVideoVolume}
           onvolumechange={rememberVideoVolume}><track kind="captions" /></video
         >
+        {#if csrf && warningTrack && !warningTrack.supported}
+          <div class="audio-warning" role="presentation" onclick={(event) => event.stopPropagation()}>
+            <span
+              >{t($language, '默认音轨 {codec} 浏览器无法播放声音。', {
+                codec: warningTrack.codec.toUpperCase(),
+              })}</span
+            >
+            <button type="button" disabled={transcodeBusy} onclick={() => void startTranscode()}>
+              {transcodeBusy ? t($language, '转码中…') : t($language, '转码播放')}
+            </button>
+            {#if downloadHref}
+              <a href={downloadHref(current)}>{t($language, '下载文件')}</a>
+            {/if}
+            {#if transcodeError}<span class="audio-error">{transcodeError}</span>{/if}
+          </div>
+        {/if}
       {:else if isAudio(current.name)}
         <audio src={url} controls autoplay onclick={(event) => event.stopPropagation()}></audio>
       {:else if isPdf(current.name)}
@@ -818,5 +897,43 @@
     justify-content: center;
     gap: 16px;
     font-size: 13px;
+  }
+
+  .audio-warning {
+    position: absolute;
+    bottom: 24px;
+    left: 50%;
+    display: flex;
+    max-width: min(680px, calc(100% - 32px));
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+    transform: translateX(-50%);
+    box-shadow: var(--shadow);
+  }
+
+  .audio-warning button,
+  .audio-warning a {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+    color: var(--text);
+    font: inherit;
+    text-decoration: none;
+  }
+
+  .audio-warning button:disabled {
+    opacity: 0.6;
+  }
+
+  .audio-error {
+    color: var(--danger);
   }
 </style>

@@ -305,6 +305,12 @@ pub async fn upload(
     if !resolved.absolute.is_dir() {
         return Err(AppError::bad_request("upload target is not a directory"));
     }
+    let creator = state
+        .db
+        .find_user_by_id(share.creator_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::Forbidden)?;
     let filename = query.filename.trim();
     if !share_root_is_hidden(&share) && filename.starts_with('.') {
         return Err(AppError::invalid_path(
@@ -330,11 +336,30 @@ pub async fn upload(
     {
         return Err(AppError::invalid_path("invalid Windows filename"));
     }
-    let target = resolved.absolute.join(filename);
-    let target = fsops::unique_target(&target);
-    tokio::fs::write(&target, body)
-        .await
-        .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+    let base_target = resolved.absolute.join(filename);
+    crate::usage::ensure_entry_capacity(&state, &creator, 1).await?;
+    let data = body.to_vec();
+    let existed = std::fs::symlink_metadata(&base_target).is_ok();
+    let target = tokio::task::spawn_blocking(move || {
+        let mut candidate = fsops::unique_target(&base_target);
+        for _ in 0..16 {
+            match fsops::write_new_file(&candidate, &data) {
+                Ok(()) => return Ok(candidate),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    candidate = fsops::unique_target(&candidate);
+                }
+                Err(error) => {
+                    return Err(AppError::internal(anyhow::Error::from(error)));
+                }
+            }
+        }
+        Err(AppError::conflict("upload target keeps changing"))
+    })
+    .await
+    .map_err(|err| AppError::internal(anyhow::anyhow!("upload task failed: {err}")))??;
+    if !existed || target != resolved.absolute.join(filename) {
+        state.adjust_entries(share.creator_id, 1);
+    }
     state
         .invalidate_path_caches(&target, Some(share.creator_id), false)
         .await;
@@ -410,6 +435,13 @@ pub async fn create_upload(
         return Err(AppError::bad_request("too many upload chunks"));
     }
 
+    let creator = state
+        .db
+        .find_user_by_id(share.creator_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::Forbidden)?;
+    crate::usage::ensure_entry_capacity(&state, &creator, 1).await?;
     let upload_id = format!("su_{}", auth::random_token(16));
     let temp = fsops::create_upload_temp(&resolved.absolute, &upload_id)?;
     let now = unix_now();
@@ -576,6 +608,7 @@ pub async fn complete_upload(
         .invalidate_path_caches(&target, Some(share.creator_id), false)
         .await;
     let _ = state.db.delete_share_upload(&id, share.id).await;
+    state.adjust_entries(share.creator_id, 1);
     let name = target
         .file_name()
         .and_then(|name| name.to_str())
@@ -718,6 +751,12 @@ pub async fn public_meta(
             .events
             .publish_share("share.visited", share.id, activity);
     }
+    let zip_allowed = state
+        .db
+        .find_user_by_id(share.creator_id)
+        .await
+        .map_err(AppError::internal)?
+        .is_some_and(|user| user.feature_zip);
     let video_enabled = {
         let settings = state.settings();
         settings.settings.thumbnails.enabled
@@ -761,6 +800,7 @@ pub async fn public_meta(
             "is_dir": true,
             "collection": true,
             "read_only": true,
+            "zip_allowed": zip_allowed,
             "entries": entries,
         })));
     }
@@ -781,6 +821,7 @@ pub async fn public_meta(
             "path": "",
             "is_dir": false,
             "read_only": share.read_only,
+            "zip_allowed": zip_allowed,
             "size": info.size,
             "modified": info.modified,
             "mime_type": mime_guess::from_path(&share.real_path).first_or_octet_stream().to_string(),
@@ -810,6 +851,7 @@ pub async fn public_meta(
             "path": resolved.relative,
             "is_dir": false,
             "read_only": share.read_only,
+            "zip_allowed": zip_allowed,
             "size": info.size,
             "modified": info.modified,
             "mime_type": mime_guess::from_path(&resolved.absolute).first_or_octet_stream().to_string(),
@@ -866,6 +908,7 @@ pub async fn public_meta(
         "path": resolved.relative,
         "is_dir": true,
         "read_only": share.read_only || filesystem_read_only,
+        "zip_allowed": zip_allowed,
         "entries": entries,
         "next_cursor": (offset.saturating_add(limit) < total)
             .then(|| (offset + limit).to_string()),
@@ -1350,6 +1393,18 @@ async fn public_zip_response(
     ticket: Option<String>,
 ) -> Result<Response, AppError> {
     let share = load_public_share(&state, &token).await?;
+    let creator = state
+        .db
+        .find_user_by_id(share.creator_id)
+        .await
+        .map_err(AppError::internal)?;
+    let Some(creator) = creator else {
+        return Err(AppError::Forbidden);
+    };
+    let capabilities = crate::capabilities::load(&state, &creator).await?;
+    if !capabilities.zip {
+        return Err(AppError::Forbidden);
+    }
     require_ticket(&state, &share, headers, ticket.as_deref())?;
     check_public_rate(&state, &share, headers)?;
     let (selected, filename) = resolve_zip_selection(&state, &share, path, paths, item_ids).await?;
@@ -1414,6 +1469,23 @@ pub async fn zip_preflight(
     Json(request): Json<PublicZipRequest>,
 ) -> Result<Json<Value>, AppError> {
     let share = load_public_share(&state, &token).await?;
+    let creator = state
+        .db
+        .find_user_by_id(share.creator_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::Forbidden)?;
+    let capabilities = crate::capabilities::load(&state, &creator).await?;
+    if !capabilities.zip {
+        return Ok(Json(json!({
+            "allowed": false,
+            "files": 0,
+            "bytes": 0,
+            "max_bytes": state.settings().settings.downloads.zip_max_bytes,
+            "max_files": state.settings().settings.downloads.zip_max_files,
+            "message": "zip is disabled for the share owner",
+        })));
+    }
     require_ticket(&state, &share, &headers, request.ticket.as_deref())?;
     check_public_rate(&state, &share, &headers)?;
     let (selected, _filename) = resolve_zip_selection(

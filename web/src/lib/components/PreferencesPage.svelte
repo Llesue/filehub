@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type User, type UserPreferences } from '../api';
+  import { api, type Capabilities, type User, type UserPreferences } from '../api';
   import { language, t, type Lang } from '../i18n';
   import { showNotice } from '../notices';
   import AvatarCropper from './AvatarCropper.svelte';
@@ -11,12 +11,14 @@
     user,
     csrf,
     preferences,
+    capabilities,
     system,
     onPreferences,
   }: {
     user: User;
     csrf: string;
     preferences: UserPreferences;
+    capabilities: Capabilities;
     system: { thumbnails: boolean; editor: boolean; terminal: boolean };
     onPreferences: (preferences: UserPreferences) => void;
   } = $props();
@@ -154,7 +156,7 @@
         />
       </div>
     {/if}
-    {#if system.terminal}
+    {#if system.terminal && capabilities.terminal}
       <div class="pref-row">
         <span>{t($language, '启用终端')}</span>
         <input

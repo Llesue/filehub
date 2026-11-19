@@ -273,7 +273,7 @@ pub(crate) async fn thumbnail_response(
                         Err(ThumbError::Cancelled) => Err(AppError::Cancelled),
                         Err(ThumbError::Failed { reason, message }) => {
                             if let Some(parent) = job_failure_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                                let _ = crate::platform::create_private_dir_all(parent);
                             }
                             let record = json!({
                                 "reason": reason,
@@ -281,7 +281,10 @@ pub(crate) async fn thumbnail_response(
                                 "version": 4,
                                 "at": crate::db::unix_now(),
                             });
-                            let _ = std::fs::write(&job_failure_path, record.to_string());
+                            let _ = crate::platform::write_private_file(
+                                &job_failure_path,
+                                record.to_string().as_bytes(),
+                            );
                             tracing::warn!(
                                 path = %job_log_source.display(),
                                 width,
@@ -613,10 +616,10 @@ fn generate_thumbnail(
         .encode_image(&rgb)
         .map_err(|error| ThumbError::failed("encode", format!("JPEG encode failed: {error}")))?;
 
-    std::fs::create_dir_all(cache_path.parent().unwrap_or(cache_dir)).map_err(|error| {
-        ThumbError::failed("io", format!("failed to create cache dir: {error}"))
-    })?;
-    std::fs::write(cache_path, &encoded)
+    crate::platform::create_private_dir_all(cache_path.parent().unwrap_or(cache_dir)).map_err(
+        |error| ThumbError::failed("io", format!("failed to create cache dir: {error}")),
+    )?;
+    crate::platform::write_private_file(cache_path, &encoded)
         .map_err(|error| ThumbError::failed("io", format!("failed to write cache: {error}")))?;
     Ok(encoded)
 }
@@ -1028,7 +1031,7 @@ pub(crate) async fn clear_failure_records(cache_dir: &Path) {
 
 async fn write_failure_record(path: &Path, reason: &str, message: &str) {
     if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        let _ = crate::platform::create_private_dir_all(parent);
     }
     let record = json!({
         "reason": reason,
@@ -1036,7 +1039,7 @@ async fn write_failure_record(path: &Path, reason: &str, message: &str) {
         "version": 4,
         "at": crate::db::unix_now(),
     });
-    let _ = tokio::fs::write(path, record.to_string()).await;
+    let _ = crate::platform::write_private_file(path, record.to_string().as_bytes());
 }
 
 fn settings_edge(state: &AppState) -> u32 {

@@ -810,3 +810,160 @@ async fn revoked_share_reports_gone_instead_of_not_found() {
     .await;
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writable_share_never_writes_through_symlink_leaf() {
+    let app = setup_app().await;
+    let token = create_share(&app, "pub", false, None).await;
+    let outside = app._dir.path().join("outside.txt");
+    std::os::unix::fs::symlink(&outside, app.home.join("pub/dangling.txt")).unwrap();
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/public/shares/{token}/upload?path=&filename=dangling.txt"
+                ))
+                .body(Body::from("pwned".as_bytes().to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["name"], "dangling (2).txt");
+    assert!(!outside.exists(), "upload escaped through dangling symlink");
+    assert!(
+        std::fs::symlink_metadata(app.home.join("pub/dangling.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(app.home.join("pub/dangling (2).txt")).unwrap(),
+        b"pwned"
+    );
+
+    let outside_chunked = app._dir.path().join("outside-chunked.bin");
+    std::os::unix::fs::symlink(&outside_chunked, app.home.join("pub/chunked.txt")).unwrap();
+    let created = send_json(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/public/shares/{token}/uploads"),
+        None,
+        None,
+        json!({"path": "", "filename": "chunked.txt", "total_size": 3, "chunk_size": 3}),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let upload_id = json_body(created).await["upload_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let chunk = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!(
+                    "/api/v1/public/shares/{token}/uploads/{upload_id}/chunks/0"
+                ))
+                .body(Body::from(b"abc".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunk.status(), StatusCode::OK);
+    let complete = send_json(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/public/shares/{token}/uploads/{upload_id}/complete"),
+        None,
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(complete.status(), StatusCode::OK);
+    assert_eq!(json_body(complete).await["name"], "chunked (2).txt");
+    assert!(
+        !outside_chunked.exists(),
+        "chunked upload escaped through dangling symlink"
+    );
+    assert_eq!(
+        std::fs::read(app.home.join("pub/chunked (2).txt")).unwrap(),
+        b"abc"
+    );
+}
+
+#[tokio::test]
+async fn public_share_zip_respects_owner_feature_toggle() {
+    let app = setup_app().await;
+    let token = create_share(&app, "pub", true, None).await;
+
+    let preflight = send_json(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/public/shares/{token}/zip/preflight"),
+        None,
+        None,
+        json!({"path": ""}),
+    )
+    .await;
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(json_body(preflight).await["allowed"], true);
+
+    let disabled = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/admin/users/{}", 1),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"feature_zip": false}),
+    )
+    .await;
+    assert_eq!(disabled.status(), StatusCode::OK);
+
+    let preflight = send_json(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/public/shares/{token}/zip/preflight"),
+        None,
+        None,
+        json!({"path": ""}),
+    )
+    .await;
+    assert_eq!(preflight.status(), StatusCode::OK);
+    let body = json_body(preflight).await;
+    assert_eq!(body["allowed"], false);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("disabled")
+    );
+
+    let zip = send_json(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/public/shares/{token}/zip"),
+        None,
+        None,
+        json!({"path": ""}),
+    )
+    .await;
+    assert_eq!(zip.status(), StatusCode::FORBIDDEN);
+
+    let meta = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{token}?path="),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(json_body(meta).await["zip_allowed"], false);
+}

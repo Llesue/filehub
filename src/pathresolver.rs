@@ -93,6 +93,13 @@ fn resolve_sync(root: Root, path: &str, require_write: bool) -> Result<ResolvedP
         }
         canonical
     } else {
+        // exists() follows symlinks, so a dangling symlink looks absent here.
+        // Never hand back a symlink leaf: callers may write through it.
+        if let Ok(metadata) = std::fs::symlink_metadata(&candidate)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(AppError::invalid_path("path is a symbolic link"));
+        }
         let parent = candidate
             .parent()
             .ok_or_else(|| AppError::invalid_path("path has no parent"))?;

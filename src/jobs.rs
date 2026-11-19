@@ -19,6 +19,9 @@ pub enum JobKind {
     Move,
     Index,
     Thumbnail,
+    Archive,
+    Unzip,
+    MediaTranscode,
 }
 
 impl JobKind {
@@ -29,6 +32,9 @@ impl JobKind {
             Self::Move => "move",
             Self::Index => "index",
             Self::Thumbnail => "thumbnail",
+            Self::Archive => "archive",
+            Self::Unzip => "unzip",
+            Self::MediaTranscode => "media_transcode",
         }
     }
 
@@ -39,6 +45,9 @@ impl JobKind {
             "move" => Some(Self::Move),
             "index" => Some(Self::Index),
             "thumbnail" => Some(Self::Thumbnail),
+            "archive" => Some(Self::Archive),
+            "unzip" => Some(Self::Unzip),
+            "media_transcode" => Some(Self::MediaTranscode),
             _ => None,
         }
     }
@@ -179,6 +188,8 @@ fn job_label(kind: JobKind, payload: &Value) -> String {
             .to_owned(),
         JobKind::DirSize => text("real_path").unwrap_or_default().to_owned(),
         JobKind::Thumbnail => text("source").unwrap_or_default().to_owned(),
+        JobKind::Archive | JobKind::Unzip => text("name").unwrap_or_default().to_owned(),
+        JobKind::MediaTranscode => text("path").unwrap_or_default().to_owned(),
     }
 }
 
@@ -297,8 +308,15 @@ impl JobManager {
         }
 
         let label = job_label(kind, &payload);
-        let notify_failure = matches!(kind, JobKind::Copy | JobKind::Move | JobKind::Index)
-            && payload.get("auto").and_then(Value::as_bool) != Some(true);
+        let notify_failure = matches!(
+            kind,
+            JobKind::Copy
+                | JobKind::Move
+                | JobKind::Index
+                | JobKind::Archive
+                | JobKind::Unzip
+                | JobKind::MediaTranscode
+        ) && payload.get("auto").and_then(Value::as_bool) != Some(true);
         let id = format!("job_{}", crate::auth::random_token(12));
         let now = unix_now();
         let record = JobRecord {

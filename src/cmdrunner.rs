@@ -1,4 +1,3 @@
-use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +25,19 @@ pub struct CmdRequest {
     cwd: Option<String>,
     line: String,
     confirm: Option<bool>,
+    confirm_code: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfirmPrompt {
+    pub prompt: String,
+    pub code: String,
+    pub expires_at: i64,
+}
+
+pub enum ExecOutcome {
+    Output(String),
+    Confirm(ConfirmPrompt),
 }
 
 pub async fn run(
@@ -35,34 +47,40 @@ pub async fn run(
 ) -> Result<Json<Value>, AppError> {
     let current = auth::current_user(&state, &headers).await?;
     auth::require_csrf(&current, &headers)?;
-    let preferences = state
-        .db
-        .get_user_preferences(current.user.id)
-        .await
-        .map_err(AppError::internal)?;
-    if !state.settings().settings.terminal_enabled || !preferences.terminal_enabled {
-        return Err(AppError::Forbidden);
-    }
+    crate::capabilities::require_terminal(&state, &current.user).await?;
     let root = load_root(&state, current.user.id, request.root).await?;
     let cwd = request.cwd.unwrap_or_default();
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        execute(
-            &state,
-            current.user.id,
-            root,
-            cwd,
-            request.line,
-            request.confirm.unwrap_or(false),
-            &headers,
-        ),
-    )
-    .await
-    .map_err(|_| AppError::bad_request("command timed out"))??;
+    let long = is_long_command(&request.line);
+    let future = execute(
+        &state,
+        current.user.id,
+        root,
+        cwd,
+        request.line,
+        request.confirm.unwrap_or(false),
+        request.confirm_code,
+        &headers,
+    );
+    let outcome = if long {
+        future.await?
+    } else {
+        tokio::time::timeout(Duration::from_secs(60), future)
+            .await
+            .map_err(|_| AppError::bad_request("command timed out"))??
+    };
 
-    Ok(Json(json!({ "output": output })))
+    Ok(match outcome {
+        ExecOutcome::Output(output) => Json(json!({ "output": output })),
+        ExecOutcome::Confirm(prompt) => Json(json!({ "output": "", "confirm": prompt })),
+    })
 }
 
+pub(crate) fn is_long_command(line: &str) -> bool {
+    let command = line.split_whitespace().next().unwrap_or_default();
+    matches!(command, "rm" | "cp" | "mv" | "zip" | "unzip")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute(
     state: &Arc<AppState>,
     user_id: i64,
@@ -70,14 +88,33 @@ pub(crate) async fn execute(
     cwd: String,
     line: String,
     confirm: bool,
+    confirm_code: Option<String>,
     headers: &HeaderMap,
-) -> Result<String, AppError> {
+) -> Result<ExecOutcome, AppError> {
+    let user = state
+        .db
+        .find_user_by_id(user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::Unauthorized)?;
     let tokens = tokenize(&line)?;
     let Some(command) = tokens.first() else {
         return Err(AppError::bad_request("empty command"));
     };
     let (mut flags, mut args) = split_args(&tokens[1..]);
     let command = command.as_str();
+
+    if command == "help" {
+        return Ok(ExecOutcome::Output(help_text(
+            args.first().map(String::as_str),
+        )));
+    }
+    if tokens[1..]
+        .iter()
+        .any(|token| token == "-h" || token == "--help")
+    {
+        return Ok(ExecOutcome::Output(help_text(Some(command))));
+    }
 
     let output = match command {
         "pwd" => {
@@ -139,7 +176,12 @@ pub(crate) async fn execute(
             } else {
                 args.clone()
             };
+            let multiple = paths.len() > 1;
             let mut lines = Vec::new();
+            let mut total_dirs = 0_usize;
+            let mut total_files = 0_usize;
+            let mut total_bytes = 0_u64;
+            let mut total_unknown = 0_usize;
             for path in paths {
                 let resolved =
                     authz::resolve(state, user_id, root.id, &join(&cwd, &path), false).await?;
@@ -149,13 +191,113 @@ pub(crate) async fn execute(
                 })
                 .await
                 .map_err(|err| AppError::internal(anyhow::anyhow!("ls task failed: {err}")))??;
-                for entry in entries {
-                    lines.push(if entry.is_dir {
-                        format!("{}/", entry.name)
-                    } else {
-                        entry.name
-                    });
+                let dir_paths: Vec<String> = entries
+                    .iter()
+                    .filter(|entry| entry.is_dir)
+                    .map(|entry| {
+                        resolved
+                            .absolute
+                            .join(&entry.name)
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                    .collect();
+                let dir_stats = if dir_paths.is_empty() {
+                    std::collections::HashMap::new()
+                } else {
+                    state
+                        .db
+                        .dir_index_stats(dir_paths)
+                        .await
+                        .map_err(AppError::internal)?
+                };
+                if multiple {
+                    lines.push(format!(
+                        "{}:",
+                        if resolved.relative.is_empty() {
+                            "/".to_owned()
+                        } else {
+                            format!("/{}", resolved.relative)
+                        }
+                    ));
                 }
+                lines.push(format!("{:>9}  {:16}  {}", "SIZE", "MODIFIED", "NAME"));
+                let mut dirs = 0_usize;
+                let mut files = 0_usize;
+                let mut bytes = 0_u64;
+                let mut unknown = 0_usize;
+                for entry in entries {
+                    let stat = if entry.is_dir {
+                        dir_stats.get(
+                            &resolved
+                                .absolute
+                                .join(&entry.name)
+                                .to_string_lossy()
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    };
+                    let size = if entry.is_dir {
+                        stat.and_then(|value| value.size)
+                    } else {
+                        Some(entry.size.max(0) as u64)
+                    };
+                    if let Some(size) = size {
+                        bytes = bytes.saturating_add(size);
+                        if entry.is_dir {
+                            dirs += 1;
+                        } else {
+                            files += 1;
+                        }
+                        lines.push(format!(
+                            "{:>9}  {:16}  {}{}",
+                            format_size(size),
+                            format_local_time(entry.modified),
+                            entry.name,
+                            if entry.is_dir { "/" } else { "" }
+                        ));
+                    } else {
+                        unknown += 1;
+                        dirs += 1;
+                        lines.push(format!(
+                            "{:>9}  {:16}  {}/",
+                            "-",
+                            format_local_time(entry.modified),
+                            entry.name
+                        ));
+                    }
+                }
+                let suffix = if unknown > 0 {
+                    format!("（{unknown} 个目录大小未知）")
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "{} 个目录，{} 个文件，共计 {}{}",
+                    dirs,
+                    files,
+                    format_size(bytes),
+                    suffix
+                ));
+                total_dirs += dirs;
+                total_files += files;
+                total_bytes = total_bytes.saturating_add(bytes);
+                total_unknown += unknown;
+            }
+            if multiple {
+                let suffix = if total_unknown > 0 {
+                    format!("（{total_unknown} 个目录大小未知）")
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "全部：{} 个目录，{} 个文件，共计 {}{}",
+                    total_dirs,
+                    total_files,
+                    format_size(total_bytes),
+                    suffix
+                ));
             }
             truncate(lines.join("\n"))
         }
@@ -164,6 +306,9 @@ pub(crate) async fn execute(
             for path in args {
                 let resolved =
                     authz::resolve(state, user_id, root.id, &join(&cwd, &path), true).await?;
+                if std::fs::symlink_metadata(&resolved.absolute).is_err() {
+                    crate::usage::ensure_entry_capacity(state, &user, 1).await?;
+                }
                 let absolute = resolved.absolute.clone();
                 tokio::task::spawn_blocking(move || {
                     if recursive {
@@ -175,6 +320,7 @@ pub(crate) async fn execute(
                 .await
                 .map_err(|err| AppError::internal(anyhow::anyhow!("mkdir task failed: {err}")))?
                 .map_err(io_error)?;
+                state.adjust_entries(user_id, 1);
             }
             String::new()
         }
@@ -182,53 +328,136 @@ pub(crate) async fn execute(
             for path in args {
                 let resolved =
                     authz::resolve(state, user_id, root.id, &join(&cwd, &path), true).await?;
+                match std::fs::symlink_metadata(&resolved.absolute) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(AppError::invalid_path(
+                            "touch does not follow symbolic links",
+                        ));
+                    }
+                    Ok(_) => continue,
+                    Err(_) => {}
+                }
+                crate::usage::ensure_entry_capacity(state, &user, 1).await?;
                 let absolute = resolved.absolute.clone();
-                tokio::task::spawn_blocking(move || {
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(absolute)
-                        .map(|_| ())
-                })
-                .await
-                .map_err(|err| AppError::internal(anyhow::anyhow!("touch task failed: {err}")))?
-                .map_err(io_error)?;
+                tokio::task::spawn_blocking(move || fsops::touch_file(&absolute))
+                    .await
+                    .map_err(|err| {
+                        AppError::internal(anyhow::anyhow!("touch task failed: {err}"))
+                    })??;
+                state.adjust_entries(user_id, 1);
             }
             String::new()
         }
         "rm" => {
-            if !flags.contains(&'y') && !confirm {
-                return Err(AppError::ConfirmRequired);
-            }
             if args.is_empty() {
                 return Err(AppError::bad_request("rm requires a path"));
             }
             let recursive = flags.contains(&'r');
             let paths = expand_sources(state, user_id, &root, &cwd, args, true).await?;
-            for path in paths {
+            let mut items = Vec::with_capacity(paths.len());
+            for path in &paths {
                 let resolved =
-                    authz::resolve(state, user_id, root.id, &join(&cwd, &path), true).await?;
+                    authz::resolve(state, user_id, root.id, &join(&cwd, path), true).await?;
+                if resolved.relative.is_empty() {
+                    return Err(AppError::invalid_path(
+                        "the root directory cannot be removed",
+                    ));
+                }
+                let metadata = std::fs::symlink_metadata(&resolved.absolute)
+                    .map_err(|_| AppError::NotFound)?;
+                let is_dir = metadata.is_dir() && !metadata.file_type().is_symlink();
+                if is_dir && !recursive {
+                    return Err(AppError::bad_request("directory requires -r"));
+                }
+                let size = if metadata.is_file() {
+                    metadata.len()
+                } else {
+                    0
+                };
+                items.push((resolved, is_dir, size));
+            }
+            let candidates: Vec<(bool, u64)> = items
+                .iter()
+                .map(|(_, is_dir, size)| (*is_dir, *size))
+                .collect();
+            let needs_code = crate::files::delete_requires_code(&candidates);
+            if needs_code {
+                let key = format!("{user_id}:{}:{cwd}", root.id);
+                let targets: Vec<String> = items
+                    .iter()
+                    .map(|(item, _, _)| item.relative.clone())
+                    .collect();
+                if let Some(code) = confirm_code.as_deref() {
+                    let mut pending = state.cmd_confirmations.lock();
+                    let Some(entry) = pending.get_mut(&key) else {
+                        return Err(AppError::bad_request(
+                            "confirmation code is missing or expired",
+                        ));
+                    };
+                    if entry.expires_at <= crate::db::unix_now() {
+                        pending.remove(&key);
+                        return Err(AppError::bad_request("confirmation code has expired"));
+                    }
+                    if entry.targets != targets {
+                        pending.remove(&key);
+                        return Err(AppError::bad_request("confirmation targets have changed"));
+                    }
+                    if !auth::constant_time_eq(&entry.code, code) {
+                        entry.attempts = entry.attempts.saturating_add(1);
+                        let attempts = entry.attempts;
+                        if attempts >= 3 {
+                            pending.remove(&key);
+                        }
+                        return Err(AppError::bad_request("invalid confirmation code"));
+                    }
+                    pending.remove(&key);
+                } else {
+                    let random = auth::sha256_hex(&auth::random_token(8));
+                    let code = format!(
+                        "{:04}",
+                        u32::from_str_radix(&random[..8], 16).unwrap_or_default() % 10_000
+                    );
+                    let expires_at = crate::db::unix_now() + 60;
+                    state.cmd_confirmations.lock().insert(
+                        key,
+                        crate::state::CmdConfirmation {
+                            user_id,
+                            root_id: root.id,
+                            cwd: cwd.clone(),
+                            code: code.clone(),
+                            targets,
+                            expires_at,
+                            attempts: 0,
+                        },
+                    );
+                    return Ok(ExecOutcome::Confirm(ConfirmPrompt {
+                        prompt: format!(
+                            "高危删除：将删除 {} 项。请输入验证码 {code} 确认（60 秒内有效）",
+                            items.len()
+                        ),
+                        code,
+                        expires_at,
+                    }));
+                }
+            } else if !flags.contains(&'y') && !confirm {
+                return Err(AppError::ConfirmRequired);
+            }
+            let mut cache_targets = Vec::with_capacity(items.len());
+            for (resolved, _, _) in &items {
                 let absolute = resolved.absolute.clone();
                 let relative = resolved.relative.clone();
-                tokio::task::spawn_blocking(move || {
-                    let metadata = std::fs::symlink_metadata(&absolute)?;
-                    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                        if !recursive {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::IsADirectory,
-                                "directory requires -r",
-                            ));
-                        }
-                        std::fs::remove_dir_all(&absolute)
-                    } else {
-                        std::fs::remove_file(&absolute)
-                    }
-                })
-                .await
-                .map_err(|err| AppError::internal(anyhow::anyhow!("rm task failed: {err}")))?
-                .map_err(io_error)?;
-                let _ = (relative,);
+                tokio::task::spawn_blocking(move || fsops::remove_path(&absolute, &relative))
+                    .await
+                    .map_err(|err| {
+                        AppError::internal(anyhow::anyhow!("rm task failed: {err}"))
+                    })??;
+                cache_targets.push(resolved.absolute.clone());
             }
+            state
+                .invalidate_paths_exact(&cache_targets, Some(user_id))
+                .await;
+            state.schedule_cache_cleanup(cache_targets);
+            state.adjust_entries(user_id, -(items.len() as i64));
             String::new()
         }
         "cp" => {
@@ -245,21 +474,42 @@ pub(crate) async fn execute(
                     "cp with multiple sources requires a directory destination",
                 ));
             }
+            let mut wanted = 0_u64;
+            for source in &sources {
+                let resolved =
+                    authz::resolve(state, user_id, root.id, &join(&cwd, source), false).await?;
+                wanted =
+                    wanted.saturating_add(fsops::count_entries_limited(&resolved.absolute, 10_000));
+            }
+            crate::usage::ensure_entry_capacity(state, &user, wanted).await?;
             for source in sources {
                 let source =
                     authz::resolve(state, user_id, root.id, &join(&cwd, &source), false).await?;
+                if source.relative.is_empty() {
+                    return Err(AppError::invalid_path(
+                        "the root directory cannot be copied",
+                    ));
+                }
                 let target = if dest.absolute.is_dir() {
                     dest.absolute
                         .join(source.absolute.file_name().unwrap_or_default())
                 } else {
                     dest.absolute.clone()
                 };
+                if source.absolute.is_dir()
+                    && (target == source.absolute || target.starts_with(&source.absolute))
+                {
+                    return Err(AppError::invalid_path(
+                        "cannot copy a directory into itself",
+                    ));
+                }
                 let source_path = source.absolute.clone();
                 tokio::task::spawn_blocking(move || copy_path(&source_path, &target, recursive))
                     .await
                     .map_err(|err| AppError::internal(anyhow::anyhow!("cp task failed: {err}")))?
                     .map_err(io_error)?;
             }
+            state.adjust_entries(user_id, wanted as i64);
             String::new()
         }
         "mv" => {
@@ -278,12 +528,22 @@ pub(crate) async fn execute(
             for source in sources {
                 let source =
                     authz::resolve(state, user_id, root.id, &join(&cwd, &source), true).await?;
+                if source.relative.is_empty() {
+                    return Err(AppError::invalid_path("the root directory cannot be moved"));
+                }
                 let target = if dest.absolute.is_dir() {
                     dest.absolute
                         .join(source.absolute.file_name().unwrap_or_default())
                 } else {
                     dest.absolute.clone()
                 };
+                if source.absolute.is_dir()
+                    && (target == source.absolute || target.starts_with(&source.absolute))
+                {
+                    return Err(AppError::invalid_path(
+                        "cannot move a directory into itself",
+                    ));
+                }
                 let source_path = source.absolute.clone();
                 tokio::task::spawn_blocking(move || move_path(&source_path, &target))
                     .await
@@ -302,6 +562,7 @@ pub(crate) async fn execute(
                 return Err(AppError::NotFound);
             }
             let link = authz::resolve(state, user_id, root.id, &join(&cwd, &args[1]), true).await?;
+            crate::usage::ensure_entry_capacity(state, &user, 1).await?;
             let target_path = target.absolute.clone();
             let link_path = link.absolute.clone();
             let symlink = flags.contains(&'s');
@@ -315,7 +576,206 @@ pub(crate) async fn execute(
             .await
             .map_err(|err| AppError::internal(anyhow::anyhow!("ln task failed: {err}")))?
             .map_err(io_error)?;
+            state.adjust_entries(user_id, 1);
             String::new()
+        }
+        "job" | "jobs" => {
+            let jobs = state
+                .jobs
+                .list_for_user(user_id, 0)
+                .await
+                .map_err(AppError::internal)?;
+            match args.first().map(String::as_str) {
+                Some(id) if id.starts_with("job_") => {
+                    let Some(job) = state.jobs.get(id).await.map_err(AppError::internal)? else {
+                        return Err(AppError::NotFound);
+                    };
+                    if job.user_id != user_id {
+                        return Err(AppError::NotFound);
+                    }
+                    format_job_detail(&job)
+                }
+                Some(limit) => {
+                    let limit: usize = limit
+                        .parse()
+                        .map_err(|_| AppError::bad_request("job expects a count or job id"))?;
+                    format_job_list(
+                        &jobs
+                            .into_iter()
+                            .take(limit.clamp(1, 50))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                None => format_job_list(&jobs.into_iter().take(10).collect::<Vec<_>>()),
+            }
+        }
+        "zip" => {
+            if args.len() < 2 {
+                return Err(AppError::bad_request(
+                    "zip requires an archive name and at least one source",
+                ));
+            }
+            crate::capabilities::require_zip(state, &user).await?;
+            let recursive = flags.contains(&'r');
+            let mut name = args.remove(0);
+            if !name.to_ascii_lowercase().ends_with(".zip") {
+                name.push_str(".zip");
+            }
+            if name.contains('/') || name.contains('\\') || name.contains('\0') {
+                return Err(AppError::invalid_path("invalid archive name"));
+            }
+            let name = crate::files::validate_filename(&name)?;
+            let sources = expand_sources(state, user_id, &root, &cwd, args, false).await?;
+            if sources.is_empty() {
+                return Err(AppError::bad_request("no sources to archive"));
+            }
+            let base = if cwd.is_empty() {
+                String::new()
+            } else {
+                format!("{cwd}/")
+            };
+            let mut names = Vec::with_capacity(sources.len());
+            for source in &sources {
+                let resolved =
+                    authz::resolve(state, user_id, root.id, &join(&cwd, source), false).await?;
+                if resolved.relative.is_empty() {
+                    return Err(AppError::invalid_path("cannot archive the root directory"));
+                }
+                if resolved.absolute.is_dir() && !recursive {
+                    return Err(AppError::bad_request("directory requires -r"));
+                }
+                let relative = resolved
+                    .relative
+                    .strip_prefix(&base)
+                    .ok_or_else(|| {
+                        AppError::invalid_path("source is outside the current directory")
+                    })?
+                    .to_owned();
+                if relative.is_empty() {
+                    return Err(AppError::invalid_path("invalid archive source"));
+                }
+                names.push(relative);
+            }
+            let outcome = crate::files::submit_zip_job(
+                state,
+                user_id,
+                root.id,
+                cwd.clone(),
+                names,
+                name.clone(),
+                sources.len(),
+            )
+            .await?;
+            format!(
+                "queued archive job {}: {}\nuse `job` to check progress",
+                outcome.job.id, name
+            )
+        }
+        "unzip" => {
+            crate::capabilities::require_unzip(state, &user).await?;
+            let mut archive = None;
+            let mut target = None;
+            let mut rest = tokens[1..].iter();
+            while let Some(token) = rest.next() {
+                if token == "-d" {
+                    target = Some(
+                        rest.next()
+                            .cloned()
+                            .ok_or_else(|| AppError::bad_request("unzip -d requires a target"))?,
+                    );
+                } else if archive.is_none() {
+                    archive = Some(token.clone());
+                } else {
+                    return Err(AppError::bad_request("unzip takes one archive"));
+                }
+            }
+            let archive =
+                archive.ok_or_else(|| AppError::bad_request("unzip requires an archive"))?;
+            let archive_resolved =
+                authz::resolve(state, user_id, root.id, &join(&cwd, &archive), false).await?;
+            if !archive_resolved.absolute.is_file() {
+                return Err(AppError::NotFound);
+            }
+            let (target_relative, existing) = if let Some(target) = target {
+                if target == "." {
+                    (cwd.clone(), true)
+                } else {
+                    let resolved =
+                        authz::resolve(state, user_id, root.id, &join(&cwd, &target), true).await?;
+                    let exists = std::fs::symlink_metadata(&resolved.absolute).is_ok();
+                    if exists && !resolved.absolute.is_dir() {
+                        return Err(AppError::bad_request("target is a file, not a directory"));
+                    }
+                    (resolved.relative, exists)
+                }
+            } else {
+                let file_name = archive_resolved
+                    .absolute
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| AppError::invalid_path("invalid archive name"))?;
+                let stem = file_name
+                    .strip_suffix(".zip")
+                    .or_else(|| file_name.strip_suffix(".ZIP"))
+                    .unwrap_or(file_name);
+                let parent = archive_resolved
+                    .relative
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_owned())
+                    .unwrap_or_default();
+                let target = if parent.is_empty() {
+                    stem.to_owned()
+                } else {
+                    format!("{parent}/{stem}")
+                };
+                let resolved = authz::resolve(state, user_id, root.id, &target, true).await?;
+                (resolved.relative, false)
+            };
+            if existing {
+                let archive_path = archive_resolved.absolute.clone();
+                let target_path = authz::resolve(state, user_id, root.id, &target_relative, true)
+                    .await?
+                    .absolute;
+                tokio::task::spawn_blocking(move || {
+                    crate::unzip::ensure_no_conflicts(&archive_path, &target_path)
+                })
+                .await
+                .map_err(|err| {
+                    AppError::internal(anyhow::anyhow!("unzip preflight task failed: {err}"))
+                })??;
+            }
+            let outcome = crate::unzip::submit_unzip_job(
+                state,
+                user_id,
+                root.id,
+                archive_resolved.relative,
+                target_relative.clone(),
+                existing,
+                target_relative.clone(),
+            )
+            .await?;
+            let job = state
+                .jobs
+                .wait_for(&outcome.job.id)
+                .await
+                .ok_or(AppError::NotFound)?;
+            match job.status.as_str() {
+                "completed" => {
+                    let path = job
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("path"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&target_relative);
+                    format!("extracted to {path}")
+                }
+                "cancelled" => return Err(AppError::Cancelled),
+                _ => {
+                    return Err(AppError::bad_request(
+                        job.error.unwrap_or_else(|| "unzip failed".to_owned()),
+                    ));
+                }
+            }
         }
         _ => {
             return Err(AppError::bad_request(format!(
@@ -325,7 +785,93 @@ pub(crate) async fn execute(
     };
 
     audit(state, user_id, &line, &cwd, headers).await;
-    Ok(truncate(output))
+    Ok(ExecOutcome::Output(truncate(output)))
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0_usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_local_time(seconds: i64) -> String {
+    let Ok(utc) = time::OffsetDateTime::from_unix_timestamp(seconds) else {
+        return "-".to_owned();
+    };
+    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let local = utc.to_offset(offset);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        local.year(),
+        u8::from(local.month()),
+        local.day(),
+        local.hour(),
+        local.minute()
+    )
+}
+
+fn help_text(command: Option<&str>) -> String {
+    let overview = "Available commands:
+  pwd       print the current directory
+  cd        change directory
+  ls        list entries
+  tree      show a directory tree
+  mkdir     create directories
+  touch     create empty files
+  rm        remove files/directories
+  cp        copy files/directories
+  mv        move/rename files/directories
+  ln        create hard/symbolic links
+  zip       create a ZIP archive
+  unzip     extract a ZIP archive
+  job       list background jobs
+  help      show help
+
+Run `help <command>` or `<command> -h` for details.";
+    let Some(command) = command else {
+        return overview.to_owned();
+    };
+    let text = match command {
+        "pwd" => "pwd\n\nPrint the current directory.",
+        "cd" => "cd <path>\n\nChange the current directory. `cd` or `cd /` returns to the root.",
+        "ls" => {
+            "ls [-l] [-a] [path]\n\nList entries. -l shows size and modified time, -a includes hidden entries."
+        }
+        "tree" => "tree [path]\n\nShow a directory tree (depth and output are capped).",
+        "mkdir" => "mkdir [-p] <path>...\n\nCreate directories. -p creates missing parents.",
+        "touch" => {
+            "touch <path>...\n\nCreate empty files. Existing files and symbolic links are not modified."
+        }
+        "rm" => {
+            "rm [-r] [-y] <path>...\n\nRemove files. Directories require -r. -y skips the simple y/N confirmation.\nHigh-risk deletions always require a 4-digit code: any directory, more than 5 items, or more than 10 MiB."
+        }
+        "cp" => {
+            "cp [-r] <source>... <destination>\n\nCopy files or directories. Directories require -r."
+        }
+        "mv" => "mv <source>... <destination>\n\nMove or rename files and directories.",
+        "ln" => "ln [-s] <target> <link>\n\nCreate a hard link, or a symbolic link with -s.",
+        "zip" => {
+            "zip [-r] <archive.zip> <source>...\n\nCreate a background ZIP job in the current directory. Directories require -r. Existing archives get a numeric suffix."
+        }
+        "unzip" => {
+            "unzip <archive.zip> [-d <target>]\n\nExtract a ZIP archive. Without -d it creates a directory named after the archive. Encrypted archives and symbolic-link entries are rejected."
+        }
+        "job" => {
+            "job [count | job_id]\njobs [count | job_id]\n\nList recent background jobs or show one job."
+        }
+        "help" => "help [command]\n\nShow the command list or help for one command.",
+        _ => return format!("unknown command: {command}"),
+    };
+    text.to_owned()
 }
 
 fn split_args(args: &[String]) -> (std::collections::HashSet<char>, Vec<String>) {
@@ -341,6 +887,65 @@ fn split_args(args: &[String]) -> (std::collections::HashSet<char>, Vec<String>)
         }
     }
     (flags, paths)
+}
+
+fn format_job_list(jobs: &[crate::jobs::Job]) -> String {
+    if jobs.is_empty() {
+        return "no jobs".to_owned();
+    }
+    jobs.iter()
+        .map(format_job_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_job_line(job: &crate::jobs::Job) -> String {
+    let progress = if job.total > 0 {
+        format!("{}/{}", job.progress, job.total)
+    } else {
+        String::new()
+    };
+    let bytes = if job.bytes_total > 0 {
+        format!("  {}/{}", job.bytes_done, job.bytes_total)
+    } else {
+        String::new()
+    };
+    format!(
+        "{}  {}  {}  {}{}{}",
+        job.id,
+        job.kind,
+        job.status,
+        progress,
+        bytes,
+        job.error
+            .as_deref()
+            .map(|error| format!("  {error}"))
+            .unwrap_or_default()
+    )
+}
+
+fn format_job_detail(job: &crate::jobs::Job) -> String {
+    let mut lines = vec![
+        format!("id: {}", job.id),
+        format!("kind: {}", job.kind),
+        format!("status: {}", job.status),
+        format!("progress: {}/{}", job.progress, job.total),
+        format!("bytes: {}/{}", job.bytes_done, job.bytes_total),
+        format!("created: {}", job.created_at),
+    ];
+    if let Some(started) = job.started_at {
+        lines.push(format!("started: {started}"));
+    }
+    if let Some(finished) = job.finished_at {
+        lines.push(format!("finished: {finished}"));
+    }
+    if let Some(error) = job.error.as_deref() {
+        lines.push(format!("error: {error}"));
+    }
+    if let Some(result) = job.result.as_ref() {
+        lines.push(format!("result: {result}"));
+    }
+    lines.join("\n")
 }
 
 async fn expand_sources(
@@ -375,8 +980,14 @@ async fn expand_sources(
         })
         .await
         .map_err(|err| AppError::internal(anyhow::anyhow!("glob task failed: {err}")))??;
+        let include_hidden = pattern.starts_with('.');
+        let mut matched = 0_usize;
         for entry in entries {
+            if !include_hidden && entry.name.starts_with('.') {
+                continue;
+            }
             if matcher.is_match(&entry.name) {
+                matched += 1;
                 result.push(if parent.is_empty() {
                     entry.name
                 } else {
@@ -386,6 +997,9 @@ async fn expand_sources(
                     return Err(AppError::bad_request("too many wildcard matches"));
                 }
             }
+        }
+        if matched == 0 {
+            return Err(AppError::bad_request(format!("no matches: {arg}")));
         }
     }
     Ok(result)

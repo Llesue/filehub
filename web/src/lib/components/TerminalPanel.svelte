@@ -26,6 +26,8 @@
   let lines = $state<Line[]>([]);
   let busy = $state(false);
   let pendingDelete = $state<string | null>(null);
+  let pendingCode = $state<string | null>(null);
+  let pendingCodeLine = $state<string | null>(null);
   let inputElement = $state<HTMLInputElement | null>(null);
   let socket = $state<WebSocket | null>(null);
   let connected = $state(false);
@@ -89,6 +91,7 @@
   type ServerMessage =
     | { type: 'ready'; cwd: string }
     | { type: 'result'; output: string; cwd: string }
+    | { type: 'confirm'; prompt: string; code: string; expires_at: number }
     | { type: 'error'; message: string };
 
   function append(kind: Line['kind'], text: string): void {
@@ -127,8 +130,15 @@
       } else if (message.type === 'result') {
         if (message.output) append('output', message.output);
         workdir = message.cwd;
+        pendingCode = null;
+        pendingCodeLine = null;
         busy = false;
         onRefresh();
+        focusInput();
+      } else if (message.type === 'confirm') {
+        append('prompt', message.prompt);
+        pendingCode = message.code;
+        busy = false;
         focusInput();
       } else {
         append('error', message.message);
@@ -170,15 +180,31 @@
     offsetY = event.clientY - dragStart.y;
   }
 
-  function execute(line: string, confirm: boolean): void {
+  function execute(line: string, confirm: boolean, confirmCode?: string): void {
     busy = true;
-    if (!send({ type: 'exec', line, confirm })) busy = false;
+    pendingCodeLine = line;
+    if (!send({ type: 'exec', line, confirm, confirm_code: confirmCode })) busy = false;
   }
 
   async function run(): Promise<void> {
     const line = input.trim();
     if (!line || busy) return;
     input = '';
+
+    if (pendingCode) {
+      lines = [...lines, { kind: 'input', text: '$ ********' }];
+      const command = pendingCodeLine ?? '';
+      const code = line;
+      pendingCode = null;
+      if (!command) {
+        append('error', t($language, '确认状态已失效，请重新执行命令。'));
+        focusInput();
+        return;
+      }
+      execute(command, false, code);
+      return;
+    }
+
     lines = [...lines, { kind: 'input', text: `$ ${line}` }];
 
     if (line === 'exit' || line === 'quit') {
