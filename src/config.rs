@@ -138,7 +138,7 @@ impl Default for IndexSettings {
             max_entries_per_dir: 200_000,
             auto_index_on_browse: true,
             scheduled_scans: true,
-            quick_scan_minutes: 10,
+            quick_scan_minutes: 60,
             full_scan_hours: 24,
         }
     }

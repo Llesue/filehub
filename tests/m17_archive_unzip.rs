@@ -251,6 +251,20 @@ async fn run_cmd(app: &TestApp, line: &str, confirm_code: Option<&str>) -> (Stat
     (status, json_body(response).await)
 }
 
+async fn run_cmd_at(app: &TestApp, cwd: &str, line: &str) -> (StatusCode, Value) {
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/cmd",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "cwd": cwd, "line": line, "confirm": true}),
+    )
+    .await;
+    let status = response.status();
+    (status, json_body(response).await)
+}
+
 #[tokio::test]
 async fn terminal_help_zip_and_unzip() {
     let app = setup_app().await;
@@ -507,4 +521,95 @@ async fn archive_unzip_api_extracts_into_named_directory() {
     )
     .await;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn terminal_commands_workflow() {
+    let app = setup_app().await;
+    let ok = |status: StatusCode, body: &Value, label: &str| {
+        assert_eq!(status, StatusCode::OK, "{label}: {body}");
+    };
+
+    let (status, body) = run_cmd(&app, "pwd", None).await;
+    ok(status, &body, "pwd");
+    assert_eq!(body["output"], "/");
+
+    let (status, body) = run_cmd(&app, "mkdir termwork", None).await;
+    ok(status, &body, "mkdir");
+    let (status, body) = run_cmd(&app, "touch termwork/a.txt", None).await;
+    ok(status, &body, "touch");
+
+    let (status, body) = run_cmd(&app, "ls termwork", None).await;
+    ok(status, &body, "ls");
+    assert!(body["output"].as_str().unwrap().contains("a.txt"));
+    assert!(body["output"].as_str().unwrap().contains("\u{1b}["));
+
+    let (status, body) = run_cmd(&app, "cd termwork", None).await;
+    ok(status, &body, "cd");
+    assert_eq!(body["output"], "termwork");
+    let (status, body) = run_cmd_at(&app, "termwork", "pwd").await;
+    ok(status, &body, "pwd after cd");
+    assert_eq!(body["output"], "/termwork");
+
+    let (status, body) = run_cmd_at(&app, "termwork", "tree").await;
+    ok(status, &body, "tree");
+    assert!(body["output"].as_str().unwrap().contains("a.txt"));
+
+    let (status, body) = run_cmd_at(&app, "termwork", "cp a.txt b.txt").await;
+    ok(status, &body, "cp");
+    let (status, body) = run_cmd_at(&app, "termwork", "mv b.txt c.txt").await;
+    ok(status, &body, "mv");
+    assert!(app.home.join("termwork/c.txt").exists());
+
+    let (status, body) = run_cmd_at(&app, "termwork", "ln a.txt hard.txt").await;
+    ok(status, &body, "ln");
+    assert!(app.home.join("termwork/hard.txt").exists());
+
+    let (status, body) = run_cmd(&app, "help", None).await;
+    ok(status, &body, "help");
+    assert!(body["output"].as_str().unwrap().contains("zip"));
+    let (status, body) = run_cmd(&app, "cp --help", None).await;
+    ok(status, &body, "cp --help");
+    assert!(body["output"].as_str().unwrap().starts_with("cp "));
+    assert!(app.home.join("termwork/a.txt").exists());
+
+    let (status, body) = run_cmd(&app, "ls *.nomatch", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no matches")
+    );
+
+    let (status, body) = run_cmd_at(&app, "termwork", "zip term.zip a.txt c.txt").await;
+    ok(status, &body, "zip");
+    let output = body["output"].as_str().unwrap().to_owned();
+    let job_id = output
+        .split_whitespace()
+        .find(|value| value.starts_with("job_"))
+        .unwrap()
+        .trim_end_matches(':');
+    wait_job(&app, job_id).await;
+    assert!(app.home.join("termwork/term.zip").exists());
+
+    let (status, body) = run_cmd_at(&app, "termwork", "unzip term.zip -d extracted").await;
+    ok(status, &body, "unzip");
+    assert!(app.home.join("termwork/extracted/a.txt").is_file());
+
+    let (status, body) = run_cmd_at(&app, "termwork", "rm a.txt -y").await;
+    ok(status, &body, "rm file");
+    assert!(!app.home.join("termwork/a.txt").exists());
+
+    let (status, body) = run_cmd(&app, "rm -r . -y", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"].as_str().unwrap().contains("root"));
+
+    let (status, body) = run_cmd(&app, "job", None).await;
+    ok(status, &body, "job");
+    assert!(body["output"].as_str().unwrap().contains("\u{1b}["));
+
+    let (status, body) = run_cmd(&app, "roots", None).await;
+    ok(status, &body, "roots");
+    assert!(body["output"].as_str().unwrap().contains("@"));
 }

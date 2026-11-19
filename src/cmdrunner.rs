@@ -181,6 +181,11 @@ pub(crate) async fn execute(
             } else {
                 args.clone()
             };
+            let paths = if paths.iter().any(|path| path.contains('*')) {
+                expand_sources(state, user_id, &root, &cwd, paths, false).await?
+            } else {
+                paths
+            };
             let multiple = paths.len() > 1;
             let mut lines = Vec::new();
             let mut total_dirs = 0_usize;
@@ -190,6 +195,35 @@ pub(crate) async fn execute(
             for path in paths {
                 let resolved =
                     authz::resolve(state, user_id, root.id, &join(&cwd, &path), false).await?;
+                if resolved.absolute.is_file() {
+                    let metadata = std::fs::metadata(&resolved.absolute).map_err(|err| {
+                        AppError::internal(anyhow::anyhow!("ls task failed: {err}"))
+                    })?;
+                    let name = resolved
+                        .absolute
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("file");
+                    lines.push(format!(
+                        "{:>9}  {:16}  {}",
+                        format_size(metadata.len()),
+                        format_local_time(
+                            metadata
+                                .modified()
+                                .ok()
+                                .and_then(|time| {
+                                    time.duration_since(std::time::UNIX_EPOCH)
+                                        .ok()
+                                        .map(|duration| duration.as_secs() as i64)
+                                })
+                                .unwrap_or_default()
+                        ),
+                        name
+                    ));
+                    total_files += 1;
+                    total_bytes = total_bytes.saturating_add(metadata.len());
+                    continue;
+                }
                 let entries = tokio::task::spawn_blocking({
                     let resolved = resolved.clone();
                     move || fsops::list_dir(&resolved, "name", "asc")

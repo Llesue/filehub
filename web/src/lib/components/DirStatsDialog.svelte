@@ -274,4 +274,21 @@
     color: var(--text-2);
     font-size: 13px;
   }
+
+  .icon-button {
+    display: grid;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    place-items: center;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-2);
+  }
+
+  .icon-button:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
 </style>
