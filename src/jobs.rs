@@ -256,6 +256,8 @@ pub struct JobManager {
     interactive_io: Arc<Semaphore>,
     dir_size_io: Arc<Semaphore>,
     index_io: Arc<Semaphore>,
+    archive_io: Arc<Semaphore>,
+    media_io: Arc<Semaphore>,
     queue_limit: usize,
     thumbnail_queue_limit: usize,
     events: Arc<EventBus>,
@@ -269,6 +271,8 @@ impl JobManager {
         interactive_workers: usize,
         dir_size_workers: usize,
         index_workers: usize,
+        archive_workers: usize,
+        media_workers: usize,
         queue_limit: usize,
         thumbnail_queue_limit: usize,
         events: Arc<EventBus>,
@@ -286,6 +290,8 @@ impl JobManager {
             interactive_io: Arc::new(Semaphore::new(interactive_workers.max(1))),
             dir_size_io: Arc::new(Semaphore::new(dir_size_workers.max(1))),
             index_io: Arc::new(Semaphore::new(index_workers.max(1))),
+            archive_io: Arc::new(Semaphore::new(archive_workers.max(1))),
+            media_io: Arc::new(Semaphore::new(media_workers.max(1))),
             queue_limit: queue_limit.max(1),
             thumbnail_queue_limit: thumbnail_queue_limit.max(1),
             events,
@@ -366,7 +372,7 @@ impl JobManager {
                 | JobKind::Unzip
                 | JobKind::MediaTranscode
         ) && payload.get("auto").and_then(Value::as_bool) != Some(true);
-        if kind == JobKind::Index
+        if matches!(kind, JobKind::Index | JobKind::DirSize)
             && let Some(scope) = payload.get("real_path").and_then(Value::as_str)
         {
             let scope = scope.trim_end_matches(['/', '\\']).to_owned();
@@ -511,6 +517,10 @@ impl JobManager {
             Some(Arc::clone(&self.dir_size_io))
         } else if kind == JobKind::Index {
             Some(Arc::clone(&self.index_io))
+        } else if matches!(kind, JobKind::Archive | JobKind::Unzip) {
+            Some(Arc::clone(&self.archive_io))
+        } else if kind == JobKind::MediaTranscode {
+            Some(Arc::clone(&self.media_io))
         } else if kind.uses_shared_io() {
             Some(Arc::clone(&self.io))
         } else {

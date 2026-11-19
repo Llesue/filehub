@@ -83,7 +83,7 @@ impl Default for ThumbnailsSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            workers: 2,
+            workers: 5,
             preview_workers: 1,
             preview_edge: 2048,
             max_source_bytes: 512 * 1024 * 1024,
@@ -276,6 +276,7 @@ pub struct JobsSettings {
     pub dir_size_workers: usize,
     pub index_workers: usize,
     pub archive_workers: usize,
+    pub media_workers: usize,
     pub archive_per_user: usize,
     pub queue_max: usize,
     pub thumbnail_queue_max: usize,
@@ -293,9 +294,10 @@ impl Default for JobsSettings {
         Self {
             io_workers: 1,
             interactive_workers: 2,
-            dir_size_workers: 1,
+            dir_size_workers: 2,
             index_workers: 2,
-            archive_workers: 1,
+            archive_workers: 2,
+            media_workers: 1,
             archive_per_user: 2,
             queue_max: 256,
             thumbnail_queue_max: 64,
@@ -377,6 +379,12 @@ impl Settings {
         }
         if self.jobs.dir_size_workers == 0 {
             bail!("jobs.dir_size_workers must be greater than zero");
+        }
+        if self.jobs.archive_workers == 0 {
+            bail!("jobs.archive_workers must be greater than zero");
+        }
+        if self.jobs.media_workers == 0 {
+            bail!("jobs.media_workers must be greater than zero");
         }
         if self.jobs.queue_max == 0 {
             bail!("jobs.queue_max must be greater than zero");

@@ -26,6 +26,9 @@
 - `index.quick_scan_minutes` 默认从 10 分钟改为 60 分钟，避免大索引库一直跑 scheduled quick scan；目录浏览仍会触发按需索引。
 - 索引扫描多线程化：`index.scan_workers`（默认 4）并行扫描目录，单线程批量落库；`jobs.index_workers`（默认 2）让 scheduled scan 与浏览按需索引不再互堵。
 - 索引任务去重/包含协调：同一路径复用现有任务；新的递归父任务会取代已排队的子任务；被父任务覆盖的子任务不再重复入队。
+- 缩略图默认并发提高到 `thumbnails.workers=5` / `preview_workers=1`（4 个列表 + 1 个预览）。
+- `jobs.dir_size_workers` 默认 2，并复用索引的父子 scope 去重，避免目录大小任务重复扫同一子树。
+- `jobs.archive_workers` 默认 2、`jobs.media_workers` 默认 1，Archive/Unzip/视频转码改为独立 worker lane，不再和普通 IO 任务共用一条队列。
 - 统一目录概览 / CSS 选择器弹窗的关闭按钮样式，去掉外框。
 - 有 ffmpeg 时检测视频音轨并对 AC3/EAC3/DTS/TrueHD 做仅音频转码，缓存 AAC 输出。
 - 终端物理磁盘/配额超过 1024 GB 时进位显示 TB。

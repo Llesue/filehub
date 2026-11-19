@@ -2148,6 +2148,7 @@ async fn enqueue_dir_size(
     let payload = json!({
         "real_path": real_path,
         "mtime_ns": mtime_ns,
+        "recursive": true,
     });
     let key = real_path.clone();
     if let Some(job) = state.jobs.active_job_for_path(JobKind::DirSize, &key) {
