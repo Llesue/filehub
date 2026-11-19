@@ -55,6 +55,28 @@
   function date(value: number): string {
     return new Date(value * 1000).toLocaleString(localeOf($language));
   }
+
+  async function copyIp(ip: string | null | undefined): Promise<void> {
+    if (!ip) return;
+    try {
+      if (window.isSecureContext && navigator.clipboard) {
+        await navigator.clipboard.writeText(ip);
+      } else {
+        const area = document.createElement('textarea');
+        area.value = ip;
+        area.style.position = 'fixed';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        const copied = document.execCommand('copy');
+        area.remove();
+        if (!copied) throw new Error('copy failed');
+      }
+      showNotice(t($language, 'IP 已复制'), 'info');
+    } catch {
+      showNotice(t($language, '复制失败'), 'warning');
+    }
+  }
 </script>
 
 <section class="audit-page">
@@ -73,7 +95,13 @@
         <div class="audit-row">
           <span class="time">{date(entry.created_at)}</span>
           <span class="user">{entry.username ?? '—'}</span>
-          <span class="ip">{entry.ip ?? '—'}</span>
+          <button
+            type="button"
+            class="ip"
+            title={entry.ip ?? ''}
+            onclick={() => void copyIp(entry.ip)}
+            >{entry.ip ?? '—'}</button
+          >
           <span class="pill">{entry.action}</span>
           <span class="path">{entry.path ?? ''}</span>
           <span class="detail">{entry.detail ?? ''}</span>
@@ -137,10 +165,31 @@
     border-bottom: 0;
   }
   .time,
-  .ip,
   .detail {
     color: var(--text-2);
     font-family: var(--font-mono);
+  }
+  .ip {
+    min-width: 0;
+    overflow: hidden;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-2);
+    cursor: pointer;
+    font: inherit;
+    font-family: var(--font-mono);
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ip:hover {
+    color: var(--accent-text);
+  }
+  .detail {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .user {
     font-weight: 500;

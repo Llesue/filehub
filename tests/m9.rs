@@ -1348,3 +1348,79 @@ async fn transfer_job_copies_many_files_with_parallel_workers() {
         }
     }
 }
+
+#[tokio::test]
+async fn external_path_alias_rename_updates_assigned_roots() {
+    let app = setup_app().await;
+    std::fs::create_dir_all(app.home.join("external")).unwrap();
+    let me = send_json(
+        &app.router,
+        Method::GET,
+        "/api/v1/me",
+        Some(&app.cookie),
+        None,
+        json!({}),
+    )
+    .await;
+    let user_id = json_body(me).await["user"]["id"].as_i64().unwrap();
+
+    let created = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/server-paths",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "path": app.home.join("external").to_string_lossy(),
+            "alias": "Alpha",
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let path_id = json_body(created).await["id"].as_i64().unwrap();
+
+    let assigned = send_json(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/admin/users/{user_id}/roots"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "path": app.home.join("external").to_string_lossy(),
+            "alias": "Alpha",
+            "read_only": false,
+        }),
+    )
+    .await;
+    assert_eq!(assigned.status(), StatusCode::OK);
+    let root_id = json_body(assigned).await["root_id"].as_i64().unwrap();
+
+    let renamed = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/admin/server-paths/{path_id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"alias": "Beta"}),
+    )
+    .await;
+    assert_eq!(renamed.status(), StatusCode::OK);
+
+    let roots = send_json(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/admin/users/{user_id}/roots"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({}),
+    )
+    .await;
+    let roots = json_body(roots).await;
+    let root = roots["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|root| root["id"].as_i64() == Some(root_id))
+        .unwrap();
+    assert_eq!(root["alias"], "Beta");
+}

@@ -3452,11 +3452,30 @@ impl Db {
     pub async fn update_server_path_alias(&self, id: i64, alias: &str) -> anyhow::Result<bool> {
         let alias = alias.to_owned();
         self.call(move |connection| {
-            let changed = connection.execute(
+            let transaction = connection.transaction()?;
+            let real_path = transaction
+                .query_row(
+                    "SELECT real_path FROM server_paths WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(real_path) = real_path else {
+                transaction.commit()?;
+                return Ok(false);
+            };
+            transaction.execute(
                 "UPDATE server_paths SET alias = ?1 WHERE id = ?2",
                 params![alias, id],
             )?;
-            Ok(changed > 0)
+            // Assigned roots mirror the server path alias, so renaming an
+            // external path updates every user card without a second edit.
+            transaction.execute(
+                "UPDATE user_roots SET alias = ?1 WHERE real_path = ?2",
+                params![alias, real_path],
+            )?;
+            transaction.commit()?;
+            Ok(true)
         })
         .await
     }

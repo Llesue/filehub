@@ -12,6 +12,7 @@
   import NameDialog from './NameDialog.svelte';
   import NewUserDialog from './NewUserDialog.svelte';
   import QuotaDialog from './QuotaDialog.svelte';
+  import ByteSizeInput from './ByteSizeInput.svelte';
 
   let {
     csrf,
@@ -19,6 +20,7 @@
     onRootsChanged,
   }: { csrf: string; onAudit: () => void; onRootsChanged?: () => void } = $props();
 
+  let adminTab = $state<'access' | 'settings'>('access');
   let users = $state<User[]>([]);
   let paths = $state<ServerPath[]>([]);
   let settings = $state<SettingsResponse | null>(null);
@@ -435,19 +437,6 @@
     queueSetting(key, next);
   }
 
-  let defaultQuotaGb = $state(15);
-  let settingReady = $state(false);
-  $effect(() => {
-    if (settings && !settingReady) {
-      defaultQuotaGb = Number(setting('default_quota_bytes') ?? 15 * 1024 ** 3) / 1024 ** 3;
-      settingReady = true;
-    }
-  });
-
-  function saveDefaultQuota(): void {
-    saveNumber('default_quota_bytes', defaultQuotaGb, 0, 1024 * 1024, 1024 ** 3);
-  }
-
   let brandNameInput = $state('FileHub');
   let brandReady = $state(false);
   let brandBusy = $state(false);
@@ -549,14 +538,12 @@
   let previewEdge = $state(2048);
   let jpegMaxMp = $state(1000);
   let maxPixelsMp = $state(50);
-  let maxSourceMb = $state(512);
   let thumbSettingsReady = $state(false);
   $effect(() => {
     if (settings && !thumbSettingsReady) {
       previewEdge = Number(setting('thumbnails.preview_edge') ?? 2048);
       jpegMaxMp = Number(setting('thumbnails.jpeg_max_pixels') ?? 1_000_000_000) / 1_000_000;
       maxPixelsMp = Number(setting('thumbnails.max_pixels') ?? 50_000_000) / 1_000_000;
-      maxSourceMb = Number(setting('thumbnails.max_source_bytes') ?? 512 * 1024 ** 2) / 1024 ** 2;
       thumbSettingsReady = true;
     }
   });
@@ -594,16 +581,13 @@
     saveNumber('thumbnails.preview_edge', previewEdge, 512, 4096);
     saveNumber('thumbnails.jpeg_max_pixels', jpegMaxMp, 1, 100_000, 1_000_000);
     saveNumber('thumbnails.max_pixels', maxPixelsMp, 1, 100_000, 1_000_000);
-    saveNumber('thumbnails.max_source_bytes', maxSourceMb, 1, 1_048_576, 1024 ** 2);
   }
 
-  let zipMaxGb = $state(2);
   let zipMaxFiles = $state(1000);
   let zipConcurrency = $state(1);
   let zipSettingsReady = $state(false);
   $effect(() => {
     if (settings && !zipSettingsReady) {
-      zipMaxGb = Number(setting('downloads.zip_max_bytes') ?? 2 * 1024 ** 3) / 1024 ** 3;
       zipMaxFiles = Number(setting('downloads.zip_max_files') ?? 1000);
       zipConcurrency = Number(setting('downloads.zip_concurrency') ?? 1);
       zipSettingsReady = true;
@@ -611,10 +595,205 @@
   });
 
   function saveZipSettings(): void {
-    saveNumber('downloads.zip_max_bytes', zipMaxGb, 0, 1024 * 1024, 1024 ** 3);
     saveNumber('downloads.zip_max_files', zipMaxFiles, 0, 10_000_000);
     saveNumber('downloads.zip_concurrency', zipConcurrency, 1, 64);
   }
+
+  type NumberField = {
+    key: string;
+    label: string;
+    min: number;
+    max: number;
+    unit?: string;
+    hint?: string;
+  };
+  type ByteField = { key: string; label: string; min: number; max: number; hint?: string };
+  type BoolField = { key: string; label: string; hint?: string };
+  type ListField = { key: string; label: string; hint?: string };
+
+  const NUMBER_DEFAULTS: Record<string, number> = {
+    'thumbnails.workers': 5,
+    'thumbnails.preview_workers': 1,
+    'thumbnails.video_timeout_secs': 15,
+    'index.quick_scan_minutes': 60,
+    'index.full_scan_hours': 24,
+    'index.scan_workers': 4,
+    'index.max_entries_per_dir': 200_000,
+    'uploads.session_ttl_hours': 24,
+    'uploads.concurrency_per_user': 32,
+    'downloads.unzip_max_entries': 1000,
+    'downloads.unzip_max_ratio': 200,
+    'jobs.io_workers': 1,
+    'jobs.interactive_workers': 2,
+    'jobs.transfer_workers': 2,
+    'jobs.dir_size_workers': 2,
+    'jobs.index_workers': 2,
+    'jobs.archive_workers': 2,
+    'jobs.media_workers': 1,
+    'jobs.archive_per_user': 2,
+    'jobs.queue_max': 256,
+    'jobs.thumbnail_queue_max': 64,
+    'jobs.dir_size_ttl_seconds': 300,
+    'jobs.dir_size_error_retry_seconds': 60,
+    'jobs.usage_cache_seconds': 900,
+    'jobs.audit_retention_days': 90,
+    'jobs.audit_max_rows': 200_000,
+    'jobs.job_retention_days': 30,
+    'security.session_ttl_hours': 168,
+    'security.public_rate_limit_per_minute': 240,
+    'max_entries_per_user': 1_000_000,
+    'log.retention_days': 14,
+    'symlinks.max_depth': 32,
+    'symlinks.max_hops': 40,
+  };
+
+  let numberSettings = $state<Record<string, number>>({ ...NUMBER_DEFAULTS });
+  let numberReady = $state(false);
+  let listSettings = $state<Record<string, string>>({
+    'index.ignore': '.git\nnode_modules\n@eaDir',
+    'security.trusted_proxies': '',
+  });
+  let listReady = $state(false);
+
+  $effect(() => {
+    if (!settings) return;
+    if (!numberReady) {
+      for (const key of Object.keys(NUMBER_DEFAULTS)) {
+        const value = Number(setting(key));
+        numberSettings[key] = Number.isFinite(value)
+          ? value
+          : (NUMBER_DEFAULTS[key] ?? 0);
+      }
+      numberReady = true;
+    }
+    if (!listReady) {
+      const ignore = setting('index.ignore');
+      listSettings['index.ignore'] = Array.isArray(ignore)
+        ? ignore.join('\n')
+        : String(ignore ?? '');
+      const proxies = setting('security.trusted_proxies');
+      listSettings['security.trusted_proxies'] = Array.isArray(proxies)
+        ? proxies.join('\n')
+        : String(proxies ?? '');
+      listReady = true;
+    }
+  });
+
+  function saveNumberField(field: NumberField): void {
+    const value = Number(numberSettings[field.key]);
+    if (!Number.isFinite(value) || value < field.min || value > field.max) {
+      markSettingState(field.key, 'error', t($language, '数值超出允许范围'));
+      return;
+    }
+    queueSetting(field.key, Math.round(value));
+  }
+
+  function saveListField(field: ListField): void {
+    const values = (listSettings[field.key] ?? '')
+      .split(/[\n,]/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    queueSetting(field.key, values);
+  }
+
+  function byteValue(key: string, fallback: number): number {
+    const value = Number(setting(key));
+    return Number.isFinite(value) ? value : fallback;
+  }
+
+  const thumbNumberFields: NumberField[] = [
+    { key: 'thumbnails.workers', label: '缩略图并发', min: 1, max: 32, hint: '建议 4–6，视频多时降低' },
+    { key: 'thumbnails.preview_workers', label: '预览并发', min: 1, max: 16, hint: '建议 1–2' },
+    { key: 'thumbnails.video_timeout_secs', label: '视频缩略图超时', min: 1, max: 300, unit: '秒' },
+  ];
+  const thumbByteFields: ByteField[] = [
+    { key: 'thumbnails.cache_max_bytes', label: '缩略图缓存上限', min: 0, max: 1024 ** 5 },
+    { key: 'thumbnails.max_source_bytes', label: '源文件大小上限', min: 1, max: 1024 ** 5 },
+  ];
+  const thumbBoolFields: BoolField[] = [
+    { key: 'thumbnails.video', label: '视频缩略图', hint: '需要 ffmpeg' },
+  ];
+
+  const uploadNumberFields: NumberField[] = [
+    { key: 'uploads.session_ttl_hours', label: '上传会话有效期', min: 1, max: 720, unit: '小时' },
+    { key: 'uploads.concurrency_per_user', label: '每用户并发上传', min: 1, max: 256 },
+  ];
+  const uploadByteFields: ByteField[] = [
+    { key: 'uploads.max_file_bytes', label: '单文件上限', min: 1, max: 1024 ** 5 },
+    { key: 'uploads.chunk_size', label: '分块大小', min: 64 * 1024, max: 64 * 1024 ** 2 },
+  ];
+
+  const unzipNumberFields: NumberField[] = [
+    { key: 'downloads.unzip_max_entries', label: '最大条目数', min: 1, max: 1_000_000 },
+    { key: 'downloads.unzip_max_ratio', label: '最大压缩比', min: 2, max: 10_000, hint: '建议 100–500' },
+  ];
+  const unzipByteFields: ByteField[] = [
+    { key: 'downloads.unzip_max_bytes', label: '解压总大小上限', min: 0, max: 1024 ** 5 },
+    { key: 'downloads.unzip_max_entry_bytes', label: '单文件解压上限', min: 0, max: 1024 ** 5 },
+    { key: 'downloads.unzip_ratio_check_bytes', label: '压缩比检查阈值', min: 0, max: 1024 ** 5 },
+  ];
+
+  const indexNumberFields: NumberField[] = [
+    { key: 'index.quick_scan_minutes', label: '快速扫描间隔', min: 1, max: 10_080, unit: '分钟' },
+    { key: 'index.full_scan_hours', label: '全量扫描间隔', min: 1, max: 8_760, unit: '小时' },
+    { key: 'index.scan_workers', label: '扫描线程数', min: 1, max: 16, hint: '建议 2–4，HDD 用 2' },
+    { key: 'index.max_entries_per_dir', label: '单目录条目上限', min: 1000, max: 2_000_000 },
+  ];
+  const indexBoolFields: BoolField[] = [
+    { key: 'index.auto_index_on_browse', label: '浏览时自动索引' },
+    { key: 'index.scheduled_scans', label: '定时扫描' },
+  ];
+  const indexListFields: ListField[] = [
+    { key: 'index.ignore', label: '索引忽略项', hint: '每行一个目录名' },
+  ];
+
+  const jobResourceFields: NumberField[] = [
+    { key: 'jobs.io_workers', label: '通用 IO worker', min: 1, max: 16 },
+    { key: 'jobs.interactive_workers', label: '交互任务 worker', min: 1, max: 16 },
+    { key: 'jobs.transfer_workers', label: '复制/移动内部线程', min: 1, max: 16 },
+    { key: 'jobs.dir_size_workers', label: '目录大小 worker', min: 1, max: 16 },
+    { key: 'jobs.index_workers', label: '索引 worker', min: 1, max: 16 },
+    { key: 'jobs.archive_workers', label: 'ZIP/解压 worker', min: 1, max: 16 },
+    { key: 'jobs.media_workers', label: '视频转码 worker', min: 1, max: 8 },
+    { key: 'jobs.archive_per_user', label: '每用户 archive 上限', min: 1, max: 32 },
+    { key: 'jobs.queue_max', label: '任务队列上限', min: 8, max: 10_000 },
+    { key: 'jobs.thumbnail_queue_max', label: '缩略图队列上限', min: 8, max: 1000 },
+  ];
+  const jobRetentionFields: NumberField[] = [
+    { key: 'jobs.dir_size_ttl_seconds', label: '目录大小缓存 TTL', min: 10, max: 86_400, unit: '秒' },
+    { key: 'jobs.dir_size_error_retry_seconds', label: '目录大小失败重试', min: 5, max: 3600, unit: '秒' },
+    { key: 'jobs.usage_cache_seconds', label: '用量缓存 TTL', min: 10, max: 86_400, unit: '秒' },
+    { key: 'jobs.audit_retention_days', label: '审计保留天数', min: 1, max: 3650, unit: '天' },
+    { key: 'jobs.audit_max_rows', label: '审计最大行数', min: 1000, max: 10_000_000 },
+    { key: 'jobs.job_retention_days', label: '任务记录保留天数', min: 1, max: 3650, unit: '天' },
+  ];
+
+  const securityNumberFields: NumberField[] = [
+    { key: 'security.session_ttl_hours', label: '登录会话有效期', min: 1, max: 8760, unit: '小时' },
+    { key: 'security.public_rate_limit_per_minute', label: '公开接口每分钟上限', min: 1, max: 100_000 },
+    { key: 'max_entries_per_user', label: '每用户条目上限', min: 0, max: 10_000_000, hint: '0 = 不限制，默认 100 万' },
+    { key: 'symlinks.max_depth', label: '符号链接最大深度', min: 1, max: 128 },
+    { key: 'symlinks.max_hops', label: '符号链接最大跳数', min: 1, max: 128 },
+  ];
+  const securityBoolFields: BoolField[] = [
+    { key: 'security.cookie_secure', label: '仅 HTTPS Cookie', hint: 'HTTPS 部署必须开启' },
+    { key: 'symlinks.allow_create', label: '允许创建符号链接' },
+    { key: 'symlinks.follow_in_index', label: '索引跟随符号链接', hint: '高风险' },
+    { key: 'symlinks.follow_admin_links', label: '跟随管理员信任链接', hint: '高风险' },
+  ];
+  const securityListFields: ListField[] = [
+    { key: 'security.trusted_proxies', label: '可信代理 IP/CIDR', hint: '每行一个，仅填反向代理地址' },
+  ];
+
+  const mediaByteFields: ByteField[] = [
+    { key: 'media.audio_cache_max_bytes', label: '转码缓存上限', min: 0, max: 1024 ** 5 },
+  ];
+  const mediaBoolFields: BoolField[] = [
+    { key: 'media.audio_transcode', label: '视频音频转码', hint: '需要 ffmpeg，重启生效' },
+  ];
+  const logNumberFields: NumberField[] = [
+    { key: 'log.retention_days', label: '日志保留天数', min: 1, max: 365, unit: '天' },
+  ];
 </script>
 
 {#snippet saveState(key: string)}
@@ -633,6 +812,87 @@
   {/if}
 {/snippet}
 
+{#snippet numberRow(field: NumberField)}
+  <label class="setting-row wide">
+    <span
+      >{t($language, field.label)}
+      <small class="setting-source">{settingSource(field.key)}</small>
+      {@render saveState(field.key)}</span
+    >
+    <div class="quota-setting">
+      <input
+        type="number"
+        min={field.min}
+        max={field.max}
+        value={numberSettings[field.key] ?? field.min}
+        oninput={(event) =>
+          (numberSettings[field.key] = Number(event.currentTarget.value))}
+        onblur={() => saveNumberField(field)}
+        onkeydown={blurOnEnter}
+      />
+      {#if field.unit}<span>{field.unit}</span>{/if}
+    </div>
+    {#if field.hint}<small class="settings-hint">{t($language, field.hint)}</small>{/if}
+  </label>
+{/snippet}
+
+{#snippet byteRow(field: ByteField)}
+  <div class="setting-row wide">
+    <span
+      >{t($language, field.label)}
+      <small class="setting-source">{settingSource(field.key)}</small>
+      {@render saveState(field.key)}</span
+    >
+    <div class="quota-setting">
+      <ByteSizeInput
+        value={byteValue(field.key, field.min)}
+        min={field.min}
+        max={field.max}
+        onSave={(bytes) => queueSetting(field.key, bytes)}
+      />
+      {#if settings?.sources[field.key] === 'db'}
+        <button type="button" class="small" onclick={() => void clearSetting(field.key)}
+          >{t($language, '清除覆盖')}</button
+        >
+      {/if}
+    </div>
+    {#if field.hint}<small class="settings-hint">{t($language, field.hint)}</small>{/if}
+  </div>
+{/snippet}
+
+{#snippet boolRow(field: BoolField)}
+  <label class="setting-row">
+    <span
+      >{t($language, field.label)}
+      <small class="setting-source">{settingSource(field.key)}</small>
+      {@render saveState(field.key)}</span
+    >
+    <input
+      type="checkbox"
+      checked={Boolean(setting(field.key))}
+      onchange={(event) => queueSetting(field.key, event.currentTarget.checked)}
+    />
+    {#if field.hint}<small class="settings-hint">{t($language, field.hint)}</small>{/if}
+  </label>
+{/snippet}
+
+{#snippet listRow(field: ListField)}
+  <div class="setting-row wide">
+    <span
+      >{t($language, field.label)}
+      <small class="setting-source">{settingSource(field.key)}</small>
+      {@render saveState(field.key)}</span
+    >
+    <textarea
+      rows="4"
+      bind:value={listSettings[field.key]}
+      onblur={() => saveListField(field)}
+      spellcheck="false"
+    ></textarea>
+    {#if field.hint}<small class="settings-hint">{t($language, field.hint)}</small>{/if}
+  </div>
+{/snippet}
+
 <section class="admin-page">
   <header class="admin-header">
     <div>
@@ -644,9 +904,24 @@
     >
   </header>
 
+  <nav class="admin-tabs" aria-label={t($language, '系统管理页面')}>
+    <button
+      type="button"
+      class:active={adminTab === 'access'}
+      onclick={() => (adminTab = 'access')}
+      >{t($language, '用户与外部链接')}</button
+    >
+    <button
+      type="button"
+      class:active={adminTab === 'settings'}
+      onclick={() => (adminTab = 'settings')}
+      >{t($language, '系统设置')}</button
+    >
+  </nav>
+
   {#if loading}<p class="muted">{t($language, '加载中…')}</p>{:else}
     {#if status}
-      <section class="admin-section">
+      <section class="admin-section" class:tab-hidden={adminTab !== 'settings'}>
         <div class="section-heading">
           <h2>{t($language, '系统状态')}</h2>
         </div>
@@ -692,7 +967,59 @@
         {/if}
       </section>
     {/if}
-    <section class="admin-section">
+    <section class="admin-section" class:tab-hidden={adminTab !== 'access'}>
+      <div class="section-heading">
+        <h2>{t($language, '外部路径')}</h2>
+        <button type="button" class="add-button" onclick={() => (pathOpen = true)}
+          >{t($language, '+ 添加外部路径')}</button
+        >
+      </div>
+      <p class="settings-hint">
+        {t(
+          $language,
+          '外部路径是服务器上已存在的目录。管理员先在这里添加并命名，再分配给用户；用户侧看到的名称跟随这里的别名，修改别名会自动同步到已分配的用户。',
+        )}
+      </p>
+      {#each paths as path (path.id)}
+        <div class="path-card">
+          {#if editingPathId === path.id}
+            <div class="path-alias-form">
+              <input
+                bind:this={pathAliasInput}
+                bind:value={editingPathAlias}
+                aria-label={t($language, '外部路径别名')}
+                onblur={() => void finishPathAlias()}
+                onkeydown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  } else if (event.key === 'Escape') {
+                    editingPathId = null;
+                    editingPathAlias = editingPathOriginal;
+                    event.currentTarget.blur();
+                  }
+                }}
+              />
+            </div>
+          {:else}
+            <button type="button" class="path-alias" onclick={() => beginPathAlias(path)}
+              >{path.alias}</button
+            >
+          {/if}
+          {#if savingPathId === path.id}
+            <small class="setting-save">{t($language, '保存中…')}</small>
+          {/if}
+          <span class="root-path">{path.real_path}</span>
+          <button type="button" class="text-button danger" onclick={() => (deletePathTarget = path)}
+            >{t($language, '删除')}</button
+          >
+        </div>
+      {:else}
+        <p class="muted">{t($language, '还没有外部路径。')}</p>
+      {/each}
+    </section>
+
+    <section class="admin-section" class:tab-hidden={adminTab !== 'access'}>
       <div class="section-heading">
         <h2>{t($language, '用户')}</h2>
         <button type="button" class="add-button" onclick={() => (createOpen = true)}
@@ -781,53 +1108,7 @@
       {/each}
     </section>
 
-    <section class="admin-section">
-      <div class="section-heading">
-        <h2>{t($language, '外部路径')}</h2>
-        <button type="button" class="add-button" onclick={() => (pathOpen = true)}
-          >{t($language, '+ 添加外部路径')}</button
-        >
-      </div>
-      {#each paths as path (path.id)}
-        <div class="path-card">
-          {#if editingPathId === path.id}
-            <div class="path-alias-form">
-              <input
-                bind:this={pathAliasInput}
-                bind:value={editingPathAlias}
-                aria-label={t($language, '外部路径别名')}
-                onblur={() => void finishPathAlias()}
-                onkeydown={(event) => {
-                  if (event.key === 'Enter') {
-                    event.preventDefault();
-                    event.currentTarget.blur();
-                  } else if (event.key === 'Escape') {
-                    editingPathId = null;
-                    editingPathAlias = editingPathOriginal;
-                    event.currentTarget.blur();
-                  }
-                }}
-              />
-            </div>
-          {:else}
-            <button type="button" class="path-alias" onclick={() => beginPathAlias(path)}
-              >{path.alias}</button
-            >
-          {/if}
-          {#if savingPathId === path.id}
-            <small class="setting-save">{t($language, '保存中…')}</small>
-          {/if}
-          <span class="root-path">{path.real_path}</span>
-          <button type="button" class="text-button danger" onclick={() => (deletePathTarget = path)}
-            >{t($language, '删除')}</button
-          >
-        </div>
-      {:else}
-        <p class="muted">{t($language, '还没有外部路径。')}</p>
-      {/each}
-    </section>
-
-    <section class="admin-section">
+    <section class="admin-section" class:tab-hidden={adminTab !== 'settings'}>
       <h2>{t($language, '品牌')}</h2>
       <div class="setting-grid">
         <label class="setting-row"
@@ -894,7 +1175,7 @@
       </div>
     </section>
 
-    <section class="admin-section">
+    <section class="admin-section" class:tab-hidden={adminTab !== 'settings'}>
       <h2>{t($language, '系统设置')}</h2>
 
       <div class="settings-group">
@@ -934,17 +1215,18 @@
           <div class="setting-row wide">
             <span>{t($language, 'ZIP 下载限制')}</span>
             <div class="zip-fields">
-              <label class="zip-field"
-                ><span>{t($language, '最大大小')}{@render saveState('downloads.zip_max_bytes')}</span>
-                <input
-                  bind:value={zipMaxGb}
-                  type="number"
-                  min="0"
-                  step="1"
-                  onblur={saveZipSettings}
-                  onkeydown={blurOnEnter}
-                /><span>GB</span></label
-              >
+              <div class="zip-field">
+                <span
+                  >{t($language, '最大大小')}
+                  {@render saveState('downloads.zip_max_bytes')}</span
+                >
+                <ByteSizeInput
+                  value={byteValue('downloads.zip_max_bytes', 2 * 1024 ** 3)}
+                  min={0}
+                  max={1024 ** 5}
+                  onSave={(bytes) => queueSetting('downloads.zip_max_bytes', bytes)}
+                />
+              </div>
               <label class="zip-field"
                 ><span>{t($language, '最大文件数')}{@render saveState('downloads.zip_max_files')}</span>
                 <input
@@ -969,26 +1251,30 @@
               >
             </div>
           </div>
-          <label class="setting-row"
-            ><span>{t($language, '默认配额')}{@render saveState('default_quota_bytes')}</span>
+          <div class="setting-row wide">
+            <span
+              >{t($language, '默认配额')}
+              {@render saveState('default_quota_bytes')}</span
+            >
             <div class="quota-setting">
-              <input
-                bind:value={defaultQuotaGb}
-                type="number"
-                min="0"
-                step="1"
-                onblur={saveDefaultQuota}
-                onkeydown={blurOnEnter}
-              /><span>GB</span>
-            </div></label
-          >
+              <ByteSizeInput
+                value={byteValue('default_quota_bytes', 15 * 1024 ** 3)}
+                min={0}
+                max={1024 ** 5}
+                onSave={(bytes) => queueSetting('default_quota_bytes', bytes)}
+              />
+            </div>
+          </div>
         </div>
       </div>
 
       <div class="settings-group">
         <h3>{t($language, '缩略图与预览')}</h3>
         <p class="settings-hint">
-          {t($language, '预览长边范围 512–4096；像素上限按百万像素（MP）计。')}
+          {t($language, '预览长边范围 512–4096；像素上限按百万像素（MP）计；修改 worker 后需重启。')}
+        </p>
+        <p class="settings-warning">
+          {t($language, '风险：缩略图 worker 和像素上限过高会显著增加内存占用；8 核 / 12GB 建议 workers 4–6、单张像素 ≤50MP。')}
         </p>
         <div class="setting-grid">
           <label class="setting-row wide"
@@ -1054,23 +1340,6 @@
               /><span>MP</span>
             </div></label
           >
-          <label class="setting-row wide"
-            ><span
-              >{t($language, '源文件大小上限')}
-              <small class="setting-source">{settingSource('thumbnails.max_source_bytes')}</small>
-              {@render saveState('thumbnails.max_source_bytes')}</span
-            >
-            <div class="quota-setting">
-              <input
-                bind:value={maxSourceMb}
-                type="number"
-                min="1"
-                step="1"
-                onblur={saveThumbSettings}
-                onkeydown={blurOnEnter}
-              /><span>MB</span>
-            </div></label
-          >
         </div>
       </div>
 
@@ -1122,6 +1391,82 @@
           >
         </div>
       </div>
+      <div class="settings-group">
+        <h3>{t($language, '上传')}</h3>
+        <div class="setting-grid">
+          {#each uploadNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+          {#each uploadByteFields as field (field.key)}{@render byteRow(field)}{/each}
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '解压限制')}</h3>
+        <p class="settings-warning">
+          {t($language, '风险：上限过大可能让恶意 ZIP 占满磁盘/内存。建议总大小 ≤2GB、单文件 ≤2GB、压缩比 ≤200。')}
+        </p>
+        <div class="setting-grid">
+          {#each unzipNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+          {#each unzipByteFields as field (field.key)}{@render byteRow(field)}{/each}
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '索引')}</h3>
+        <p class="settings-hint">
+          {t($language, '扫描线程建议 2–4；HDD 用 2，SSD 可用 4。忽略项每行一个目录名。')}
+        </p>
+        <div class="setting-grid">
+          {#each indexBoolFields as field (field.key)}{@render boolRow(field)}{/each}
+          {#each indexNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+          {#each indexListFields as field (field.key)}{@render listRow(field)}{/each}
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '缩略图、媒体与转码')}</h3>
+        <p class="settings-hint">
+          {t($language, '视频转码需要 ffmpeg；修改开关或 worker 后需重启。')}
+        </p>
+        <div class="setting-grid">
+          {#each mediaBoolFields as field (field.key)}{@render boolRow(field)}{/each}
+          {#each mediaByteFields as field (field.key)}{@render byteRow(field)}{/each}
+          {#each thumbNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+          {#each thumbByteFields as field (field.key)}{@render byteRow(field)}{/each}
+          {#each thumbBoolFields as field (field.key)}{@render boolRow(field)}{/each}
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '任务与资源')}</h3>
+        <p class="settings-warning">
+          {t($language, '风险：提高 worker/队列会抢占 CPU、内存和磁盘 IO；8 核机器建议 worker 总数不超过 8，队列建议 128–1024。worker 和队列修改后需重启。')}
+        </p>
+        <div class="setting-grid">
+          {#each jobResourceFields as field (field.key)}{@render numberRow(field)}{/each}
+          {#each jobRetentionFields as field (field.key)}{@render numberRow(field)}{/each}
+          {@render boolRow({ key: 'jobs.dir_size_use_logical', label: '目录大小按逻辑大小' })}
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '安全与外部链接')}</h3>
+        <p class="settings-warning">
+          {t($language, '高风险：符号链接跟随、Cookie 安全开关和可信代理会影响访问边界。只在你清楚后果时修改。')}
+        </p>
+        <div class="setting-grid">
+          {#each securityBoolFields as field (field.key)}{@render boolRow(field)}{/each}
+          {#each securityNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+          {#each securityListFields as field (field.key)}{@render listRow(field)}{/each}
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>{t($language, '日志')}</h3>
+        <div class="setting-grid">
+          {#each logNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+        </div>
+      </div>
+
     </section>
   {/if}
 </section>
@@ -1228,6 +1573,40 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+  }
+  .admin-section.tab-hidden {
+    display: none;
+  }
+  .admin-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+  }
+  .admin-tabs button {
+    padding: 7px 12px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-2);
+    font: inherit;
+  }
+  .admin-tabs button.active {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+  }
+  .settings-warning {
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+    color: var(--danger);
+    font-size: 12.5px;
   }
   .settings-group {
     display: flex;
@@ -1422,8 +1801,13 @@
     gap: 10px;
   }
   .root-alias {
-    width: 90px;
+    width: 110px;
+    overflow: hidden;
+    color: var(--text-2);
+    font-size: 12px;
     font-weight: 400;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .root-path {
     min-width: 0;
