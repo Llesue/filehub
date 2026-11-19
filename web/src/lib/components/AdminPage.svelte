@@ -977,7 +977,7 @@
       <p class="settings-hint">
         {t(
           $language,
-          '外部路径是服务器上已存在的目录。管理员先在这里添加并命名，再分配给用户；用户侧看到的名称跟随这里的别名，修改别名会自动同步到已分配的用户。',
+          '外部路径是服务器上已存在的目录。管理员先在这里添加并命名，再分配给用户。',
         )}
       </p>
       {#each paths as path (path.id)}
@@ -1881,16 +1881,27 @@
     background: var(--surface);
   }
   .setting-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     min-height: 52px;
     align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 12px;
+    gap: 8px 12px;
     padding: 10px 16px;
     border-top: 1px solid var(--border);
     color: var(--text);
     font-size: 13.5px;
+  }
+
+  .setting-row > span {
+    min-width: 0;
+  }
+
+  .setting-row > .settings-hint {
+    grid-column: 1 / -1;
+  }
+
+  .setting-row textarea {
+    grid-column: 1 / -1;
   }
   .setting-row:first-child {
     border-top: 0;
@@ -1946,7 +1957,7 @@
     gap: 6px;
   }
   .quota-setting input {
-    width: 76px;
+    width: 112px;
     height: 32px;
     padding: 0 8px;
     border: 1px solid var(--border);

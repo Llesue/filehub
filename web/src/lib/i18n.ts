@@ -715,7 +715,7 @@ const en: Record<string, string> = {
   '目录已设为只读': 'This folder is configured as read-only',
   '目录已设为只读，无法保存': 'This folder is configured as read-only; saving is disabled',  用户与外部链接: 'Users & external paths',
   系统管理页面: 'Administration pages',
-  '外部路径是服务器上已存在的目录。管理员先在这里添加并命名，再分配给用户；用户侧看到的名称跟随这里的别名，修改别名会自动同步到已分配的用户。': 'External paths are existing server directories. Add and name them here, then assign them to users. The name shown to users follows this alias, and renaming it updates every assignment automatically.',
+  '外部路径是服务器上已存在的目录。管理员先在这里添加并命名，再分配给用户。': 'External paths are existing server directories. Add and name them here, then assign them to users.',
   缩略图并发: 'Thumbnail workers',
   预览并发: 'Preview workers',
   视频缩略图超时: 'Video thumbnail timeout',

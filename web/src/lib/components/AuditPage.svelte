@@ -3,6 +3,7 @@
   import { api, type AuditEntry } from '../api';
   import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
+  import { showToast } from '../toast';
   import Icon from './Icon.svelte';
 
   let { onBack }: { onBack: () => void } = $props();
@@ -72,9 +73,9 @@
         area.remove();
         if (!copied) throw new Error('copy failed');
       }
-      showNotice(t($language, 'IP 已复制'), 'info');
+      showToast(t($language, 'IP 已复制'));
     } catch {
-      showNotice(t($language, '复制失败'), 'warning');
+      showToast(t($language, '复制失败'));
     }
   }
 </script>
