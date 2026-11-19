@@ -829,6 +829,22 @@ export const api = {
     return `/api/v1/media/transcoded?${query.toString()}`;
   },
 
+  archiveUnzip(
+    root: number,
+    path: string,
+    target: string | undefined,
+    csrf: string,
+  ): Promise<{ job_id: string; status: string; name: string }> {
+    return request(
+      '/archive/unzip',
+      {
+        method: 'POST',
+        body: JSON.stringify({ root, path, target }),
+      },
+      csrf,
+    );
+  },
+
   archiveZip(
     root: number,
     dir: string,

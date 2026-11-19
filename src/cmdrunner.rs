@@ -157,7 +157,12 @@ pub(crate) async fn execute(
                 .map_err(|err| AppError::internal(anyhow::anyhow!("tree task failed: {err}")))??;
                 for entry in entries.into_iter().rev() {
                     let marker = if entry.is_dir { "/" } else { "" };
-                    output.push(format!("{}{}{}", "  ".repeat(depth), entry.name, marker));
+                    let line = format!("{}{}{}", "  ".repeat(depth), entry.name, marker);
+                    output.push(if entry.is_dir {
+                        format!("\x1b[34m{line}\x1b[0m")
+                    } else {
+                        line
+                    });
                     if entry.is_dir {
                         let child = if relative.is_empty() {
                             entry.name
@@ -221,7 +226,10 @@ pub(crate) async fn execute(
                         }
                     ));
                 }
-                lines.push(format!("{:>9}  {:16}  {}", "SIZE", "MODIFIED", "NAME"));
+                lines.push(format!(
+                    "\x1b[1m{:>9}  {:16}  {}\x1b[0m",
+                    "SIZE", "MODIFIED", "NAME"
+                ));
                 let mut dirs = 0_usize;
                 let mut files = 0_usize;
                 let mut bytes = 0_u64;
@@ -250,18 +258,22 @@ pub(crate) async fn execute(
                         } else {
                             files += 1;
                         }
+                        let name = if entry.is_dir {
+                            format!("\x1b[34m{}/\x1b[0m", entry.name)
+                        } else {
+                            entry.name.clone()
+                        };
                         lines.push(format!(
-                            "{:>9}  {:16}  {}{}",
+                            "{:>9}  {:16}  {}",
                             format_size(size),
                             format_local_time(entry.modified),
-                            entry.name,
-                            if entry.is_dir { "/" } else { "" }
+                            name
                         ));
                     } else {
                         unknown += 1;
                         dirs += 1;
                         lines.push(format!(
-                            "{:>9}  {:16}  {}/",
+                            "{:>9}  {:16}  \x1b[34m{}/\x1b[0m",
                             "-",
                             format_local_time(entry.modified),
                             entry.name
@@ -274,7 +286,7 @@ pub(crate) async fn execute(
                     String::new()
                 };
                 lines.push(format!(
-                    "{} 个目录，{} 个文件，共计 {}{}",
+                    "\x1b[90m{} 个目录，{} 个文件，共计 {}{}\x1b[0m",
                     dirs,
                     files,
                     format_size(bytes),
@@ -292,7 +304,7 @@ pub(crate) async fn execute(
                     String::new()
                 };
                 lines.push(format!(
-                    "全部：{} 个目录，{} 个文件，共计 {}{}",
+                    "\x1b[90m全部：{} 个目录，{} 个文件，共计 {}{}\x1b[0m",
                     total_dirs,
                     total_files,
                     format_size(total_bytes),
@@ -300,6 +312,26 @@ pub(crate) async fn execute(
                 ));
             }
             truncate(lines.join("\n"))
+        }
+        "roots" => {
+            let roots = state
+                .db
+                .list_roots(user_id)
+                .await
+                .map_err(AppError::internal)?;
+            roots
+                .iter()
+                .map(|root| {
+                    format!(
+                        "\x1b[36m@{}\x1b[0m  {}  {}  {}",
+                        root.id,
+                        root.alias,
+                        root.real_path,
+                        if root.read_only { "ro" } else { "rw" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         }
         "mkdir" => {
             let recursive = flags.remove(&'p');
@@ -466,6 +498,22 @@ pub(crate) async fn execute(
                 return Err(AppError::bad_request("cp requires source and destination"));
             }
             let destination = args.pop().unwrap_or_default();
+            if let Some(output) = cross_root_transfer(
+                state,
+                user_id,
+                &root,
+                &cwd,
+                &args,
+                &destination,
+                recursive,
+                false,
+                &line,
+                headers,
+            )
+            .await?
+            {
+                return Ok(ExecOutcome::Output(output));
+            }
             let sources = expand_sources(state, user_id, &root, &cwd, args, false).await?;
             let dest =
                 authz::resolve(state, user_id, root.id, &join(&cwd, &destination), true).await?;
@@ -517,6 +565,22 @@ pub(crate) async fn execute(
                 return Err(AppError::bad_request("mv requires source and destination"));
             }
             let destination = args.pop().unwrap_or_default();
+            if let Some(output) = cross_root_transfer(
+                state,
+                user_id,
+                &root,
+                &cwd,
+                &args,
+                &destination,
+                true,
+                true,
+                &line,
+                headers,
+            )
+            .await?
+            {
+                return Ok(ExecOutcome::Output(output));
+            }
             let sources = expand_sources(state, user_id, &root, &cwd, args, true).await?;
             let dest =
                 authz::resolve(state, user_id, root.id, &join(&cwd, &destination), true).await?;
@@ -889,11 +953,36 @@ fn split_args(args: &[String]) -> (std::collections::HashSet<char>, Vec<String>)
     (flags, paths)
 }
 
+fn job_status_rank(status: &str) -> u8 {
+    match status {
+        "running" => 0,
+        "queued" => 1,
+        _ => 2,
+    }
+}
+
+fn job_status_color(status: &str) -> &'static str {
+    match status {
+        "running" => "32",
+        "queued" => "33",
+        "failed" => "31",
+        "cancelled" => "33",
+        _ => "90",
+    }
+}
+
 fn format_job_list(jobs: &[crate::jobs::Job]) -> String {
     if jobs.is_empty() {
-        return "no jobs".to_owned();
+        return "\x1b[90mno jobs\x1b[0m".to_owned();
     }
-    jobs.iter()
+    let mut sorted = jobs.to_vec();
+    sorted.sort_by(|left, right| {
+        job_status_rank(&left.status)
+            .cmp(&job_status_rank(&right.status))
+            .then_with(|| right.created_at.cmp(&left.created_at))
+    });
+    sorted
+        .iter()
         .map(format_job_line)
         .collect::<Vec<_>>()
         .join("\n")
@@ -911,15 +1000,16 @@ fn format_job_line(job: &crate::jobs::Job) -> String {
         String::new()
     };
     format!(
-        "{}  {}  {}  {}{}{}",
+        "\x1b[36m{}\x1b[0m  {}  \x1b[{}m{}\x1b[0m  {}{}{}",
         job.id,
         job.kind,
+        job_status_color(&job.status),
         job.status,
         progress,
         bytes,
         job.error
             .as_deref()
-            .map(|error| format!("  {error}"))
+            .map(|error| format!("  \x1b[31m{error}\x1b[0m"))
             .unwrap_or_default()
     )
 }
@@ -928,7 +1018,11 @@ fn format_job_detail(job: &crate::jobs::Job) -> String {
     let mut lines = vec![
         format!("id: {}", job.id),
         format!("kind: {}", job.kind),
-        format!("status: {}", job.status),
+        format!(
+            "status: \x1b[{}m{}\x1b[0m",
+            job_status_color(&job.status),
+            job.status
+        ),
         format!("progress: {}/{}", job.progress, job.total),
         format!("bytes: {}/{}", job.bytes_done, job.bytes_total),
         format!("created: {}", job.created_at),
@@ -940,12 +1034,165 @@ fn format_job_detail(job: &crate::jobs::Job) -> String {
         lines.push(format!("finished: {finished}"));
     }
     if let Some(error) = job.error.as_deref() {
-        lines.push(format!("error: {error}"));
+        lines.push(format!("error: \x1b[31m{error}\x1b[0m"));
     }
     if let Some(result) = job.result.as_ref() {
         lines.push(format!("result: {result}"));
     }
     lines.join("\n")
+}
+
+fn parse_root_ref(roots: &[Root], token: &str) -> Result<Option<(i64, String)>, AppError> {
+    let Some(rest) = token.strip_prefix('@') else {
+        return Ok(None);
+    };
+    let Some((name, path)) = rest.split_once(":/") else {
+        return Ok(None);
+    };
+    let root = if let Ok(id) = name.parse::<i64>() {
+        roots.iter().find(|root| root.id == id)
+    } else {
+        let matches: Vec<&Root> = roots.iter().filter(|root| root.alias == name).collect();
+        if matches.len() > 1 {
+            return Err(AppError::bad_request(format!(
+                "duplicate root alias: {name}; use @<id>:/path"
+            )));
+        }
+        matches.first().copied()
+    }
+    .ok_or_else(|| AppError::bad_request(format!("unknown root: @{name}")))?;
+    Ok(Some((root.id, path.trim_start_matches('/').to_owned())))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cross_root_transfer(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root: &Root,
+    cwd: &str,
+    source_tokens: &[String],
+    destination: &str,
+    recursive: bool,
+    move_items: bool,
+    line: &str,
+    headers: &HeaderMap,
+) -> Result<Option<String>, AppError> {
+    let uses_ref =
+        destination.starts_with('@') || source_tokens.iter().any(|token| token.starts_with('@'));
+    if !uses_ref {
+        return Ok(None);
+    }
+    if source_tokens.is_empty() {
+        return Err(AppError::bad_request(if move_items {
+            "mv requires source and destination"
+        } else {
+            "cp requires source and destination"
+        }));
+    }
+    let roots = state
+        .db
+        .list_roots(user_id)
+        .await
+        .map_err(AppError::internal)?;
+    let (dest_root_id, dest_path) = match parse_root_ref(&roots, destination)? {
+        Some((id, path)) => (id, path),
+        None => (root.id, join(cwd, destination)),
+    };
+    let mut sources = Vec::with_capacity(source_tokens.len());
+    for token in source_tokens {
+        match parse_root_ref(&roots, token)? {
+            Some((id, path)) => sources.push((id, path)),
+            None => sources.push((root.id, join(cwd, token))),
+        }
+    }
+    let dest = authz::resolve(state, user_id, dest_root_id, &dest_path, true).await?;
+    if !dest.absolute.is_dir() {
+        return Err(AppError::bad_request(
+            "destination directory does not exist",
+        ));
+    }
+    let source_root_ids: std::collections::HashSet<i64> =
+        sources.iter().map(|(id, _)| *id).collect();
+    if source_root_ids.len() > 1 {
+        return Err(AppError::bad_request(
+            "cross-root sources must share the same root",
+        ));
+    }
+    let same_root = source_root_ids.contains(&dest_root_id);
+    let mut resolved_sources = Vec::with_capacity(sources.len());
+    for (root_id, path) in &sources {
+        let resolved = authz::resolve(state, user_id, *root_id, path, move_items).await?;
+        if resolved.relative.is_empty() {
+            return Err(AppError::invalid_path(if move_items {
+                "the root directory cannot be moved"
+            } else {
+                "the root directory cannot be copied"
+            }));
+        }
+        if resolved.absolute.is_dir() && !recursive && !move_items {
+            return Err(AppError::bad_request("directory requires -r"));
+        }
+        let target = dest
+            .absolute
+            .join(resolved.absolute.file_name().unwrap_or_default());
+        if resolved.absolute.is_dir()
+            && (target == resolved.absolute || target.starts_with(&resolved.absolute))
+        {
+            return Err(AppError::invalid_path(if move_items {
+                "cannot move a directory into itself"
+            } else {
+                "cannot copy a directory into itself"
+            }));
+        }
+        resolved_sources.push(resolved);
+    }
+    if same_root {
+        for resolved in &resolved_sources {
+            let source = resolved.absolute.clone();
+            let target = dest
+                .absolute
+                .join(resolved.absolute.file_name().unwrap_or_default());
+            if move_items {
+                tokio::task::spawn_blocking(move || move_path(&source, &target))
+                    .await
+                    .map_err(|err| AppError::internal(anyhow::anyhow!("mv task failed: {err}")))?
+                    .map_err(io_error)?;
+            } else {
+                tokio::task::spawn_blocking(move || copy_path(&source, &target, recursive))
+                    .await
+                    .map_err(|err| AppError::internal(anyhow::anyhow!("cp task failed: {err}")))?
+                    .map_err(io_error)?;
+            }
+        }
+        audit(state, user_id, line, cwd, headers).await;
+        return Ok(Some(String::new()));
+    }
+    let source_root = *source_root_ids
+        .iter()
+        .next()
+        .ok_or_else(|| AppError::bad_request("no sources"))?;
+    let paths: Vec<String> = resolved_sources
+        .iter()
+        .map(|resolved| resolved.relative.clone())
+        .collect();
+    let outcome = crate::files::submit_transfer_job(
+        state,
+        user_id,
+        crate::files::TransferJobPayload {
+            source_root,
+            paths,
+            dest_root: dest_root_id,
+            dest_path: Some(dest.relative.clone()),
+            move_items,
+        },
+    )
+    .await?;
+    audit(state, user_id, line, cwd, headers).await;
+    Ok(Some(format!(
+        "queued {} job {}\nuse `job` to check progress",
+        if move_items { "move" } else { "copy" },
+        outcome.job.id
+    )))
 }
 
 async fn expand_sources(

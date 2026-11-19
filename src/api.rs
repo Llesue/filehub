@@ -81,6 +81,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/media/transcode", post(crate::media::transcode))
         .route("/media/transcoded", get(crate::media::transcoded))
         .route("/archive/zip", post(crate::files::archive_zip))
+        .route("/archive/unzip", post(crate::unzip::archive_unzip))
         .route("/index", post(crate::search::index))
         .route("/index/status", get(crate::search::index_status))
         .route("/search", get(crate::search::search))

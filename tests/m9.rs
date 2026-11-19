@@ -1204,3 +1204,107 @@ async fn terminal_rejects_root_deletion_and_self_copy() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!app.home.join("work").exists());
 }
+
+#[tokio::test]
+async fn terminal_lists_roots_and_transfers_across_roots() {
+    let app = setup_app().await;
+    std::fs::create_dir_all(app.home.join("backup")).unwrap();
+    std::fs::write(app.home.join("a.txt"), b"alpha").unwrap();
+
+    let me = send_json(
+        &app.router,
+        Method::GET,
+        "/api/v1/me",
+        Some(&app.cookie),
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+    let user_id = json_body(me).await["user"]["id"].as_i64().unwrap();
+    let created = send_json(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/admin/users/{user_id}/roots"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        serde_json::json!({
+            "path": app.home.join("backup").to_string_lossy(),
+            "alias": "backup",
+            "read_only": false,
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let backup_root = json_body(created).await["root_id"].as_i64().unwrap();
+
+    let roots = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/cmd",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        serde_json::json!({"root": app.root_id, "cwd": "", "line": "roots"}),
+    )
+    .await;
+    let output = json_body(roots).await["output"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(output.contains("backup"));
+    assert!(output.contains(&format!("@{backup_root}")));
+
+    let copy = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/cmd",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        serde_json::json!({
+            "root": app.root_id,
+            "cwd": "",
+            "line": format!("cp a.txt @{backup_root}:/"),
+        }),
+    )
+    .await;
+    assert_eq!(copy.status(), StatusCode::OK);
+    let output = json_body(copy).await["output"].as_str().unwrap().to_owned();
+    assert!(output.contains("queued copy job"), "{output}");
+    for _ in 0..100 {
+        if app.home.join("backup/a.txt").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        std::fs::read(app.home.join("backup/a.txt")).unwrap(),
+        b"alpha"
+    );
+
+    let ls = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/cmd",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        serde_json::json!({"root": app.root_id, "cwd": "", "line": "ls"}),
+    )
+    .await;
+    let output = json_body(ls).await["output"].as_str().unwrap().to_owned();
+    assert!(output.contains("\u{1b}[34m"), "ls should color directories");
+    assert!(output.contains("\u{1b}[90m"), "ls should color the summary");
+
+    let jobs = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/cmd",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        serde_json::json!({"root": app.root_id, "cwd": "", "line": "job"}),
+    )
+    .await;
+    let output = json_body(jobs).await["output"].as_str().unwrap().to_owned();
+    assert!(
+        output.contains("\u{1b}["),
+        "job output should use color codes"
+    );
+}

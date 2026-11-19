@@ -13,6 +13,7 @@
   import AuditPage from './lib/components/AuditPage.svelte';
   import SharesPage from './lib/components/SharesPage.svelte';
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
+  import DirStatsDialog from './lib/components/DirStatsDialog.svelte';
   import FileTypeIcon from './lib/components/FileTypeIcon.svelte';
   import NameDialog from './lib/components/NameDialog.svelte';
   import NotificationCenter from './lib/components/NotificationCenter.svelte';
@@ -220,6 +221,7 @@
   let blankMenuLeft = $state(false);
   let blankMenuUp = $state(false);
   let terminalOpen = $state(false);
+  let terminalMinimized = $state(false);
   let jobProgressRestored = $state(false);
   let terminalAvailable = $derived(
     capabilities.terminal &&
@@ -228,10 +230,18 @@
   );
 
   $effect(() => {
-    if (!terminalAvailable) terminalOpen = false;
+    if (!terminalAvailable) {
+      terminalOpen = false;
+      terminalMinimized = false;
+    }
   });
   let transfer = $state<{ mode: 'copy' | 'move'; entries: Entry[] } | null>(null);
-  let dragPayload = $state<{ rootId: number; path: string; name: string } | null>(null);
+  let dragPayload = $state<{
+    rootId: number;
+    paths: string[];
+    names: string[];
+    dirs: string[];
+  } | null>(null);
   let dragOverKey = $state<string | null>(null);
   let dragOverValid = $state(true);
   let nameDialog = $state<{
@@ -242,6 +252,7 @@
     initialValue: string;
   } | null>(null);
   let archiveTargets = $state<Entry[]>([]);
+  let dirStatsOpen = $state(false);
   let preview = $state<{ items: Entry[]; index: number } | null>(null);
   let properties = $state<{
     data: Awaited<ReturnType<typeof api.properties>> | null;
@@ -391,6 +402,7 @@
       ) {
         event.preventDefault();
         terminalOpen = !terminalOpen;
+        terminalMinimized = false;
         return;
       }
       if (event.key === 'Escape') {
@@ -2266,6 +2278,7 @@
       | 'copy-to'
       | 'move-to'
       | 'archive-zip'
+      | 'extract'
       | 'delete'
       | 'play'
       | 'properties'
@@ -2324,6 +2337,9 @@
         label: t($language, '压缩包名称'),
         initialValue: 'archive.zip',
       };
+    }
+    if (action === 'extract' && targets.length === 1) {
+      void extractEntry(entry);
     }
     if (action === 'copy-to') transfer = { mode: 'copy', entries: targets };
     if (action === 'move-to') transfer = { mode: 'move', entries: targets };
@@ -2385,13 +2401,32 @@
     }
   }
 
+  function isDragSource(entry: Entry): boolean {
+    return (
+      dragPayload?.rootId === activeRootId &&
+      dragPayload.paths.includes(joinPath(currentPath, entry.name))
+    );
+  }
+
   function startDrag(event: DragEvent, entry: Entry): void {
     if (activeRootId === null) return;
-    const path = joinPath(currentPath, entry.name);
-    dragPayload = { rootId: activeRootId, path, name: entry.name };
+    const chosen =
+      selected.includes(entry.name) && selected.length > 1
+        ? entries.filter((item) => selected.includes(item.name))
+        : [entry];
+    const current = chosen.length > 0 ? chosen : [entry];
+    const paths = current.map((item) => joinPath(currentPath, item.name));
+    dragPayload = {
+      rootId: activeRootId,
+      paths,
+      names: current.map((item) => item.name),
+      dirs: current
+        .filter((item) => item.is_dir)
+        .map((item) => joinPath(currentPath, item.name)),
+    };
     if (event.dataTransfer) {
       event.dataTransfer.effectAllowed = 'move';
-      event.dataTransfer.setData('text/plain', path);
+      event.dataTransfer.setData('text/plain', paths.join('\n'));
     }
   }
 
@@ -2412,7 +2447,10 @@
     const sameRoot = dragPayload.rootId === activeRootId;
     const invalid =
       currentReadOnly ||
-      (sameRoot && (dragPayload.path === destPath || destPath.startsWith(`${dragPayload.path}/`)));
+      (sameRoot &&
+        dragPayload.paths.some(
+          (path) => destPath === path || destPath.startsWith(`${path}/`),
+        ));
     dragOverKey = key;
     dragOverValid = !invalid;
     if (event.dataTransfer) {
@@ -2499,17 +2537,26 @@
     const payload = dragPayload;
     clearDrag();
     if (!payload) return;
-    if (payload.rootId === destRoot && payload.path === destPath) return;
-    if (payload.rootId === destRoot && destPath.startsWith(`${payload.path}/`)) {
+    if (payload.rootId === destRoot && payload.paths.includes(destPath)) return;
+    if (
+      payload.rootId === destRoot &&
+      payload.dirs.some((path) => destPath.startsWith(`${path}/`))
+    ) {
       showNotice(t($language, '不能把目录移动到它自己里面。'), 'warning', t($language, '移动失败'));
       return;
     }
-    startProgress(t($language, '移动文件'), 1, payload.name);
+    startProgress(
+      t($language, '移动文件'),
+      payload.paths.length,
+      payload.paths.length === 1
+        ? (payload.names[0] ?? '')
+        : t($language, '已选 {count} 项', { count: payload.paths.length }),
+    );
     try {
       const job = await api.transferJob(
         'move',
         payload.rootId,
-        [payload.path],
+        payload.paths,
         destRoot,
         destPath,
         csrf,
@@ -2517,11 +2564,37 @@
       await waitForTransferJob(job.job_id);
       updateProgress(100, t($language, '完成'), 100);
       finishProgress();
-      showToast(t($language, '已移动到 {name}', { name: destPath.split('/').pop() ?? destPath }));
+      showToast(
+        payload.paths.length === 1
+          ? t($language, '已移动到 {name}', { name: destPath.split('/').pop() ?? destPath })
+          : t($language, '已移动 {count} 项', { count: payload.paths.length }),
+      );
       clearDirSizeCache();
       if (activeRootId !== null) await loadList(activeRootId, currentPath);
     } catch (error) {
       failProgress(error instanceof Error ? error.message : t($language, '移动失败'));
+      handleFilesError(error);
+    }
+  }
+
+  async function extractEntry(entry: Entry): Promise<void> {
+    if (activeRootId === null) return;
+    const rootId = activeRootId;
+    const path = joinPath(currentPath, entry.name);
+    startProgress(t($language, '解压'), 1, entry.name);
+    try {
+      const job = await api.archiveUnzip(rootId, path, undefined, csrf);
+      const result = await waitForTransferJob(job.job_id);
+      finishProgress();
+      await loadList(rootId, currentPath);
+      const name =
+        result && typeof (result as { name?: unknown }).name === 'string'
+          ? String((result as { name?: unknown }).name)
+          : (job.name.split('/').pop() ?? job.name);
+      selected = name ? [name] : [];
+      showToast(t($language, '解压完成'));
+    } catch (error) {
+      failProgress(error instanceof Error ? error.message : t($language, '解压失败'));
       handleFilesError(error);
     }
   }
@@ -3499,7 +3572,10 @@
               class="nav-item"
               disabled={!activeRoot}
               title={activeRoot ? t($language, '终端') : t($language, '请先选择存储目录')}
-              onclick={() => (terminalOpen = true)}
+              onclick={() => {
+                terminalOpen = true;
+                terminalMinimized = false;
+              }}
             >
               <Icon name="terminal" size={18} />
               <span class="nav-label">{t($language, '终端')}</span>
@@ -3574,20 +3650,22 @@
       <div class="main">
         {#if appView === 'files'}
           <div class="pathbar">
-            <div class="path-static">
-              <Icon name="folder" size={15} />
-              {#if currentReadOnly}
-                <span
-                  class="readonly-tag"
-                  title={currentReadOnlyReason === 'filesystem'
-                    ? t($language, '服务进程没有文件系统写入权限')
-                    : t($language, '目录已设为只读')}
-                  >{currentReadOnlyReason === 'filesystem'
-                    ? t($language, '只读（系统）')
-                    : t($language, '只读')}</span
-                >
-              {/if}
-            </div>
+            {#if !searchActive}
+              <div class="path-static">
+                <Icon name="folder" size={15} />
+                {#if currentReadOnly}
+                  <span
+                    class="readonly-tag"
+                    title={currentReadOnlyReason === 'filesystem'
+                      ? t($language, '服务进程没有文件系统写入权限')
+                      : t($language, '目录已设为只读')}
+                    >{currentReadOnlyReason === 'filesystem'
+                      ? t($language, '只读（系统）')
+                      : t($language, '只读')}</span
+                  >
+                {/if}
+              </div>
+            {/if}
             {#if searchActive}
               <div class="path search-path">
                 <Icon name="search" size={15} />
@@ -4204,8 +4282,7 @@
                           <tr
                             data-entry-name={entry.name}
                             class:selected={isSelected(entry.name)}
-                            class:drag-source={dragPayload?.rootId === activeRootId &&
-                              dragPayload?.path === joinPath(currentPath, entry.name)}
+                            class:drag-source={isDragSource(entry)}
                             class:drop-target={entry.is_dir && dragOverKey === entryDragKey(entry)}
                             class:drop-invalid={entry.is_dir &&
                               dragOverKey === entryDragKey(entry) &&
@@ -4335,8 +4412,7 @@
                           class="file-card"
                           data-entry-name={entry.name}
                           class:selected={isSelected(entry.name)}
-                          class:drag-source={dragPayload?.rootId === activeRootId &&
-                            dragPayload?.path === joinPath(currentPath, entry.name)}
+                          class:drag-source={isDragSource(entry)}
                           class:drop-target={entry.is_dir && dragOverKey === entryDragKey(entry)}
                           class:drop-invalid={entry.is_dir &&
                             dragOverKey === entryDragKey(entry) &&
@@ -4440,8 +4516,7 @@
                           class="file-tile"
                           data-entry-name={entry.name}
                           class:selected={isSelected(entry.name)}
-                          class:drag-source={dragPayload?.rootId === activeRootId &&
-                            dragPayload?.path === joinPath(currentPath, entry.name)}
+                          class:drag-source={isDragSource(entry)}
                           class:drop-target={entry.is_dir && dragOverKey === entryDragKey(entry)}
                           class:drop-invalid={entry.is_dir &&
                             dragOverKey === entryDragKey(entry) &&
@@ -4619,6 +4694,14 @@
           >{t($language, '打包为ZIP')}</button
         >
       {/if}
+      {#if capabilities.unzip &&
+      menuTargets.length === 1 &&
+      !contextMenu.entry.is_dir &&
+      /\.zip$/i.test(contextMenu.entry.name)}
+        <button type="button" role="menuitem" onclick={() => runContextAction('extract')}
+          >{t($language, '解压')}</button
+        >
+      {/if}
       <button type="button" role="menuitem" onclick={() => runContextAction('share')}
         >{t($language, '分享')}</button
       >
@@ -4690,6 +4773,14 @@
             folderUploadClick();
           }}>{t($language, '上传目录')}</button
         >
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            blankMenu = null;
+            dirStatsOpen = true;
+          }}>{t($language, '目录概览')}</button
+        >
       {/if}
       {#if terminalAvailable}
         <button
@@ -4698,6 +4789,7 @@
           onclick={() => {
             blankMenu = null;
             terminalOpen = true;
+            terminalMinimized = false;
           }}>{t($language, '打开终端')}</button
         >
         <div class="menu-sep"></div>
@@ -4817,6 +4909,16 @@
     />
   {/if}
 
+  {#if dirStatsOpen && activeRootId !== null}
+    <DirStatsDialog
+      rootId={activeRootId}
+      currentPath={currentPath}
+      {entries}
+      {dirSizes}
+      onClose={() => (dirStatsOpen = false)}
+    />
+  {/if}
+
   {#if nameDialog}
     <NameDialog
       open
@@ -4851,7 +4953,12 @@
       root={activeRootId}
       cwd={currentPath}
       {csrf}
-      onClose={() => (terminalOpen = false)}
+      minimized={terminalMinimized}
+      onMinimize={() => (terminalMinimized = true)}
+      onClose={() => {
+        terminalOpen = false;
+        terminalMinimized = false;
+      }}
       onRefresh={() => {
         if (activeRootId !== null) void loadList(activeRootId, currentPath);
       }}
@@ -5843,7 +5950,7 @@
   }
 
   .name-stem {
-    flex: 1 1 auto;
+    flex: 0 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;

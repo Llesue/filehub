@@ -9,13 +9,17 @@
     root,
     cwd,
     csrf,
+    minimized = false,
     onClose,
+    onMinimize,
     onRefresh,
   }: {
     root: number;
     cwd: string;
     csrf: string;
+    minimized?: boolean;
     onClose: () => void;
+    onMinimize?: () => void;
     onRefresh: () => void;
   } = $props();
 
@@ -41,7 +45,8 @@
     if (value < 1024) return `${value} B`;
     if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
     if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
-    return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+    if (value < 1024 ** 4) return `${(value / 1024 ** 3).toFixed(1)} GB`;
+    return `${(value / 1024 ** 4).toFixed(1)} TB`;
   }
 
   async function loadInfo(): Promise<void> {
@@ -93,6 +98,56 @@
     | { type: 'result'; output: string; cwd: string }
     | { type: 'confirm'; prompt: string; code: string; expires_at: number }
     | { type: 'error'; message: string };
+
+  const ANSI_COLORS: Record<string, string> = {
+    '30': 'ansi-gray',
+    '31': 'ansi-red',
+    '32': 'ansi-green',
+    '33': 'ansi-yellow',
+    '34': 'ansi-blue',
+    '35': 'ansi-magenta',
+    '36': 'ansi-cyan',
+    '37': 'ansi-white',
+    '90': 'ansi-gray',
+    '91': 'ansi-red',
+    '92': 'ansi-green',
+    '93': 'ansi-yellow',
+    '94': 'ansi-blue',
+    '95': 'ansi-magenta',
+    '96': 'ansi-cyan',
+    '97': 'ansi-white',
+  };
+
+  function ansiSegments(text: string): { text: string; className: string }[] {
+    const segments: { text: string; className: string }[] = [];
+    let current = '';
+    let className = '';
+    for (let index = 0; index < text.length; index += 1) {
+      if (text[index] === '\u001b' && text[index + 1] === '[') {
+        const end = text.indexOf('m', index + 2);
+        if (end > 0) {
+          if (current) segments.push({ text: current, className });
+          current = '';
+          for (const code of text.slice(index + 2, end).split(';')) {
+            if (code === '0' || code === '') {
+              className = '';
+            } else if (code === '1') {
+              className = className ? `${className} ansi-bold` : 'ansi-bold';
+            } else if (ANSI_COLORS[code]) {
+              className = className
+                ? `${className} ${ANSI_COLORS[code]}`
+                : ANSI_COLORS[code];
+            }
+          }
+          index = end;
+          continue;
+        }
+      }
+      current += text[index];
+    }
+    if (current) segments.push({ text: current, className });
+    return segments;
+  }
 
   function append(kind: Line['kind'], text: string): void {
     lines = [...lines, { kind, text }];
@@ -246,7 +301,12 @@
   onpointerup={() => (dragging = false)}
 />
 
-<div class="terminal-overlay" role="presentation" use:overlayGuard={onClose}>
+<div
+  class="terminal-overlay"
+  class:minimized
+  role="presentation"
+  use:overlayGuard={onClose}
+>
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <section
@@ -263,6 +323,17 @@
         <span class="tab-dot"></span>
         <span>FileHub Terminal</span>
       </div>
+      {#if onMinimize}
+        <button
+          type="button"
+          class="close"
+          aria-label={t($language, '最小化终端')}
+          title={t($language, '最小化终端')}
+          onclick={onMinimize}
+        >
+          <Icon name="minimize" size={16} />
+        </button>
+      {/if}
       <button type="button" class="close" aria-label={t($language, '关闭终端')} onclick={onClose}>
         <Icon name="close" size={16} />
       </button>
@@ -270,7 +341,9 @@
     <div class="terminal-body">
       <div class="scrollback">
         {#each lines as line, index (index)}
-          <pre class={line.kind}>{line.text}</pre>
+          <pre class={line.kind}>{#each ansiSegments(line.text) as segment, segmentIndex (segmentIndex)}<span
+                class={segment.className}>{segment.text}</span
+              >{/each}</pre>
         {/each}
       </div>
       <form
@@ -300,6 +373,10 @@
 </div>
 
 <style>
+  .terminal-overlay.minimized {
+    display: none;
+  }
+
   .terminal-overlay {
     position: fixed;
     inset: 0;
@@ -413,6 +490,42 @@
 
   pre.prompt {
     color: var(--file-slide);
+  }
+
+  .ansi-bold {
+    font-weight: 600;
+  }
+
+  .ansi-red {
+    color: var(--danger);
+  }
+
+  .ansi-green {
+    color: var(--file-sheet);
+  }
+
+  .ansi-yellow {
+    color: var(--warning);
+  }
+
+  .ansi-blue {
+    color: var(--file-doc);
+  }
+
+  .ansi-magenta {
+    color: var(--file-image);
+  }
+
+  .ansi-cyan {
+    color: var(--file-code);
+  }
+
+  .ansi-gray {
+    color: var(--terminal-muted);
+  }
+
+  .ansi-white {
+    color: var(--terminal-fg);
   }
 
   .reconnect {

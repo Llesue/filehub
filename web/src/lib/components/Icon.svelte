@@ -23,6 +23,7 @@
     | 'sun'
     | 'menu'
     | 'close'
+    | 'minimize'
     | 'copy'
     | 'share'
     | 'settings'
@@ -117,6 +118,8 @@
     <path d="M4 7h16M4 12h16M4 17h16" />
   {:else if name === 'close'}
     <path d="m6 6 12 12M18 6 6 18" />
+  {:else if name === 'minimize'}
+    <path d="M6 12h12" />
   {:else if name === 'copy'}
     <rect x="9" y="9" width="11" height="11" rx="2" />
     <path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" />

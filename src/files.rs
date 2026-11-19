@@ -924,6 +924,23 @@ pub(crate) async fn submit_zip_job(
     name: String,
     total: usize,
 ) -> Result<SubmitOutcome, AppError> {
+    let limit = state.settings().settings.jobs.archive_per_user;
+    if limit > 0 {
+        let active = state
+            .jobs
+            .list_for_user(user_id, 0)
+            .await
+            .map_err(AppError::internal)?
+            .into_iter()
+            .filter(|job| {
+                matches!(job.kind.as_str(), "archive" | "unzip")
+                    && matches!(job.status.as_str(), "queued" | "running")
+            })
+            .count();
+        if active >= limit {
+            return Err(AppError::TooManyRequests);
+        }
+    }
     let settings = state.settings();
     let max_bytes = settings.settings.downloads.zip_max_bytes;
     let max_files = settings.settings.downloads.zip_max_files;

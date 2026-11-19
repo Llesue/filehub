@@ -22,8 +22,17 @@
 - 文件名显示只保留短 ASCII 后缀；目录和奇怪后缀不拆分。
 - 统一文件分类器：目录优先、文本 allowlist、未知类型先 probe 再决定是否打开编辑器。
 - 透明品牌图标不再露出主题色背景。
+- 修复短文件名与后缀被 `flex-grow` 撑开的问题；搜索 pathbar 不再残留文件夹图标。
 - 有 ffmpeg 时检测视频音轨并对 AC3/EAC3/DTS/TrueHD 做仅音频转码，缓存 AAC 输出。
+- 终端物理磁盘/配额超过 1024 GB 时进位显示 TB。
 - 多选汇总（数量、总大小、类型分布）和搜索结果中的目录大小（来自索引/缓存）。
+- 多选后拖动到目录会一次移动全部选中项。
+- 终端 `roots` 命令与 `@id:/path` / `@alias:/path` 跨 root cp/mv；跨 root 走 transfer job。
+- 终端 `job` 按 running → queued → 已完成排序，状态用颜色区分；`ls`/`tree`/汇总也用 ANSI 颜色。
+- ZIP 文件右键“解压”，默认解压到同名目录；新增 `POST /archive/unzip`。
+- 空白处右键“目录概览”：直接子项数量、已知大小、类型分布、最大文件/目录。
+- 终端可最小化，回到左侧终端入口恢复。
+- `jobs.archive_workers` / `jobs.archive_per_user`（默认 1/2）限制 archive/unzip 并发。
 
 ## v0.1.8 - 2026-11-19
 

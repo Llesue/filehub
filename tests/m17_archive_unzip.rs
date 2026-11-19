@@ -462,3 +462,49 @@ async fn unzip_into_existing_directory_refuses_conflicts() {
     let (status, body) = run_cmd(&app, "unzip conflict.zip -d target/a.txt", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+#[tokio::test]
+async fn archive_unzip_api_extracts_into_named_directory() {
+    let app = setup_app().await;
+    write_zip(&app.home.join("api.zip"), &[("docs/a.txt", b"hello")]);
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/archive/unzip",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "api.zip"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["name"], "api");
+    wait_job(&app, body["job_id"].as_str().unwrap()).await;
+    assert_eq!(
+        std::fs::read(app.home.join("api/docs/a.txt")).unwrap(),
+        b"hello"
+    );
+
+    let disabled = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/admin/users/{}", 1),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"feature_unzip": false}),
+    )
+    .await;
+    assert_eq!(disabled.status(), StatusCode::OK);
+    write_zip(&app.home.join("second.zip"), &[("b.txt", b"b")]);
+    let denied = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/archive/unzip",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "second.zip"}),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+}

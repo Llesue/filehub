@@ -332,6 +332,23 @@ pub(crate) async fn submit_unzip_job(
     existing: bool,
     name: String,
 ) -> Result<crate::jobs::SubmitOutcome, AppError> {
+    let limit = state.settings().settings.jobs.archive_per_user;
+    if limit > 0 {
+        let active = state
+            .jobs
+            .list_for_user(user_id, 0)
+            .await
+            .map_err(AppError::internal)?
+            .into_iter()
+            .filter(|job| {
+                matches!(job.kind.as_str(), "archive" | "unzip")
+                    && matches!(job.status.as_str(), "queued" | "running")
+            })
+            .count();
+        if active >= limit {
+            return Err(AppError::TooManyRequests);
+        }
+    }
     let settings = state.settings();
     let limits = UnzipLimits::from_settings(&settings.settings.downloads);
     let payload = json!({
@@ -517,4 +534,88 @@ async fn run_unzip_job(
         bytes_done: summary.bytes,
         bytes_total: summary.bytes,
     })
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UnzipRequest {
+    root: i64,
+    path: String,
+    target: Option<String>,
+}
+
+pub async fn archive_unzip(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(request): axum::Json<UnzipRequest>,
+) -> Result<axum::Json<Value>, AppError> {
+    let current = crate::auth::current_user(&state, &headers).await?;
+    crate::auth::require_csrf(&current, &headers)?;
+    crate::capabilities::require_unzip(&state, &current.user).await?;
+    let root = crate::cmdrunner::load_root(&state, current.user.id, request.root).await?;
+    let archive =
+        crate::authz::resolve(&state, current.user.id, root.id, &request.path, false).await?;
+    if !archive.absolute.is_file() {
+        return Err(AppError::NotFound);
+    }
+    let (target, existing) = if let Some(target) = request.target {
+        let resolved =
+            crate::authz::resolve(&state, current.user.id, root.id, &target, true).await?;
+        let exists = std::fs::symlink_metadata(&resolved.absolute).is_ok();
+        if exists && !resolved.absolute.is_dir() {
+            return Err(AppError::bad_request("target is a file, not a directory"));
+        }
+        (resolved.relative, exists)
+    } else {
+        let file_name = archive
+            .absolute
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| AppError::invalid_path("invalid archive name"))?;
+        let stem = file_name
+            .strip_suffix(".zip")
+            .or_else(|| file_name.strip_suffix(".ZIP"))
+            .unwrap_or(file_name);
+        let parent = archive
+            .relative
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_owned())
+            .unwrap_or_default();
+        let relative = if parent.is_empty() {
+            stem.to_owned()
+        } else {
+            format!("{parent}/{stem}")
+        };
+        (relative, false)
+    };
+    if existing {
+        let archive_path = archive.absolute.clone();
+        let target_path = crate::authz::resolve(&state, current.user.id, root.id, &target, true)
+            .await?
+            .absolute;
+        tokio::task::spawn_blocking(move || ensure_no_conflicts(&archive_path, &target_path))
+            .await
+            .map_err(|err| {
+                AppError::internal(anyhow::anyhow!("unzip preflight task failed: {err}"))
+            })??;
+    }
+    let outcome = submit_unzip_job(
+        &state,
+        current.user.id,
+        root.id,
+        archive.relative,
+        target.clone(),
+        existing,
+        target.clone(),
+    )
+    .await?;
+    let status = if outcome.job.status == "running" {
+        "running"
+    } else {
+        "queued"
+    };
+    Ok(axum::Json(json!({
+        "job_id": outcome.job.id,
+        "status": status,
+        "name": target,
+    })))
 }

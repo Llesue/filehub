@@ -24,7 +24,7 @@
   }
 
   .name-stem {
-    flex: 1 1 auto;
+    flex: 0 1 auto;
     overflow: hidden;
     min-width: 0;
     text-overflow: ellipsis;

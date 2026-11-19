@@ -22,8 +22,17 @@
 - File-name display only keeps short ASCII extensions; directories and odd suffixes are never split.
 - Central file classifier: directories always win, text uses an allowlist, unknown types are probed before opening the editor.
 - Transparent brand icons no longer show the accent background.
+- Fixed the flex-grow gap between short file names and their extension; the search pathbar no longer keeps the folder icon.
 - Video audio detection and audio-only transcoding (AC3/EAC3/DTS/TrueHD) with cached AAC output when ffmpeg is available.
+- Terminal disk/quota sizes roll over to TB above 1024 GB.
 - Selection summary (count, total size, type distribution) and directory sizes in search results from the index/cache.
+- Multi-select drag now moves every selected item.
+- Terminal `roots` plus cross-root `cp/mv` via `@id:/path` or `@alias:/path`, using transfer jobs.
+- Terminal job lists sort running → queued → finished and use status colors; `ls`/`tree`/summaries use ANSI colors.
+- Right-click a ZIP to extract into the matching directory; new `POST /archive/unzip`.
+- Blank-area menu "Directory overview": direct entry counts, known size, type mix, largest files/folders.
+- Minimizable terminal that can be restored from the sidebar.
+- `jobs.archive_workers` / `jobs.archive_per_user` (defaults 1/2) bound archive/unzip concurrency.
 
 ## v0.1.8 - 2026-11-19
 
