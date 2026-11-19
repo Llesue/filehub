@@ -40,6 +40,8 @@ const eventTypes = [
   'audit.appended',
   'slow_request',
   'edit.presence',
+  'user.features_changed',
+  'roots.changed',
   'session.expired',
 ];
 
