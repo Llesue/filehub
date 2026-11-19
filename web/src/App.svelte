@@ -449,6 +449,9 @@
       if (event.type === 'user.features_changed') {
         void loadPreferences();
       }
+      if (event.type === 'roots.changed') {
+        void refreshRoots();
+      }
       if (event.type === 'notification') {
         const kind = String(event.data.kind ?? 'notice');
         const message =

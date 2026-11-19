@@ -271,6 +271,7 @@
       // The backend mirrors the alias onto every assigned user root.
       // Refresh the root cards so the new name is visible immediately.
       await loadDeferred();
+      onRootsChanged?.();
     } catch (error) {
       if (target) target.alias = previous;
       editingPathId = id;

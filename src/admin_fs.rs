@@ -236,6 +236,16 @@ pub struct AddRootRequest {
     sort_order: Option<i64>,
 }
 
+fn notify_roots_changed(state: &Arc<AppState>, user_ids: &[i64]) {
+    for user_id in user_ids {
+        state.events.publish(
+            "roots.changed",
+            Some(*user_id),
+            json!({ "user_id": user_id }),
+        );
+    }
+}
+
 pub async fn add_root(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -276,6 +286,7 @@ pub async fn add_root(
         .map_err(map_db_error)?;
 
     audit(&state, current.user.id, "root_added", real_path, &headers).await;
+    notify_roots_changed(&state, &[user_id]);
 
     Ok(Json(json!({ "root_id": id, "real_path": real_path })))
 }
@@ -325,6 +336,7 @@ pub async fn update_root(
         &headers,
     )
     .await;
+    notify_roots_changed(&state, &[user_id]);
 
     Ok(Json(json!({ "updated": true })))
 }
@@ -355,6 +367,7 @@ pub async fn delete_root(
         &headers,
     )
     .await;
+    notify_roots_changed(&state, &[user_id]);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -513,14 +526,12 @@ pub async fn update_server_path(
     if alias.is_empty() {
         return Err(AppError::bad_request("alias is required"));
     }
-    let changed = state
+    let owners = state
         .db
         .update_server_path_alias(id, alias)
         .await
-        .map_err(AppError::internal)?;
-    if !changed {
-        return Err(AppError::NotFound);
-    }
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
     audit(
         &state,
         current.user.id,
@@ -529,6 +540,7 @@ pub async fn update_server_path(
         &headers,
     )
     .await;
+    notify_roots_changed(&state, &owners);
     Ok(Json(json!({ "alias": alias })))
 }
 

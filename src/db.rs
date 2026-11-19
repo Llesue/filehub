@@ -3449,7 +3449,11 @@ impl Db {
         .await
     }
 
-    pub async fn update_server_path_alias(&self, id: i64, alias: &str) -> anyhow::Result<bool> {
+    pub async fn update_server_path_alias(
+        &self,
+        id: i64,
+        alias: &str,
+    ) -> anyhow::Result<Option<Vec<i64>>> {
         let alias = alias.to_owned();
         self.call(move |connection| {
             let transaction = connection.transaction()?;
@@ -3462,7 +3466,7 @@ impl Db {
                 .optional()?;
             let Some(real_path) = real_path else {
                 transaction.commit()?;
-                return Ok(false);
+                return Ok(None);
             };
             transaction.execute(
                 "UPDATE server_paths SET alias = ?1 WHERE id = ?2",
@@ -3474,8 +3478,14 @@ impl Db {
                 "UPDATE user_roots SET alias = ?1 WHERE real_path = ?2",
                 params![alias, real_path],
             )?;
+            let mut statement = transaction
+                .prepare("SELECT DISTINCT user_id FROM user_roots WHERE real_path = ?1")?;
+            let owners = statement
+                .query_map(params![real_path], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
             transaction.commit()?;
-            Ok(true)
+            Ok(Some(owners))
         })
         .await
     }
