@@ -22,9 +22,6 @@ jobs:
           tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
           version="${tag#v}"
           echo "Updating release notes for $tag"
-          echo "version=[$version]"
-          pwd
-          ls -la release-notes || true
           if [ -f "release-notes/${version}.md" ]; then
             echo "using release-notes/${version}.md"
             cp "release-notes/${version}.md" /tmp/release-notes.md
