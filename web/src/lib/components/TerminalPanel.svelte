@@ -223,6 +223,11 @@
     requestAnimationFrame(() => inputElement?.focus());
   }
 
+  function minimizeOrClose(): void {
+    if (onMinimize) onMinimize();
+    else onClose();
+  }
+
   function startDrag(event: PointerEvent): void {
     if ((event.target as HTMLElement).closest('button')) return;
     dragging = true;
@@ -295,7 +300,7 @@
 
 <svelte:window
   onkeydown={(event) => {
-    if (event.key === 'Escape') onClose();
+    if (event.key === 'Escape') minimizeOrClose();
   }}
   onpointermove={drag}
   onpointerup={() => (dragging = false)}
@@ -305,7 +310,7 @@
   class="terminal-overlay"
   class:minimized
   role="presentation"
-  use:overlayGuard={onClose}
+  use:overlayGuard={minimizeOrClose}
 >
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -323,20 +328,22 @@
         <span class="tab-dot"></span>
         <span>FileHub Terminal</span>
       </div>
-      {#if onMinimize}
-        <button
-          type="button"
-          class="close"
-          aria-label={t($language, '最小化终端')}
-          title={t($language, '最小化终端')}
-          onclick={onMinimize}
-        >
-          <Icon name="minimize" size={16} />
+      <div class="window-actions">
+        {#if onMinimize}
+          <button
+            type="button"
+            class="close"
+            aria-label={t($language, '最小化终端')}
+            title={t($language, '最小化终端')}
+            onclick={onMinimize}
+          >
+            <Icon name="minimize" size={16} />
+          </button>
+        {/if}
+        <button type="button" class="close" aria-label={t($language, '关闭终端')} onclick={onClose}>
+          <Icon name="close" size={16} />
         </button>
-      {/if}
-      <button type="button" class="close" aria-label={t($language, '关闭终端')} onclick={onClose}>
-        <Icon name="close" size={16} />
-      </button>
+      </div>
     </header>
     <div class="terminal-body">
       <div class="scrollback">
@@ -431,6 +438,13 @@
     height: 8px;
     border-radius: 50%;
     background: var(--accent);
+  }
+
+  .window-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: auto;
   }
 
   .close {

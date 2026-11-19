@@ -1584,6 +1584,26 @@ export const api = {
     return request('/admin/roots');
   },
 
+  resetSettings(keys: string[], csrf: string): Promise<{ reset: number }> {
+    return request(
+      '/admin/settings/reset',
+      { method: 'POST', body: JSON.stringify({ keys }) },
+      csrf,
+    );
+  },
+
+  verifyAdminPassword(password: string, csrf: string): Promise<void> {
+    return request<void>(
+      '/admin/verify-password',
+      { method: 'POST', body: JSON.stringify({ password }) },
+      csrf,
+    );
+  },
+
+  restartServer(csrf: string): Promise<{ restarting: boolean }> {
+    return request('/admin/restart', { method: 'POST' }, csrf);
+  },
+
   resetSetting(key: string, csrf: string): Promise<SettingsResponse> {
     return request<SettingsResponse>(
       `/admin/settings/${encodeURIComponent(key)}`,

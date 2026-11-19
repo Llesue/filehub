@@ -63,6 +63,9 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(get_settings).put(put_setting).patch(patch_settings),
         )
         .route("/admin/settings/{key}", delete(delete_setting))
+        .route("/admin/settings/reset", post(reset_settings))
+        .route("/admin/verify-password", post(verify_admin_password))
+        .route("/admin/restart", post(restart_server))
         .route(
             "/admin/branding/icon",
             post(crate::branding::upload_icon).delete(crate::branding::delete_icon),
@@ -1126,6 +1129,97 @@ async fn patch_settings(
     .await;
 
     Ok(Json(settings_json(&state)))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetSettingsRequest {
+    keys: Vec<String>,
+}
+
+async fn reset_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ResetSettingsRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    auth::require_csrf(&current, &headers)?;
+    if request.keys.is_empty() || request.keys.len() > 200 {
+        return Err(AppError::bad_request("keys must contain 1-200 items"));
+    }
+    for key in &request.keys {
+        if !config::is_known_key(key) || config::is_bootstrap_key(key) {
+            return Err(AppError::bad_request("unknown or bootstrap settings key"));
+        }
+    }
+    for key in &request.keys {
+        state
+            .db
+            .delete_setting(key)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    state
+        .reload_settings(false)
+        .await
+        .map_err(AppError::internal)?;
+    audit(
+        &state,
+        Some(current.user.id),
+        "settings_reset",
+        None,
+        Some(&request.keys.join(",")),
+        &headers,
+    )
+    .await;
+    Ok(Json(json!({ "reset": request.keys.len() })))
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyPasswordRequest {
+    password: String,
+}
+
+async fn verify_admin_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<VerifyPasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    auth::require_csrf(&current, &headers)?;
+    let valid = auth::verify_password_async(request.password, current.user.password_hash.clone())
+        .await
+        .map_err(AppError::internal)?;
+    if valid {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::Forbidden)
+    }
+}
+
+async fn restart_server(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    auth::require_csrf(&current, &headers)?;
+    audit(
+        &state,
+        Some(current.user.id),
+        "server_restart",
+        None,
+        None,
+        &headers,
+    )
+    .await;
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // Exit non-zero so systemd's Restart=on-failure brings the service back.
+        std::process::exit(1);
+    });
+    Ok(Json(json!({ "restarting": true })))
 }
 
 async fn delete_setting(

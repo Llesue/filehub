@@ -688,3 +688,68 @@ async fn entry_limit_blocks_creating_more_files() {
     assert_eq!(usage["entry_count"], 2);
     assert_eq!(usage["max_entries"], 2);
 }
+
+#[tokio::test]
+async fn admin_can_reset_settings_and_verify_password() {
+    let app = setup_app().await;
+
+    let wrong = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/verify-password",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"password": "wrong"}),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+    let valid = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/verify-password",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"password": "correct horse"}),
+    )
+    .await;
+    assert_eq!(valid.status(), StatusCode::NO_CONTENT);
+
+    let updated = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/admin/settings",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"key": "max_entries_per_user", "value": 5}),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(updated).await["settings"]["max_entries_per_user"],
+        5
+    );
+
+    let reset = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/settings/reset",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"keys": ["max_entries_per_user"]}),
+    )
+    .await;
+    assert_eq!(reset.status(), StatusCode::OK);
+    let settings = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/admin/settings",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        json_body(settings).await["settings"]["max_entries_per_user"],
+        1_000_000
+    );
+}

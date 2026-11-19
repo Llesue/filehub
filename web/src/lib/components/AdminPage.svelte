@@ -5,6 +5,7 @@
   import { branding, brandMark, loadBranding } from '../branding';
   import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
+  import { showToast } from '../toast';
   import AssignPathDialog from './AssignPathDialog.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import ExternalPathDialog from './ExternalPathDialog.svelte';
@@ -794,6 +795,153 @@
   const logNumberFields: NumberField[] = [
     { key: 'log.retention_days', label: '日志保留天数', min: 1, max: 365, unit: '天' },
   ];
+
+  const FEATURE_KEYS = ['thumbnails.enabled', 'editor.enabled', 'terminal_enabled'];
+  const DOWNLOAD_KEYS = [
+    'downloads.zip_max_bytes',
+    'downloads.zip_max_files',
+    'downloads.zip_concurrency',
+    'default_quota_bytes',
+  ];
+  const PREVIEW_KEYS = [
+    'thumbnails.preview_edge',
+    'thumbnails.jpeg_max_pixels',
+    'thumbnails.max_pixels',
+  ];
+  const NEW_USER_KEYS = [
+    'show_hidden_default',
+    'ui.default_theme',
+    'ui.default_locale',
+    'upload_conflict_default',
+  ];
+  const UPLOAD_KEYS = [
+    'uploads.max_file_bytes',
+    'uploads.chunk_size',
+    'uploads.session_ttl_hours',
+    'uploads.concurrency_per_user',
+  ];
+  const UNZIP_KEYS = [
+    'downloads.unzip_max_entries',
+    'downloads.unzip_max_bytes',
+    'downloads.unzip_max_entry_bytes',
+    'downloads.unzip_max_ratio',
+    'downloads.unzip_ratio_check_bytes',
+  ];
+  const INDEX_KEYS = [
+    'index.auto_index_on_browse',
+    'index.scheduled_scans',
+    'index.quick_scan_minutes',
+    'index.full_scan_hours',
+    'index.scan_workers',
+    'index.max_entries_per_dir',
+    'index.ignore',
+  ];
+  const MEDIA_KEYS = [
+    'thumbnails.workers',
+    'thumbnails.preview_workers',
+    'thumbnails.video_timeout_secs',
+    'thumbnails.cache_max_bytes',
+    'thumbnails.max_source_bytes',
+    'thumbnails.video',
+    'media.audio_transcode',
+    'media.audio_cache_max_bytes',
+  ];
+  const JOB_KEYS = [
+    'jobs.io_workers',
+    'jobs.interactive_workers',
+    'jobs.transfer_workers',
+    'jobs.dir_size_workers',
+    'jobs.index_workers',
+    'jobs.archive_workers',
+    'jobs.media_workers',
+    'jobs.archive_per_user',
+    'jobs.queue_max',
+    'jobs.thumbnail_queue_max',
+    'jobs.dir_size_ttl_seconds',
+    'jobs.dir_size_error_retry_seconds',
+    'jobs.usage_cache_seconds',
+    'jobs.dir_size_use_logical',
+    'jobs.audit_retention_days',
+    'jobs.audit_max_rows',
+    'jobs.job_retention_days',
+  ];
+  const SECURITY_KEYS = [
+    'security.session_ttl_hours',
+    'security.cookie_secure',
+    'security.public_rate_limit_per_minute',
+    'security.trusted_proxies',
+    'max_entries_per_user',
+    'symlinks.allow_create',
+    'symlinks.follow_in_index',
+    'symlinks.follow_admin_links',
+    'symlinks.max_depth',
+    'symlinks.max_hops',
+  ];
+  const LOG_KEYS = ['log.retention_days'];
+
+  let highRiskUnlocked = $state(false);
+  let highRiskPrompt = $state(false);
+  let highRiskPassword = $state('');
+  let highRiskBusy = $state(false);
+  let highRiskError = $state('');
+  let restartConfirm = $state(false);
+
+  function syncInputStates(): void {
+    for (const key of Object.keys(NUMBER_DEFAULTS)) {
+      const value = Number(setting(key));
+      numberSettings[key] = Number.isFinite(value) ? value : (NUMBER_DEFAULTS[key] ?? 0);
+    }
+    const ignore = setting('index.ignore');
+    listSettings['index.ignore'] = Array.isArray(ignore) ? ignore.join('\n') : '';
+    const proxies = setting('security.trusted_proxies');
+    listSettings['security.trusted_proxies'] = Array.isArray(proxies)
+      ? proxies.join('\n')
+      : '';
+    previewEdge = Number(setting('thumbnails.preview_edge') ?? 2048);
+    jpegMaxMp = Number(setting('thumbnails.jpeg_max_pixels') ?? 1_000_000_000) / 1_000_000;
+    maxPixelsMp = Number(setting('thumbnails.max_pixels') ?? 50_000_000) / 1_000_000;
+    zipMaxFiles = Number(setting('downloads.zip_max_files') ?? 1000);
+    zipConcurrency = Number(setting('downloads.zip_concurrency') ?? 1);
+    brandNameInput = String(setting('ui.brand_name') ?? 'FileHub');
+  }
+
+  async function resetGroup(keys: string[], label: string): Promise<void> {
+    try {
+      await api.resetSettings(keys, csrf);
+      applySettingsSnapshot(await api.getSettings());
+      syncInputStates();
+      showToast(t($language, '{name}已恢复默认', { name: label }));
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '恢复默认失败'));
+    }
+  }
+
+  async function unlockHighRisk(): Promise<void> {
+    if (!highRiskPassword || highRiskBusy) return;
+    highRiskBusy = true;
+    highRiskError = '';
+    try {
+      await api.verifyAdminPassword(highRiskPassword, csrf);
+      highRiskUnlocked = true;
+      highRiskPrompt = false;
+      highRiskPassword = '';
+    } catch {
+      highRiskError = t($language, '密码错误');
+    } finally {
+      highRiskBusy = false;
+    }
+  }
+
+  async function restartNow(): Promise<void> {
+    restartConfirm = false;
+    try {
+      await api.restartServer(csrf);
+      showToast(t($language, '服务器正在重启…'));
+      window.setTimeout(() => window.location.reload(), 2500);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '重启失败'));
+    }
+  }
 </script>
 
 {#snippet saveState(key: string)}
@@ -810,6 +958,15 @@
           : t($language, '保存失败')}</small
     >
   {/if}
+{/snippet}
+
+{#snippet groupHeading(title: string, keys: string[])}
+  <div class="group-heading">
+    <h3>{t($language, title)}</h3>
+    <button type="button" class="small ghost" onclick={() => void resetGroup(keys, t($language, title))}
+      >{t($language, '恢复默认')}</button
+    >
+  </div>
 {/snippet}
 
 {#snippet numberRow(field: NumberField)}
@@ -1179,7 +1336,7 @@
       <h2>{t($language, '系统设置')}</h2>
 
       <div class="settings-group">
-        <h3>{t($language, '功能开关')}</h3>
+        {@render groupHeading('功能开关', FEATURE_KEYS)}
         <p class="settings-hint">
           {t($language, '关闭后，用户偏好设置中的对应选项会隐藏。后端仍会强制关闭该功能。')}
         </p>
@@ -1210,7 +1367,7 @@
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '下载与配额')}</h3>
+        {@render groupHeading('下载与配额', DOWNLOAD_KEYS)}
         <div class="setting-grid">
           <div class="setting-row wide">
             <span>{t($language, 'ZIP 下载限制')}</span>
@@ -1269,7 +1426,14 @@
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '缩略图与预览')}</h3>
+        {@render groupHeading('日志', LOG_KEYS)}
+        <div class="setting-grid">
+          {#each logNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+        </div>
+      </div>
+
+      <div class="settings-group">
+        {@render groupHeading('缩略图与预览', PREVIEW_KEYS)}
         <p class="settings-hint">
           {t($language, '预览长边范围 512–4096；像素上限按百万像素（MP）计；修改 worker 后需重启。')}
         </p>
@@ -1344,7 +1508,7 @@
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '新用户默认值')}</h3>
+        {@render groupHeading('新用户默认值', NEW_USER_KEYS)}
         <p class="settings-hint">
           {t($language, '只影响新建用户；已有用户继续使用自己的偏好。')}
         </p>
@@ -1392,7 +1556,7 @@
         </div>
       </div>
       <div class="settings-group">
-        <h3>{t($language, '上传')}</h3>
+        {@render groupHeading('上传', UPLOAD_KEYS)}
         <div class="setting-grid">
           {#each uploadNumberFields as field (field.key)}{@render numberRow(field)}{/each}
           {#each uploadByteFields as field (field.key)}{@render byteRow(field)}{/each}
@@ -1400,7 +1564,7 @@
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '解压限制')}</h3>
+        {@render groupHeading('解压限制', UNZIP_KEYS)}
         <p class="settings-warning">
           {t($language, '风险：上限过大可能让恶意 ZIP 占满磁盘/内存。建议总大小 ≤2GB、单文件 ≤2GB、压缩比 ≤200。')}
         </p>
@@ -1411,7 +1575,7 @@
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '索引')}</h3>
+        {@render groupHeading('索引', INDEX_KEYS)}
         <p class="settings-hint">
           {t($language, '扫描线程建议 2–4；HDD 用 2，SSD 可用 4。忽略项每行一个目录名。')}
         </p>
@@ -1423,7 +1587,7 @@
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '缩略图、媒体与转码')}</h3>
+        {@render groupHeading('缩略图、媒体与转码', MEDIA_KEYS)}
         <p class="settings-hint">
           {t($language, '视频转码需要 ffmpeg；修改开关或 worker 后需重启。')}
         </p>
@@ -1437,7 +1601,7 @@
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '任务与资源')}</h3>
+        {@render groupHeading('任务与资源', JOB_KEYS)}
         <p class="settings-warning">
           {t($language, '风险：提高 worker/队列会抢占 CPU、内存和磁盘 IO；8 核机器建议 worker 总数不超过 8，队列建议 128–1024。worker 和队列修改后需重启。')}
         </p>
@@ -1449,21 +1613,83 @@
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '安全与外部链接')}</h3>
+        <div class="group-heading">
+          <h3>{t($language, '安全与外部链接')}</h3>
+          {#if highRiskUnlocked}
+            <div class="group-actions">
+              <button
+                type="button"
+                class="small ghost"
+                onclick={() => void resetGroup(SECURITY_KEYS, t($language, '安全与外部链接'))}
+                >{t($language, '恢复默认')}</button
+              >
+              <button
+                type="button"
+                class="small ghost"
+                onclick={() => {
+                  highRiskUnlocked = false;
+                  highRiskPrompt = false;
+                }}>{t($language, '收起')}</button
+              >
+            </div>
+          {:else}
+            <button type="button" class="small" onclick={() => (highRiskPrompt = true)}
+              >{t($language, '展开')}</button
+            >
+          {/if}
+        </div>
         <p class="settings-warning">
           {t($language, '高风险：符号链接跟随、Cookie 安全开关和可信代理会影响访问边界。只在你清楚后果时修改。')}
         </p>
-        <div class="setting-grid">
-          {#each securityBoolFields as field (field.key)}{@render boolRow(field)}{/each}
-          {#each securityNumberFields as field (field.key)}{@render numberRow(field)}{/each}
-          {#each securityListFields as field (field.key)}{@render listRow(field)}{/each}
-        </div>
+        {#if highRiskPrompt && !highRiskUnlocked}
+          <form
+            class="high-risk-form"
+            onsubmit={(event) => {
+              event.preventDefault();
+              void unlockHighRisk();
+            }}
+          >
+            <input
+              type="password"
+              bind:value={highRiskPassword}
+              placeholder={t($language, '管理员密码')}
+              autocomplete="current-password"
+            />
+            <button type="submit" class="small" disabled={highRiskBusy || !highRiskPassword}
+              >{highRiskBusy ? t($language, '验证中…') : t($language, '确认展开')}</button
+            >
+            <button
+              type="button"
+              class="small ghost"
+              onclick={() => {
+                highRiskPrompt = false;
+                highRiskPassword = '';
+                highRiskError = '';
+              }}>{t($language, '取消')}</button
+            >
+            {#if highRiskError}<small class="danger-text">{highRiskError}</small>{/if}
+          </form>
+        {:else if !highRiskUnlocked}
+          <p class="settings-hint">{t($language, '展开此区域需要输入管理员密码。')}</p>
+        {/if}
+        {#if highRiskUnlocked}
+          <div class="setting-grid">
+            {#each securityBoolFields as field (field.key)}{@render boolRow(field)}{/each}
+            {#each securityNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+            {#each securityListFields as field (field.key)}{@render listRow(field)}{/each}
+          </div>
+        {/if}
       </div>
 
       <div class="settings-group">
-        <h3>{t($language, '日志')}</h3>
-        <div class="setting-grid">
-          {#each logNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+        <h3>{t($language, '服务器')}</h3>
+        <p class="settings-warning">
+          {t($language, '重启会中断所有请求和正在运行的任务。只在确认没有任务运行时操作。')}
+        </p>
+        <div>
+          <button type="button" class="small restart-button" onclick={() => (restartConfirm = true)}
+            >{t($language, '重启服务器')}</button
+          >
         </div>
       </div>
 
@@ -1518,6 +1744,15 @@
     danger
     onConfirm={() => void confirmDeletePath()}
     onCancel={() => (deletePathTarget = null)}
+  />{/if}
+{#if restartConfirm}<ConfirmDialog
+    open
+    title={t($language, '重启服务器')}
+    message={t($language, '重启会中断所有请求和正在运行的任务，确定继续？')}
+    confirmLabel={t($language, '重启')}
+    danger
+    onConfirm={() => void restartNow()}
+    onCancel={() => (restartConfirm = false)}
   />{/if}
 {#if deleteUser}<ConfirmDialog
     open
@@ -1618,6 +1853,42 @@
     color: var(--text);
     font-size: 14px;
     font-weight: 600;
+  }
+  .group-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .group-heading h3 {
+    margin: 8px 0 0;
+  }
+  .group-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .high-risk-form {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+  }
+  .high-risk-form input {
+    width: 220px;
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text);
+  }
+  .restart-button {
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+    color: var(--danger);
   }
   .setting-save {
     margin-left: 6px;

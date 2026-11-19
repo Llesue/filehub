@@ -787,7 +787,22 @@ const en: Record<string, string> = {
   '扫描线程建议 2–4；HDD 用 2，SSD 可用 4。忽略项每行一个目录名。': 'Use 2–4 scan workers; 2 for HDD and up to 4 for SSD. One ignore per line.',
   '视频转码需要 ffmpeg；修改开关后重启生效。': 'Video transcoding requires ffmpeg; restart after changing the switch.',
   '风险：提高 worker/队列会抢占 CPU、内存和磁盘 IO；8 核机器建议 worker 总数不超过 8，队列建议 128–1024。': 'Risk: more workers/queue slots consume CPU, memory and disk IO. On 8 cores keep total workers ≤8 and queue around 128–1024.',
-  '高风险：符号链接跟随、Cookie 安全开关和可信代理会影响访问边界。只在你清楚后果时修改。': 'High risk: symlink following, secure cookies and trusted proxies affect access boundaries. Change only if you understand the impact.',
+  '高风险：符号链接跟随、Cookie 安全开关和可信代理会影响访问边界。只在你清楚后果时修改。': 'High risk: symlink following, secure cookies and trusted proxies affect access boundaries. Change only if you understand the impact.',  恢复默认: 'Restore defaults',
+  '{name}已恢复默认': '{name} restored to defaults',
+  恢复默认失败: 'Could not restore defaults',
+  展开: 'Expand',
+  收起: 'Collapse',
+  管理员密码: 'Administrator password',
+  '验证中…': 'Verifying…',
+  确认展开: 'Unlock',
+  '展开此区域需要输入管理员密码。': 'Enter the administrator password to unlock this section.',
+  服务器: 'Server',
+  重启服务器: 'Restart server',
+  '重启会中断所有请求和正在运行的任务。只在确认没有任务运行时操作。': 'Restarting interrupts all requests and running jobs. Do it only when no job is active.',
+  '重启会中断所有请求和正在运行的任务，确定继续？': 'Restarting interrupts all requests and running jobs. Continue?',
+  重启: 'Restart',
+  '服务器正在重启…': 'Server is restarting…',
+  重启失败: 'Restart failed',
 };
 
 export function t(lang: Lang, key: string, vars?: Record<string, string | number>): string {
