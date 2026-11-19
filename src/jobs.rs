@@ -70,6 +70,10 @@ pub struct Job {
     key: String,
     #[serde(skip)]
     cancel_scope: Option<String>,
+    #[serde(skip)]
+    scope_path: Option<String>,
+    #[serde(skip)]
+    scope_recursive: bool,
     pub status: String,
     pub progress: usize,
     pub total: usize,
@@ -84,20 +88,31 @@ pub struct Job {
 
 impl Job {
     pub(crate) fn from_record(record: JobRecord) -> Self {
-        let cancel_scope = serde_json::from_str::<Value>(&record.payload)
-            .ok()
-            .and_then(|payload| {
-                payload
-                    .get("cancel_scope")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
+        let payload_value = serde_json::from_str::<Value>(&record.payload).ok();
+        let cancel_scope = payload_value.as_ref().and_then(|payload| {
+            payload
+                .get("cancel_scope")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let scope_path = payload_value.as_ref().and_then(|payload| {
+            payload
+                .get("real_path")
+                .and_then(Value::as_str)
+                .map(|value| value.trim_end_matches(['/', '\\']).to_owned())
+        });
+        let scope_recursive = payload_value
+            .as_ref()
+            .and_then(|payload| payload.get("recursive").and_then(Value::as_bool))
+            .unwrap_or(false);
         Self {
             id: record.id,
             user_id: record.user_id,
             kind: record.kind,
             key: record.job_key,
             cancel_scope,
+            scope_path,
+            scope_recursive,
             status: record.status,
             progress: record.progress.max(0) as usize,
             total: record.total.max(0) as usize,
@@ -210,17 +225,20 @@ pub struct JobManager {
     io: Arc<Semaphore>,
     interactive_io: Arc<Semaphore>,
     dir_size_io: Arc<Semaphore>,
+    index_io: Arc<Semaphore>,
     queue_limit: usize,
     thumbnail_queue_limit: usize,
     events: Arc<EventBus>,
 }
 
 impl JobManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Db,
         io_workers: usize,
         interactive_workers: usize,
         dir_size_workers: usize,
+        index_workers: usize,
         queue_limit: usize,
         thumbnail_queue_limit: usize,
         events: Arc<EventBus>,
@@ -237,6 +255,7 @@ impl JobManager {
             io: Arc::new(Semaphore::new(io_workers.max(1))),
             interactive_io: Arc::new(Semaphore::new(interactive_workers.max(1))),
             dir_size_io: Arc::new(Semaphore::new(dir_size_workers.max(1))),
+            index_io: Arc::new(Semaphore::new(index_workers.max(1))),
             queue_limit: queue_limit.max(1),
             thumbnail_queue_limit: thumbnail_queue_limit.max(1),
             events,
@@ -317,6 +336,73 @@ impl JobManager {
                 | JobKind::Unzip
                 | JobKind::MediaTranscode
         ) && payload.get("auto").and_then(Value::as_bool) != Some(true);
+        if kind == JobKind::Index
+            && let Some(scope) = payload.get("real_path").and_then(Value::as_str)
+        {
+            let scope = scope.trim_end_matches(['/', '\\']).to_owned();
+            let new_recursive = payload
+                .get("recursive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut supersede = Vec::new();
+            let mut covering = None;
+            {
+                let inner = self.inner.lock();
+                for job in inner.jobs.values() {
+                    if job.kind != "index" || !matches!(job.status.as_str(), "queued" | "running") {
+                        continue;
+                    }
+                    let Some(other) = job.scope_path.as_deref() else {
+                        continue;
+                    };
+                    let same = other == scope;
+                    let old_contains_new = job.scope_recursive
+                        && std::path::Path::new(&scope).starts_with(std::path::Path::new(other));
+                    let new_contains_old = new_recursive
+                        && std::path::Path::new(other).starts_with(std::path::Path::new(&scope));
+                    if old_contains_new && !same {
+                        covering = Some(job.clone());
+                        break;
+                    }
+                    if same {
+                        if new_recursive && !job.scope_recursive {
+                            supersede.push(job.id.clone());
+                        } else {
+                            covering = Some(job.clone());
+                            break;
+                        }
+                    } else if new_contains_old {
+                        supersede.push(job.id.clone());
+                    }
+                }
+            }
+            if let Some(job) = covering {
+                tracing::info!(
+                    job_id = %job.id,
+                    scope = %scope,
+                    "index job covered by an active parent; reusing"
+                );
+                return Ok(SubmitOutcome {
+                    job,
+                    created: false,
+                });
+            }
+            if !supersede.is_empty() {
+                let inner = self.inner.lock();
+                for id in &supersede {
+                    if let Some(token) = inner.cancel.get(id) {
+                        token.cancel();
+                    }
+                }
+                drop(inner);
+                tracing::info!(
+                    scope = %scope,
+                    superseded = supersede.len(),
+                    "index job supersedes active descendants"
+                );
+            }
+        }
+
         let id = format!("job_{}", crate::auth::random_token(12));
         let now = unix_now();
         let record = JobRecord {
@@ -404,6 +490,8 @@ impl JobManager {
             Some(Arc::clone(&self.interactive_io))
         } else if kind == JobKind::DirSize {
             Some(Arc::clone(&self.dir_size_io))
+        } else if kind == JobKind::Index {
+            Some(Arc::clone(&self.index_io))
         } else if kind.uses_shared_io() {
             Some(Arc::clone(&self.io))
         } else {
@@ -679,6 +767,7 @@ impl JobManager {
     }
 
     pub fn active_job_for_path(&self, kind: JobKind, path: &str) -> Option<Job> {
+        let target = path.trim_end_matches(['/', '\\']);
         let inner = self.inner.lock();
         inner
             .jobs
@@ -688,8 +777,14 @@ impl JobManager {
                 {
                     return false;
                 }
-                path == job.key
-                    || path
+                let Some(scope) = job.scope_path.as_deref() else {
+                    return false;
+                };
+                target == scope
+                    || (job.scope_recursive
+                        && std::path::Path::new(target).starts_with(std::path::Path::new(scope)))
+                    || target == job.key
+                    || target
                         .strip_prefix(&job.key)
                         .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
             })

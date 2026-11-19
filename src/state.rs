@@ -223,6 +223,7 @@ impl AppState {
             snapshot.settings.jobs.io_workers,
             snapshot.settings.jobs.interactive_workers,
             snapshot.settings.jobs.dir_size_workers,
+            snapshot.settings.jobs.index_workers,
             snapshot.settings.jobs.queue_max,
             snapshot.settings.jobs.thumbnail_queue_max,
             Arc::clone(&events),

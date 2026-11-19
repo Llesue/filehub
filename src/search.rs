@@ -38,9 +38,14 @@ pub async fn index(
         target.relative,
         if recursive { "tree" } else { "dir" }
     );
+    let real_path = std::path::Path::new(&target.root.real_path)
+        .join(&target.relative)
+        .to_string_lossy()
+        .to_string();
     let payload = json!({
         "root_id": target.root.id,
         "path": target.relative,
+        "real_path": real_path,
         "recursive": recursive,
         "requested_path": path,
         "covered_by": target.covered_by,

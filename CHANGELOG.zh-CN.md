@@ -24,6 +24,8 @@
 - 透明品牌图标不再露出主题色背景。
 - 修复短文件名与后缀被 `flex-grow` 撑开的问题；搜索 pathbar 不再残留文件夹图标。
 - `index.quick_scan_minutes` 默认从 10 分钟改为 60 分钟，避免大索引库一直跑 scheduled quick scan；目录浏览仍会触发按需索引。
+- 索引扫描多线程化：`index.scan_workers`（默认 4）并行扫描目录，单线程批量落库；`jobs.index_workers`（默认 2）让 scheduled scan 与浏览按需索引不再互堵。
+- 索引任务去重/包含协调：同一路径复用现有任务；新的递归父任务会取代已排队的子任务；被父任务覆盖的子任务不再重复入队。
 - 统一目录概览 / CSS 选择器弹窗的关闭按钮样式，去掉外框。
 - 有 ffmpeg 时检测视频音轨并对 AC3/EAC3/DTS/TrueHD 做仅音频转码，缓存 AAC 输出。
 - 终端物理磁盘/配额超过 1024 GB 时进位显示 TB。

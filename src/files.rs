@@ -403,6 +403,7 @@ async fn schedule_browse_index(
     let payload = json!({
         "root_id": root.id,
         "path": relative,
+        "real_path": real_path,
         "recursive": false,
         "auto": true,
     });

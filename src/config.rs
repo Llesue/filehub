@@ -128,6 +128,7 @@ pub struct IndexSettings {
     pub auto_index_on_browse: bool,
     pub scheduled_scans: bool,
     pub quick_scan_minutes: u64,
+    pub scan_workers: usize,
     pub full_scan_hours: u64,
 }
 
@@ -139,6 +140,7 @@ impl Default for IndexSettings {
             auto_index_on_browse: true,
             scheduled_scans: true,
             quick_scan_minutes: 60,
+            scan_workers: 4,
             full_scan_hours: 24,
         }
     }
@@ -272,6 +274,7 @@ pub struct JobsSettings {
     pub io_workers: usize,
     pub interactive_workers: usize,
     pub dir_size_workers: usize,
+    pub index_workers: usize,
     pub archive_workers: usize,
     pub archive_per_user: usize,
     pub queue_max: usize,
@@ -291,6 +294,7 @@ impl Default for JobsSettings {
             io_workers: 1,
             interactive_workers: 2,
             dir_size_workers: 1,
+            index_workers: 2,
             archive_workers: 1,
             archive_per_user: 2,
             queue_max: 256,

@@ -420,109 +420,43 @@ pub async fn quick_scan(
             .into_iter()
             .map(|(path, _id, mtime, status)| (path, mtime, status))
             .collect();
-        let batch_cancel = cancel.clone();
-        let batch_ignore = ignore.clone();
-        let batch_roots = roots.clone();
-        let batch = tokio::task::spawn_blocking(move || {
-            quick_scan_batch(
-                paths,
-                &batch_roots,
-                &batch_ignore,
-                &batch_cancel,
-                video_enabled,
-            )
-        })
-        .await
-        .map_err(|error| {
-            AppError::internal(anyhow::anyhow!("quick index scan task failed: {error}"))
-        })??;
-        stats.checked += batch.checked;
-        for error in batch.errors {
-            if stats.errors.len() < 20 {
-                stats.errors.push(error);
-            }
-        }
-
-        for change in batch.changes {
-            if cancel.is_cancelled() {
-                return Err(AppError::Cancelled);
-            }
-            let dir_id = state
-                .db
-                .upsert_index_dir(&change.path, change.mtime_ns)
-                .await
-                .map_err(AppError::internal)?;
-            let direct_size: u64 = change
-                .entries
-                .iter()
-                .filter(|entry| !entry.is_dir)
-                .map(|entry| entry.size.max(0) as u64)
-                .sum();
-            let child_paths: Vec<String> = change
-                .child_dirs
-                .iter()
-                .map(|child| child.to_string_lossy().to_string())
-                .collect();
-            let child_sizes = if child_paths.is_empty() {
-                std::collections::HashMap::new()
-            } else {
-                state
-                    .db
-                    .directory_size_values(child_paths)
+        let workers = state.settings().settings.index.scan_workers.clamp(1, 16);
+        let chunk_size = 250_usize;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(workers));
+        let batch_roots = Arc::new(roots.clone());
+        let batch_ignore = Arc::new(ignore.clone());
+        for group in paths.chunks(workers.saturating_mul(chunk_size)) {
+            let mut handles = Vec::new();
+            for chunk in group.chunks(chunk_size) {
+                let permit = Arc::clone(&semaphore)
+                    .acquire_owned()
                     .await
-                    .unwrap_or_default()
-            };
-            let mut total_size = direct_size;
-            let mut partial = change.partial;
-            for child in &change.child_dirs {
-                let child = child.to_string_lossy().to_string();
-                if let Some((status, child_size)) = child_sizes.get(&child)
-                    && matches!(status.as_str(), "ready" | "stale")
-                {
-                    total_size = total_size.saturating_add((*child_size).max(0) as u64);
-                } else {
-                    partial = true;
-                }
+                    .map_err(|_| AppError::internal(anyhow::anyhow!("index scanner closed")))?;
+                let roots = Arc::clone(&batch_roots);
+                let ignore = Arc::clone(&batch_ignore);
+                let cancel = cancel.clone();
+                let chunk = chunk.to_vec();
+                handles.push(tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    quick_scan_batch(chunk, &roots, &ignore, &cancel, video_enabled)
+                }));
             }
-            let count = state
-                .db
-                .replace_index_entries(dir_id, change.entries)
-                .await
-                .map_err(AppError::internal)?;
-            let _ = state
-                .db
-                .finish_index_dir(
-                    dir_id,
-                    "ready",
-                    count as i64,
-                    total_size.min(i64::MAX as u64) as i64,
-                    partial,
-                    change.error.as_deref(),
+            for handle in handles {
+                let batch = handle.await.map_err(|error| {
+                    AppError::internal(anyhow::anyhow!("quick index scan task failed: {error}"))
+                })??;
+                apply_quick_scan_batch(
+                    state,
+                    batch,
+                    &mut stats,
+                    &mut parents,
+                    &mut new_dir_candidates,
+                    cancel,
                 )
-                .await;
-            let _ = state.db.mark_directory_size_stale(&change.path).await;
-            for child in change.child_dirs {
-                new_dir_candidates.insert(child.to_string_lossy().to_string());
+                .await?;
+                progress(stats.checked, total);
             }
-            if let Some(parent) = Path::new(&change.path).parent() {
-                parents.insert(parent.to_path_buf());
-            }
-            stats.changed += 1;
-            stats.entries += count;
         }
-        let mut missing_targets = Vec::with_capacity(batch.missing.len());
-        for missing in batch.missing {
-            if let Some(parent) = Path::new(&missing).parent() {
-                parents.insert(parent.to_path_buf());
-            }
-            missing_targets.push(PathBuf::from(missing));
-            stats.missing += 1;
-        }
-        if !missing_targets.is_empty() {
-            state.invalidate_paths_exact(&missing_targets, None).await;
-            state.schedule_cache_cleanup(missing_targets);
-        }
-        progress(stats.checked, total);
     }
 
     for parent in parents {
@@ -542,6 +476,103 @@ pub async fn quick_scan(
     }
 
     Ok(stats)
+}
+
+async fn apply_quick_scan_batch(
+    state: &Arc<AppState>,
+    batch: QuickScanBatch,
+    stats: &mut QuickScanStats,
+    parents: &mut HashSet<PathBuf>,
+    new_dir_candidates: &mut HashSet<String>,
+    cancel: &CancellationToken,
+) -> Result<(), AppError> {
+    stats.checked += batch.checked;
+    for error in batch.errors {
+        if stats.errors.len() < 20 {
+            stats.errors.push(error);
+        }
+    }
+
+    for change in batch.changes {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let dir_id = state
+            .db
+            .upsert_index_dir(&change.path, change.mtime_ns)
+            .await
+            .map_err(AppError::internal)?;
+        let direct_size: u64 = change
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.size.max(0) as u64)
+            .sum();
+        let child_paths: Vec<String> = change
+            .child_dirs
+            .iter()
+            .map(|child| child.to_string_lossy().to_string())
+            .collect();
+        let child_sizes = if child_paths.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            state
+                .db
+                .directory_size_values(child_paths)
+                .await
+                .unwrap_or_default()
+        };
+        let mut total_size = direct_size;
+        let mut partial = change.partial;
+        for child in &change.child_dirs {
+            let child = child.to_string_lossy().to_string();
+            if let Some((status, child_size)) = child_sizes.get(&child)
+                && matches!(status.as_str(), "ready" | "stale")
+            {
+                total_size = total_size.saturating_add((*child_size).max(0) as u64);
+            } else {
+                partial = true;
+            }
+        }
+        let count = state
+            .db
+            .replace_index_entries(dir_id, change.entries)
+            .await
+            .map_err(AppError::internal)?;
+        let _ = state
+            .db
+            .finish_index_dir(
+                dir_id,
+                "ready",
+                count as i64,
+                total_size.min(i64::MAX as u64) as i64,
+                partial,
+                change.error.as_deref(),
+            )
+            .await;
+        let _ = state.db.mark_directory_size_stale(&change.path).await;
+        for child in change.child_dirs {
+            new_dir_candidates.insert(child.to_string_lossy().to_string());
+        }
+        if let Some(parent) = Path::new(&change.path).parent() {
+            parents.insert(parent.to_path_buf());
+        }
+        stats.changed += 1;
+        stats.entries += count;
+    }
+    let mut missing_targets = Vec::with_capacity(batch.missing.len());
+    for missing in batch.missing {
+        if let Some(parent) = Path::new(&missing).parent() {
+            parents.insert(parent.to_path_buf());
+        }
+        missing_targets.push(PathBuf::from(missing));
+        stats.missing += 1;
+    }
+    if !missing_targets.is_empty() {
+        state.invalidate_paths_exact(&missing_targets, None).await;
+        state.schedule_cache_cleanup(missing_targets);
+    }
+    Ok(())
 }
 
 const QUICK_SCAN_CHILD_LIMIT: usize = 500;
@@ -602,6 +633,7 @@ async fn queue_new_directory_indexes(
                 serde_json::json!({
                     "root_id": root.id,
                     "path": relative,
+                    "real_path": path,
                     "recursive": true,
                     "auto": "quick-scan",
                 }),
