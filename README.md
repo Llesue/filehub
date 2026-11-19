@@ -142,6 +142,29 @@ sc.exe stop FileHub
 
 Windows indexing uses the NTFS MFT fast path when available, then USN Journal incremental updates; it falls back to a normal directory scan when USN is unavailable.
 
+## Configuration
+
+`config.json` supplies deployment defaults; values changed in the admin UI are stored in SQLite and take precedence.
+
+The most important fields are:
+
+```json
+{
+  "listen": "0.0.0.0:8080",
+  "db_path": "/home/filehub/filehub.db",
+  "users_root": "/home/filehub/users",
+  "cache_dir": "/home/filehub/cache"
+}
+```
+
+See [`config.example.json`](config.example.json) for all options. On Windows the defaults are under `C:\ProgramData\FileHub`; an explicit config path can be passed at installation time:
+
+```powershell
+& "C:\Program Files\FileHub\filehub.exe" --config "C:\ProgramData\FileHub\config.json" service install
+```
+
+Do not expose FileHub directly to the public internet. Put it behind a TLS reverse proxy, enable `security.cookie_secure`, and keep the data directory private.
+
 ## Reverse proxy
 
 Do not expose FileHub directly to the public internet. Terminate TLS in Caddy or Nginx and forward traffic to FileHub over loopback or a private network. When the proxy runs on the same host, set `listen` to `127.0.0.1:8080` so FileHub cannot be reached around the proxy.
@@ -174,6 +197,7 @@ files.example.com {
         max_size 32MB
     }
 
+    # WebSocket upgrades (including /api/v1/terminal/ws) are proxied automatically.
     reverse_proxy 127.0.0.1:8080 {
         header_up Host {host}
         header_up X-Forwarded-For {remote_host}
@@ -213,6 +237,7 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8080;
 
+        # WebSocket: /api/v1/terminal/ws uses the upgrade map above.
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
@@ -230,29 +255,6 @@ server {
 ```
 
 Use `$remote_addr` rather than `$proxy_add_x_forwarded_for`: the latter appends to a client-supplied `X-Forwarded-For` header, so the first address can still be forged. If the proxy runs in Docker, use the container address or bridge network in `proxy_pass` and add the matching source address to `security.trusted_proxies`.
-
-## Configuration
-
-`config.json` supplies deployment defaults; values changed in the admin UI are stored in SQLite and take precedence.
-
-The most important fields are:
-
-```json
-{
-  "listen": "0.0.0.0:8080",
-  "db_path": "/home/filehub/filehub.db",
-  "users_root": "/home/filehub/users",
-  "cache_dir": "/home/filehub/cache"
-}
-```
-
-See [`config.example.json`](config.example.json) for all options. On Windows the defaults are under `C:\ProgramData\FileHub`; an explicit config path can be passed at installation time:
-
-```powershell
-& "C:\Program Files\FileHub\filehub.exe" --config "C:\ProgramData\FileHub\config.json" service install
-```
-
-Do not expose FileHub directly to the public internet. Put it behind a TLS reverse proxy, enable `security.cookie_secure`, and keep the data directory private.
 
 ## API
 

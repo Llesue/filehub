@@ -117,6 +117,7 @@ files.example.com {
         max_size 32MB
     }
 
+    # WebSocket（包括 /api/v1/terminal/ws）由 reverse_proxy 自动转发。
     reverse_proxy 127.0.0.1:8080 {
         header_up Host {host}
         header_up X-Forwarded-For {remote_host}
@@ -156,6 +157,7 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8080;
 
+        # WebSocket：/api/v1/terminal/ws 使用上面的 upgrade map。
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;

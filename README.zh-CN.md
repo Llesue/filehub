@@ -142,6 +142,29 @@ sc.exe stop FileHub
 
 Windows 索引优先使用 NTFS MFT，之后通过 USN Journal 做增量更新；USN 不可用时回退普通目录扫描。
 
+## 配置
+
+`config.json` 提供部署级默认值；后台修改的设置写入 SQLite，并优先于配置文件。
+
+最重要的字段：
+
+```json
+{
+  "listen": "0.0.0.0:8080",
+  "db_path": "/home/filehub/filehub.db",
+  "users_root": "/home/filehub/users",
+  "cache_dir": "/home/filehub/cache"
+}
+```
+
+完整配置见 [`config.example.json`](config.example.json)。Windows 默认使用 `C:\ProgramData\FileHub`；安装服务时可以显式指定配置：
+
+```powershell
+& "C:\Program Files\FileHub\filehub.exe" --config "C:\ProgramData\FileHub\config.json" service install
+```
+
+不要把 FileHub 直接暴露到公网。建议放在 TLS 反向代理后面，开启 `security.cookie_secure`，并限制数据目录权限。
+
 ## 反向代理
 
 不要把 FileHub 直接暴露到公网。由 Caddy 或 Nginx 终止 TLS，再通过回环地址或私有网络把流量转发给 FileHub。反向代理和 FileHub 在同一台机器时，建议把 `listen` 设为 `127.0.0.1:8080`，避免绕过代理直接访问。
@@ -174,6 +197,7 @@ files.example.com {
         max_size 32MB
     }
 
+    # WebSocket（包括 /api/v1/terminal/ws）由 reverse_proxy 自动转发。
     reverse_proxy 127.0.0.1:8080 {
         header_up Host {host}
         header_up X-Forwarded-For {remote_host}
@@ -213,6 +237,7 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8080;
 
+        # WebSocket：/api/v1/terminal/ws 使用上面的 upgrade map。
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
@@ -230,29 +255,6 @@ server {
 ```
 
 `$proxy_add_x_forwarded_for` 会追加客户端预置的 XFF，第一个地址仍可伪造，所以这里必须用 `$remote_addr` 覆盖。代理运行在 Docker 中时，`proxy_pass` 使用容器地址或网桥地址，并把对应的源地址加入 `security.trusted_proxies`。
-
-## 配置
-
-`config.json` 提供部署级默认值；后台修改的设置写入 SQLite，并优先于配置文件。
-
-最重要的字段：
-
-```json
-{
-  "listen": "0.0.0.0:8080",
-  "db_path": "/home/filehub/filehub.db",
-  "users_root": "/home/filehub/users",
-  "cache_dir": "/home/filehub/cache"
-}
-```
-
-完整配置见 [`config.example.json`](config.example.json)。Windows 默认使用 `C:\ProgramData\FileHub`；安装服务时可以显式指定配置：
-
-```powershell
-& "C:\Program Files\FileHub\filehub.exe" --config "C:\ProgramData\FileHub\config.json" service install
-```
-
-不要把 FileHub 直接暴露到公网。建议放在 TLS 反向代理后面，开启 `security.cookie_secure`，并限制数据目录权限。
 
 ## API
 
