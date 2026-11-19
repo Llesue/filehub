@@ -219,6 +219,36 @@ fn clear_active(inner: &mut Inner, kind: &str, key: &str, id: &str) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexScopeRelation {
+    Covered,
+    Supersede,
+    Unrelated,
+}
+
+fn index_scope_relation(
+    new_scope: &str,
+    new_recursive: bool,
+    old_scope: &str,
+    old_recursive: bool,
+) -> IndexScopeRelation {
+    let new_path = std::path::Path::new(new_scope);
+    let old_path = std::path::Path::new(old_scope);
+    if new_scope == old_scope {
+        if new_recursive && !old_recursive {
+            return IndexScopeRelation::Supersede;
+        }
+        return IndexScopeRelation::Covered;
+    }
+    if old_recursive && new_path.starts_with(old_path) {
+        return IndexScopeRelation::Covered;
+    }
+    if new_recursive && old_path.starts_with(new_path) {
+        return IndexScopeRelation::Supersede;
+    }
+    IndexScopeRelation::Unrelated
+}
+
 pub struct JobManager {
     db: Db,
     inner: Mutex<Inner>,
@@ -355,24 +385,13 @@ impl JobManager {
                     let Some(other) = job.scope_path.as_deref() else {
                         continue;
                     };
-                    let same = other == scope;
-                    let old_contains_new = job.scope_recursive
-                        && std::path::Path::new(&scope).starts_with(std::path::Path::new(other));
-                    let new_contains_old = new_recursive
-                        && std::path::Path::new(other).starts_with(std::path::Path::new(&scope));
-                    if old_contains_new && !same {
-                        covering = Some(job.clone());
-                        break;
-                    }
-                    if same {
-                        if new_recursive && !job.scope_recursive {
-                            supersede.push(job.id.clone());
-                        } else {
+                    match index_scope_relation(&scope, new_recursive, other, job.scope_recursive) {
+                        IndexScopeRelation::Covered => {
                             covering = Some(job.clone());
                             break;
                         }
-                    } else if new_contains_old {
-                        supersede.push(job.id.clone());
+                        IndexScopeRelation::Supersede => supersede.push(job.id.clone()),
+                        IndexScopeRelation::Unrelated => {}
                     }
                 }
             }
@@ -1040,5 +1059,42 @@ impl JobContext {
                 )
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod index_scope_tests {
+    use super::{IndexScopeRelation, index_scope_relation};
+
+    #[test]
+    fn scope_relations_cover_parent_child_and_siblings() {
+        assert_eq!(
+            index_scope_relation("/a", true, "/a/b", true),
+            IndexScopeRelation::Supersede
+        );
+        assert_eq!(
+            index_scope_relation("/a/b", true, "/a", true),
+            IndexScopeRelation::Covered
+        );
+        assert_eq!(
+            index_scope_relation("/a/c", true, "/a/b", true),
+            IndexScopeRelation::Unrelated
+        );
+        assert_eq!(
+            index_scope_relation("/a/bc", true, "/a/b", true),
+            IndexScopeRelation::Unrelated
+        );
+        assert_eq!(
+            index_scope_relation("/a", true, "/a", false),
+            IndexScopeRelation::Supersede
+        );
+        assert_eq!(
+            index_scope_relation("/a", false, "/a", true),
+            IndexScopeRelation::Covered
+        );
+        assert_eq!(
+            index_scope_relation("/a/b", false, "/a", true),
+            IndexScopeRelation::Covered
+        );
     }
 }
