@@ -593,6 +593,29 @@ async fn terminal_commands_workflow() {
     wait_job(&app, job_id).await;
     assert!(app.home.join("termwork/term.zip").exists());
 
+    let (status, body) = run_cmd(&app, format!("job {job_id}").as_str(), None).await;
+    ok(status, &body, "job detail");
+    assert!(body["output"].as_str().unwrap().contains("status:"));
+
+    let (status, body) = run_cmd(&app, "help unknown", None).await;
+    ok(status, &body, "help unknown");
+    assert!(body["output"].as_str().unwrap().contains("unknown command"));
+
+    let (status, body) = run_cmd_at(&app, "termwork", "mkdir sub").await;
+    ok(status, &body, "mkdir sub");
+    let (status, body) = run_cmd_at(&app, "termwork", "touch sub/x.txt").await;
+    ok(status, &body, "touch sub");
+    let (status, body) = run_cmd_at(&app, "termwork", "zip -r sub.zip sub").await;
+    ok(status, &body, "zip -r");
+    let output = body["output"].as_str().unwrap().to_owned();
+    let sub_job = output
+        .split_whitespace()
+        .find(|value| value.starts_with("job_"))
+        .unwrap()
+        .trim_end_matches(':');
+    wait_job(&app, sub_job).await;
+    assert!(app.home.join("termwork/sub.zip").exists());
+
     let (status, body) = run_cmd_at(&app, "termwork", "unzip term.zip -d extracted").await;
     ok(status, &body, "unzip");
     assert!(app.home.join("termwork/extracted/a.txt").is_file());
