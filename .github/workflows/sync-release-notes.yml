@@ -3,6 +3,7 @@ name: Sync release notes
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,10 +23,13 @@ jobs:
           version="${tag#v}"
           echo "Updating release notes for $tag"
           if [ -f "release-notes/${version}.md" ]; then
+            echo "using release-notes/${version}.md"
             cp "release-notes/${version}.md" /tmp/release-notes.md
+            wc -c /tmp/release-notes.md
             gh release edit "$tag" --notes-file /tmp/release-notes.md
             exit 0
           fi
+          echo "no custom notes; falling back to CHANGELOG"
           python3 - "$version" <<'PY'
           import re
           import sys
