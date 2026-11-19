@@ -6,6 +6,7 @@
   import { language, localeOf, t } from '../i18n';
   import { showNotice } from '../notices';
   import { showToast } from '../toast';
+  import { realtimeEvent } from '../events';
   import AssignPathDialog from './AssignPathDialog.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import ExternalPathDialog from './ExternalPathDialog.svelte';
@@ -120,8 +121,22 @@
     scheduleUsagePoll();
   }
 
-  onMount(() => void load());
+  let adminRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  onMount(() => {
+    void load();
+    const unsubscribe = realtimeEvent.subscribe((event) => {
+      if (event?.type !== 'user.updated' && event?.type !== 'roots.changed') return;
+      if (adminRefreshTimer) clearTimeout(adminRefreshTimer);
+      adminRefreshTimer = setTimeout(() => {
+        adminRefreshTimer = null;
+        void load();
+      }, 150);
+    });
+    return unsubscribe;
+  });
   onDestroy(() => {
+    if (adminRefreshTimer) clearTimeout(adminRefreshTimer);
     if (usageTimer) clearTimeout(usageTimer);
     if (settingFlushTimer) clearTimeout(settingFlushTimer);
     for (const timer of savedTimers.values()) clearTimeout(timer);

@@ -42,6 +42,10 @@ const eventTypes = [
   'edit.presence',
   'user.features_changed',
   'roots.changed',
+  'settings.changed',
+  'share.updated',
+  'user.updated',
+  'resync',
   'session.expired',
 ];
 
@@ -116,11 +120,47 @@ function leaseAlive(lease: LeaderLease | null, now = Date.now()): boolean {
   return lease !== null && now - lease.ts < LEASE_MS;
 }
 
-function dispatch(event: WireEvent): void {
+const BATCH_TYPES = new Set(['thumbnail.ready', 'thumbnail.failed']);
+const BATCH_MS = 80;
+let thumbQueue: WireEvent[] = [];
+let thumbTimer: ReturnType<typeof setTimeout> | null = null;
+
+function deliver(event: WireEvent): void {
   if (typeof event.type !== 'string' || event.data === null || typeof event.data !== 'object')
     return;
   realtimeActive.set(true);
   realtimeEvent.set({ type: event.type, data: event.data });
+}
+
+function broadcast(event: WireEvent): void {
+  try {
+    channel?.postMessage(event);
+  } catch {
+    // A closed channel simply means this tab no longer has followers.
+  }
+}
+
+function flushThumbs(): void {
+  thumbTimer = null;
+  if (thumbQueue.length === 0) return;
+  const events = thumbQueue;
+  thumbQueue = [];
+  const event =
+    events.length === 1
+      ? events[0]!
+      : { type: 'thumbnail.batch', data: { events } as Record<string, unknown> };
+  deliver(event);
+  broadcast(event);
+}
+
+function enqueue(event: WireEvent): void {
+  if (!BATCH_TYPES.has(event.type)) {
+    deliver(event);
+    broadcast(event);
+    return;
+  }
+  thumbQueue.push(event);
+  if (!thumbTimer) thumbTimer = setTimeout(flushThumbs, BATCH_MS);
 }
 
 function parseEvent(type: string, raw: string): void {
@@ -132,14 +172,11 @@ function parseEvent(type: string, raw: string): void {
   } catch {
     return;
   }
-  const event = { type, data };
-  dispatch(event);
-  try {
-    channel?.postMessage(event);
-  } catch {
-    // A closed channel simply means this tab no longer has followers.
-  }
+  enqueue({ type, data });
 }
+
+let openedOnce = false;
+let reconnecting = false;
 
 function openSource(): void {
   if (source || typeof EventSource === 'undefined') return;
@@ -150,10 +187,20 @@ function openSource(): void {
   for (const type of eventTypes) {
     source.addEventListener(type, (event) => parseEvent(type, (event as MessageEvent).data));
   }
-  source.onopen = () => realtimeActive.set(true);
+  source.onopen = () => {
+    realtimeActive.set(true);
+    if (openedOnce && reconnecting) {
+      reconnecting = false;
+      const event = { type: 'resync', data: { reason: 'reconnect' } };
+      deliver(event);
+      broadcast(event);
+    }
+    openedOnce = true;
+  };
   source.onerror = () => {
-    // EventSource reconnects on its own; keep the last known state meanwhile.
+    // EventSource reconnects on its own; ask the app to resync after it opens.
     realtimeActive.set(false);
+    reconnecting = true;
   };
 }
 
@@ -171,6 +218,8 @@ function becomeLeader(): void {
 function stepDown(): void {
   leader = false;
   closeSource();
+  openedOnce = false;
+  reconnecting = false;
   if (channel) realtimeActive.set(true);
 }
 
@@ -234,7 +283,7 @@ export function connectEvents(userId: number): void {
 
   try {
     channel = new BroadcastChannel(`${CHANNEL_PREFIX}.${userId}`);
-    channel.onmessage = (message: MessageEvent<WireEvent>) => dispatch(message.data);
+    channel.onmessage = (message: MessageEvent<WireEvent>) => deliver(message.data);
   } catch {
     channel = null;
     // Without BroadcastChannel a follower would never receive events, so
@@ -265,6 +314,11 @@ export function disconnectEvents(): void {
   clearLease();
   leader = false;
   closeSource();
+  if (thumbTimer) clearTimeout(thumbTimer);
+  thumbTimer = null;
+  thumbQueue = [];
+  openedOnce = false;
+  reconnecting = false;
   realtimeActive.set(false);
   try {
     channel?.close();

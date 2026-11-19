@@ -915,43 +915,37 @@ fn spawn_audit_writer(
             tokio::select! {
                 message = receiver.recv() => match message {
                     Some(AuditMessage::Record(record)) => {
-                        events.publish_admin(
-                            "audit.appended",
-                            serde_json::json!({
-                                "action": record.action,
-                                "path": record.path,
-                                "user_id": record.user_id,
-                            }),
-                        );
                         batch.push(record);
                         if batch.len() >= 200 {
-                            flush_audit_batch(&db, &mut batch).await;
+                            flush_audit_batch(&db, &mut batch, &events).await;
                         }
                     }
                     Some(AuditMessage::Flush(sender)) => {
-                        flush_audit_batch(&db, &mut batch).await;
+                        flush_audit_batch(&db, &mut batch, &events).await;
                         let _ = sender.send(());
                     }
                     None => {
-                        flush_audit_batch(&db, &mut batch).await;
+                        flush_audit_batch(&db, &mut batch, &events).await;
                         break;
                     }
                 },
                 _ = ticker.tick() => {
-                    flush_audit_batch(&db, &mut batch).await;
+                    flush_audit_batch(&db, &mut batch, &events).await;
                 }
             }
         }
     });
 }
 
-async fn flush_audit_batch(db: &Db, batch: &mut Vec<AuditRecord>) {
+async fn flush_audit_batch(db: &Db, batch: &mut Vec<AuditRecord>, events: &Arc<EventBus>) {
     if batch.is_empty() {
         return;
     }
+    let count = batch.len();
     let records = std::mem::take(batch);
-    if let Err(error) = db.audit_batch(records).await {
-        tracing::warn!(%error, "failed to flush audit batch");
+    match db.audit_batch(records).await {
+        Ok(()) => events.publish_admin("audit.appended", serde_json::json!({ "count": count })),
+        Err(error) => tracing::warn!(%error, "failed to flush audit batch"),
     }
 }
 

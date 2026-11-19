@@ -20,7 +20,13 @@ impl Event {
         if self.share_id.is_some() {
             return false;
         }
-        self.user_id == Some(user_id) || (self.admin_only && admin)
+        if self.admin_only {
+            return admin;
+        }
+        match self.user_id {
+            Some(owner) => owner == user_id,
+            None => true,
+        }
     }
 
     pub fn visible_to_share(&self, share_id: i64) -> bool {
@@ -56,6 +62,11 @@ impl EventBus {
 
     pub fn publish_admin(&self, event: &str, data: Value) {
         self.send(event, None, None, true, data);
+    }
+
+    /// Broadcast to every authenticated user.
+    pub fn publish_all(&self, event: &str, data: Value) {
+        self.send(event, None, None, false, data);
     }
 
     fn send(
@@ -119,5 +130,33 @@ mod tests {
         let third = receiver.try_recv().unwrap().id;
         assert_eq!(second, first + 1);
         assert_eq!(third, second + 1);
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn broadcast_events_are_visible_to_every_user() {
+        let bus = EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        bus.publish_all("settings.changed", json!({ "keys": ["ui.brand_name"] }));
+        let event = receiver.try_recv().unwrap();
+        assert!(event.visible_to_user(1, false));
+        assert!(event.visible_to_user(2, true));
+        assert!(event.visible_to_user(3, false));
+        assert!(!event.visible_to_share(1));
+    }
+
+    #[test]
+    fn admin_only_events_stay_admin_only() {
+        let bus = EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        bus.publish_admin("user.updated", json!({ "id": 1 }));
+        let event = receiver.try_recv().unwrap();
+        assert!(event.visible_to_user(1, true));
+        assert!(!event.visible_to_user(1, false));
     }
 }

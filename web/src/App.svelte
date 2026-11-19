@@ -222,6 +222,7 @@
   let blankMenuUp = $state(false);
   let terminalOpen = $state(false);
   let terminalMinimized = $state(false);
+  let rootsRefreshTimer: number | null = null;
   let jobProgressRestored = $state(false);
   let terminalAvailable = $derived(
     capabilities.terminal &&
@@ -450,7 +451,32 @@
         void loadPreferences();
       }
       if (event.type === 'roots.changed') {
-        void refreshRoots();
+        scheduleRootsRefresh();
+      }
+      if (event.type === 'settings.changed') {
+        void loadPreferences();
+        void loadBranding();
+      }
+      if (event.type === 'resync') {
+        scheduleRootsRefresh();
+        void loadUsage();
+        void loadPreferences();
+        if (user) void restoreJobs(user.id);
+      }
+      if (event.type === 'thumbnail.batch') {
+        const items = event.data.events;
+        if (Array.isArray(items)) {
+          for (const item of items) {
+            if (
+              item &&
+              typeof item === 'object' &&
+              (item as { type?: unknown }).type !== undefined
+            ) {
+              const typed = item as { type: string; data: Record<string, unknown> };
+              handleThumbnailEvent(typed.type, typed.data);
+            }
+          }
+        }
       }
       if (event.type === 'notification') {
         const kind = String(event.data.kind ?? 'notice');
@@ -909,6 +935,14 @@
 
   /// Refresh the sidebar roots after an admin change without resetting the
   /// current browse position unless the root disappeared.
+  function scheduleRootsRefresh(): void {
+    if (rootsRefreshTimer !== null) window.clearTimeout(rootsRefreshTimer);
+    rootsRefreshTimer = window.setTimeout(() => {
+      rootsRefreshTimer = null;
+      void refreshRoots();
+    }, 120);
+  }
+
   async function refreshRoots(): Promise<void> {
     try {
       const result = await api.roots();

@@ -224,7 +224,12 @@ async fn events_stream(
                         .data(data);
                     return Some((Ok::<_, Infallible>(out), receiver));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    let out = SseEvent::default()
+                        .event("resync")
+                        .data(json!({ "missed": missed }).to_string());
+                    return Some((Ok::<_, Infallible>(out), receiver));
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
@@ -235,6 +240,9 @@ async fn events_stream(
     response
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     Ok(response)
 }
 
@@ -693,6 +701,9 @@ async fn create_user(
         &headers,
     )
     .await;
+    state
+        .events
+        .publish_admin("user.updated", json!({ "id": id, "action": "created" }));
 
     Ok(Json(json!({ "user": user_json(&user) })))
 }
@@ -832,6 +843,9 @@ async fn update_user(
         &headers,
     )
     .await;
+    state
+        .events
+        .publish_admin("user.updated", json!({ "id": id, "action": "updated" }));
 
     Ok(Json(json!({ "user": user_json(&user) })))
 }
@@ -920,6 +934,9 @@ async fn delete_user(
         &headers,
     )
     .await;
+    state
+        .events
+        .publish_admin("user.updated", json!({ "id": id, "action": "deleted" }));
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -937,6 +954,13 @@ async fn get_settings(
 struct PutSettingRequest {
     key: String,
     value: Value,
+}
+
+fn notify_settings_changed(state: &Arc<AppState>, keys: &[String]) {
+    state.events.publish_all(
+        "settings.changed",
+        json!({ "keys": keys, "at": crate::db::unix_now() }),
+    );
 }
 
 async fn put_setting(
@@ -1008,6 +1032,7 @@ async fn put_setting(
         &headers,
     )
     .await;
+    notify_settings_changed(&state, std::slice::from_ref(&request.key));
 
     Ok(Json(settings_json(&state)))
 }
@@ -1127,6 +1152,7 @@ async fn patch_settings(
         &headers,
     )
     .await;
+    notify_settings_changed(&state, &keys);
 
     Ok(Json(settings_json(&state)))
 }
@@ -1172,6 +1198,7 @@ async fn reset_settings(
         &headers,
     )
     .await;
+    notify_settings_changed(&state, &request.keys);
     Ok(Json(json!({ "reset": request.keys.len() })))
 }
 
@@ -1256,6 +1283,7 @@ async fn delete_setting(
         &headers,
     )
     .await;
+    notify_settings_changed(&state, std::slice::from_ref(&key));
 
     Ok(Json(settings_json(&state)))
 }

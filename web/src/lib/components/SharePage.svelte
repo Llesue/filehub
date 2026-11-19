@@ -216,6 +216,10 @@
       }
       return;
     }
+    if (type === 'share.updated') {
+      void load();
+      return;
+    }
     if (type === 'share.revoked') {
       closeShareEvents();
       data = null;

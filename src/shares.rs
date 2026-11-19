@@ -253,6 +253,12 @@ pub async fn update(
     if !changed {
         return Err(AppError::NotFound);
     }
+    state
+        .events
+        .publish("share.updated", Some(current.user.id), json!({ "id": id }));
+    state
+        .events
+        .publish_share("share.updated", id, json!({ "id": id }));
     Ok(Json(json!({ "ok": true })))
 }
 
