@@ -24,7 +24,7 @@ set -euo pipefail
 MODE="${1:-linux}"
 HOST="${FILEHUB_BUILD_HOST:-parasite6}"
 REMOTE_DIR="${FILEHUB_BUILD_DIR:-/root/build/filehub}"
-JOBS="${FILEHUB_BUILD_JOBS:-6}"
+DEFAULT_JOBS="${FILEHUB_BUILD_JOBS:-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SSH_CMD="ssh -o BatchMode=yes"
 
@@ -53,6 +53,24 @@ esac
 if [[ ! -f "$ROOT/web/dist/index.html" ]]; then
   echo "web/dist is missing; run 'pnpm build' in web/ first" >&2
   exit 1
+fi
+
+if [[ -z "$DEFAULT_JOBS" ]]; then
+  read -r MEM_KB MAX_KB NPROC <<<"$(ssh "$HOST" "awk '/MemTotal/{m=\$2} END{print m}' /proc/meminfo; \
+    dmesg 2>/dev/null | sed -n 's/.*Max. dynamic memory size: \([0-9]*\) MB.*/\1/p' | tail -1; \
+    nproc" | tr '\n' ' ')"
+  MAX_KB=$(( ${MAX_KB:-0} * 1024 ))
+  NPROC="${NPROC:-1}"
+  # Hyper-V dynamic memory may report only the current balloon size; use the
+  # configured maximum when it is available.
+  [[ "$MAX_KB" -gt "$MEM_KB" ]] && MEM_KB="$MAX_KB"
+  # Keep roughly 1.5 GiB per rustc; the linker needs headroom too.
+  JOBS=$(( MEM_KB / 1500000 ))
+  [[ "$JOBS" -gt "$NPROC" ]] && JOBS="$NPROC"
+  [[ "$JOBS" -lt 1 ]] && JOBS=1
+  [[ "$JOBS" -gt 6 ]] && JOBS=6
+else
+  JOBS="$DEFAULT_JOBS"
 fi
 
 echo "syncing sources to $HOST:$REMOTE_DIR"
