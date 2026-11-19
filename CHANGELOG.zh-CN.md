@@ -29,6 +29,7 @@
 - 缩略图默认并发提高到 `thumbnails.workers=5` / `preview_workers=1`（4 个列表 + 1 个预览）。
 - `jobs.dir_size_workers` 默认 2，并复用索引的父子 scope 去重，避免目录大小任务重复扫同一子树。
 - `jobs.archive_workers` 默认 2、`jobs.media_workers` 默认 1，Archive/Unzip/视频转码改为独立 worker lane，不再和普通 IO 任务共用一条队列。
+- 复制/移动任务内部文件级并行：`jobs.transfer_workers` 默认 2；目录创建保持顺序，文件内容多线程复制，进度由协调线程汇总。
 - 统一目录概览 / CSS 选择器弹窗的关闭按钮样式，去掉外框。
 - 有 ffmpeg 时检测视频音轨并对 AC3/EAC3/DTS/TrueHD 做仅音频转码，缓存 AAC 输出。
 - 终端物理磁盘/配额超过 1024 GB 时进位显示 TB。

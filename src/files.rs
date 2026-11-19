@@ -2597,6 +2597,7 @@ async fn execute_transfer_job(
 
     let total_items = sources.len();
     let cancel = ctx.token();
+    let transfer_workers = state.settings().settings.jobs.transfer_workers.max(1);
     let mut source_sizes = Vec::with_capacity(total_items);
     let mut total_bytes = 0_u64;
     for source in &sources {
@@ -2698,19 +2699,21 @@ async fn execute_transfer_job(
                 }
             };
             if move_items {
-                fsops::move_path_with_progress(
+                fsops::move_path_parallel(
                     &source_path,
                     &target_path,
                     &job_cancel,
                     expected,
+                    transfer_workers,
                     &mut progress,
                 )
             } else {
-                fsops::copy_path_with_progress(
+                fsops::copy_path_parallel(
                     &source_path,
                     &target_path,
                     &job_cancel,
                     expected,
+                    transfer_workers,
                     &mut progress,
                 )
             }

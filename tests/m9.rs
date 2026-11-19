@@ -1308,3 +1308,43 @@ async fn terminal_lists_roots_and_transfers_across_roots() {
         "job output should use color codes"
     );
 }
+
+#[tokio::test]
+async fn transfer_job_copies_many_files_with_parallel_workers() {
+    let app = setup_app().await;
+    std::fs::create_dir_all(app.home.join("copy")).unwrap();
+    for dir in 0..4 {
+        let path = app.home.join(format!("many/d{dir}"));
+        std::fs::create_dir_all(&path).unwrap();
+        for file in 0..10 {
+            std::fs::write(path.join(format!("f{file}.txt")), format!("{dir}-{file}")).unwrap();
+        }
+    }
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/transfer-jobs",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "source_root": app.root_id,
+            "paths": ["many"],
+            "dest_root": app.root_id,
+            "dest_path": "copy",
+            "move_items": false,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let job = wait_job(&app, body["job_id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    for dir in 0..4 {
+        for file in 0..10 {
+            assert_eq!(
+                std::fs::read(app.home.join(format!("copy/many/d{dir}/f{file}.txt"))).unwrap(),
+                format!("{dir}-{file}").as_bytes()
+            );
+        }
+    }
+}

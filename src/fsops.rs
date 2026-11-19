@@ -4,6 +4,8 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
@@ -972,6 +974,225 @@ fn copy_file_cancellable(
     output.sync_all().map_err(io_error)?;
     std::fs::set_permissions(target, metadata.permissions()).map_err(io_error)?;
     Ok(())
+}
+
+/// Copy a tree with a bounded pool of file-copy workers.
+///
+/// Directory creation stays sequential; file contents are copied in parallel.
+/// Progress is reported from the coordinating thread so the callback does not
+/// need to be `Sync`.
+pub fn copy_path_parallel(
+    source: &Path,
+    target: &Path,
+    cancel: &CancellationToken,
+    total_bytes: u64,
+    workers: usize,
+    progress: &mut dyn FnMut(u64, u64, u64),
+) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(source).map_err(io_error)?;
+    if metadata.file_type().is_symlink() {
+        return Err(AppError::invalid_path(
+            "copying symbolic links is not supported",
+        ));
+    }
+    if std::fs::symlink_metadata(target).is_ok() {
+        return Err(AppError::conflict("copy target already exists"));
+    }
+
+    let mut directories = Vec::new();
+    let mut files: Vec<(PathBuf, PathBuf, std::fs::Permissions)> = Vec::new();
+    let mut stack = vec![(source.to_path_buf(), target.to_path_buf())];
+    while let Some((source_path, target_path)) = stack.pop() {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let metadata = std::fs::symlink_metadata(&source_path).map_err(io_error)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            directories.push(target_path.clone());
+            for entry in std::fs::read_dir(&source_path).map_err(io_error)? {
+                let entry = entry.map_err(io_error)?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".filehub-upload-")
+                {
+                    continue;
+                }
+                stack.push((entry.path(), target_path.join(entry.file_name())));
+            }
+        } else if metadata.is_file() {
+            files.push((source_path, target_path, metadata.permissions()));
+        } else {
+            remove_path_quiet(target);
+            return Err(AppError::invalid_path("unsupported file type"));
+        }
+    }
+
+    for directory in &directories {
+        if let Err(error) = std::fs::create_dir(directory) {
+            remove_path_quiet(target);
+            return Err(io_error(error));
+        }
+    }
+    if files.is_empty() {
+        progress(0, total_bytes, 0);
+        return Ok(());
+    }
+
+    let next = AtomicUsize::new(0);
+    let bytes_done = AtomicU64::new(0);
+    let files_done = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let failure: Mutex<Option<AppError>> = Mutex::new(None);
+    let (sender, receiver) = std::sync::mpsc::channel::<()>();
+    let worker_count = workers.max(1).min(files.len());
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let files = &files;
+            let stop = &stop;
+            let next = &next;
+            let cancel = &cancel;
+            let bytes_done = &bytes_done;
+            let files_done = &files_done;
+            let failure = &failure;
+            scope.spawn(move || {
+                let mut buffer = vec![0_u8; 1024 * 1024];
+                loop {
+                    if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= files.len() {
+                        break;
+                    }
+                    let (source_path, target_path, permissions) = &files[index];
+                    match copy_file_worker(
+                        source_path,
+                        target_path,
+                        permissions,
+                        cancel,
+                        &mut buffer,
+                    ) {
+                        Ok(copied) => {
+                            bytes_done.fetch_add(copied, Ordering::Relaxed);
+                            files_done.fetch_add(1, Ordering::Relaxed);
+                            let _ = sender.send(());
+                        }
+                        Err(AppError::Cancelled) => {
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(error) => {
+                            let mut slot =
+                                failure.lock().unwrap_or_else(|poison| poison.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(error);
+                            }
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for _ in receiver {
+            progress(
+                bytes_done.load(Ordering::Relaxed),
+                total_bytes,
+                files_done.load(Ordering::Relaxed) as u64,
+            );
+        }
+    });
+
+    if cancel.is_cancelled() {
+        remove_path_quiet(target);
+        return Err(AppError::Cancelled);
+    }
+    if let Some(error) = failure
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+    {
+        remove_path_quiet(target);
+        return Err(error);
+    }
+    progress(
+        bytes_done.load(Ordering::Relaxed),
+        total_bytes,
+        files_done.load(Ordering::Relaxed) as u64,
+    );
+    Ok(())
+}
+
+fn copy_file_worker(
+    source: &Path,
+    target: &Path,
+    permissions: &std::fs::Permissions,
+    cancel: &CancellationToken,
+    buffer: &mut [u8],
+) -> Result<u64, AppError> {
+    let mut input = std::fs::File::open(source).map_err(io_error)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut output = options.open(target).map_err(io_error)?;
+    let mut copied = 0_u64;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let read = std::io::Read::read(&mut input, buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read]).map_err(io_error)?;
+        copied = copied.saturating_add(read as u64);
+    }
+    output.sync_all().map_err(io_error)?;
+    std::fs::set_permissions(target, permissions.clone()).map_err(io_error)?;
+    Ok(copied)
+}
+
+pub fn move_path_parallel(
+    source: &Path,
+    target: &Path,
+    cancel: &CancellationToken,
+    total_bytes: u64,
+    workers: usize,
+    progress: &mut dyn FnMut(u64, u64, u64),
+) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(source).map_err(io_error)?;
+    if cancel.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
+    match std::fs::rename(source, target) {
+        Ok(()) => {
+            progress(total_bytes, total_bytes, 1);
+            Ok(())
+        }
+        Err(error) if crate::platform::is_cross_device_error(&error) => {
+            if metadata.file_type().is_symlink() {
+                return Err(AppError::invalid_path(
+                    "moving symbolic links across filesystems is not supported",
+                ));
+            }
+            copy_path_parallel(source, target, cancel, total_bytes, workers, progress)?;
+            if cancel.is_cancelled() {
+                remove_path_quiet(target);
+                return Err(AppError::Cancelled);
+            }
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(source).map_err(io_error)
+            } else {
+                std::fs::remove_file(source).map_err(io_error)
+            }
+        }
+        Err(error) => Err(io_error(error)),
+    }
 }
 
 pub fn move_path(source: &Path, target: &Path) -> Result<(), AppError> {

@@ -273,6 +273,7 @@ impl Default for SecuritySettings {
 pub struct JobsSettings {
     pub io_workers: usize,
     pub interactive_workers: usize,
+    pub transfer_workers: usize,
     pub dir_size_workers: usize,
     pub index_workers: usize,
     pub archive_workers: usize,
@@ -294,6 +295,7 @@ impl Default for JobsSettings {
         Self {
             io_workers: 1,
             interactive_workers: 2,
+            transfer_workers: 2,
             dir_size_workers: 2,
             index_workers: 2,
             archive_workers: 2,
@@ -376,6 +378,9 @@ impl Settings {
         }
         if self.jobs.interactive_workers == 0 {
             bail!("jobs.interactive_workers must be greater than zero");
+        }
+        if self.jobs.transfer_workers == 0 {
+            bail!("jobs.transfer_workers must be greater than zero");
         }
         if self.jobs.dir_size_workers == 0 {
             bail!("jobs.dir_size_workers must be greater than zero");
