@@ -21,6 +21,11 @@ jobs:
           tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
           version="${tag#v}"
           echo "Updating release notes for $tag"
+          if [ -f "release-notes/${version}.md" ]; then
+            cp "release-notes/${version}.md" /tmp/release-notes.md
+            gh release edit "$tag" --notes-file /tmp/release-notes.md
+            exit 0
+          fi
           python3 - "$version" <<'PY'
           import re
           import sys
