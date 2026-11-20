@@ -12,6 +12,14 @@ The web UI is a Svelte 5 SPA embedded into the Rust binary. Data lives in SQLite
 
 Many years ago, on a WD My Cloud, I used FileBrowser for the first time and was amazed by its clean, elegant interface and how quickly it responded on low-powered hardware. Later, I needed multi-user authentication and the ability to manage arbitrary directories on my NAS, and FileBrowser gradually fell short of those needs. Then I was surprised to learn that FileBrowser had announced it was no longer being maintained—and the idea was born: build my own FileBrowser with the help of OpenCode and DeepSeek.
 
+## Demo
+
+https://filehub.ihtom.com
+
+- Account: `demo` / `filehub2026`
+- Public demo; the data resets every 24 hours
+- Do not upload private or sensitive data; treat all uploads as untrusted
+
 ## Use cases
 
 - Browser entry point for a home NAS or an external drive

@@ -12,6 +12,14 @@ FileHub 是一个单可执行文件的自托管文件管理器。它在浏览器
 
 很多年前，我在 WD My Cloud 上第一次使用 FileBrowser，被它简洁优雅的界面和在低性能机器上的快速响应所打动。后来，我有了多用户鉴权、以及管理 NAS 上任意目录的需求，FileBrowser 渐渐无法满足我；又惊闻 FileBrowser 已宣布停止更新，于是萌生了一个想法：借助 OpenCode 和 DeepSeek，开发一个属于自己的 FileBrowser。
 
+## 在线 Demo
+
+https://filehub.ihtom.com
+
+- 账号：`demo` / `filehub2026`
+- 公开演示环境，每 24 小时重置一次
+- 不要上传隐私或敏感数据，里面的文件一律视为不可信
+
 ## 使用场景
 
 - 家庭 NAS 或外接硬盘的浏览器入口

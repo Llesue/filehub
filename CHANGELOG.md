@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.12 - 2026-11-20
+
+### Fixed
+
+- Audit log timestamps stay on one line in the English UI, and the table scrolls horizontally on narrow screens.
+
 ## v0.1.11 - 2026-11-20
 
 ### Added
