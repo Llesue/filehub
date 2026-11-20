@@ -625,6 +625,7 @@ const en: Record<string, string> = {
   读取文件失败: 'Failed to read file',
   图片解码失败: 'Image decode failed',
   '图片过大，无法预览': 'Image is too large to preview',
+  无法识别图片格式: 'Unrecognized image format',
   下载原图: 'Download original',
   通知: 'Notifications',
   全部已读: 'Mark all read',

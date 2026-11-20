@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.10 - 2026-11-20
+
+### Fixed
+
+- Image dimension detection and the preview gate now sniff the content format instead of trusting the file extension; PNG payloads saved as `.jpg` (common in Immich backups) preview normally again.
+- Unsupported image formats now report "Unrecognized image format" instead of the misleading "Image is too large (unknown size)".
+- Linux aarch64 builds use `access(2)` instead of `faccessat2`, which Android/Termux seccomp rejects with `SIGSYS` (the process died with `invalid system call` right after startup).
+
 ## v0.1.9 - 2026-11-19
 
 ### Security

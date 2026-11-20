@@ -974,11 +974,11 @@ pub(crate) struct ImageHeader {
 /// Reads only the image header. Used by grid-thumbnail gating and the
 /// pre-open preview check; never decodes pixel data.
 pub(crate) fn inspect_image(path: &Path) -> Option<ImageHeader> {
-    let format = image::ImageReader::open(path)
+    let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
-        .ok()?
-        .format()?;
+        .ok()?;
+    let format = reader.format()?;
     if format == image::ImageFormat::Jpeg {
         let file = std::fs::File::open(path).ok()?;
         let mut decoder = jpeg_decoder::Decoder::new(file);
@@ -991,7 +991,10 @@ pub(crate) fn inspect_image(path: &Path) -> Option<ImageHeader> {
             cmyk: info.pixel_format == jpeg_decoder::PixelFormat::CMYK32,
         });
     }
-    let (width, height) = image::image_dimensions(path).ok()?;
+    // Read dimensions from the reader that already sniffed the content.
+    // `image::image_dimensions(path)` reopens the file and picks the decoder
+    // from the extension, so a PNG downloaded as `.jpg` would fail here.
+    let (width, height) = reader.into_dimensions().ok()?;
     Some(ImageHeader {
         width,
         height,
@@ -1390,6 +1393,24 @@ fn collect_cache_files(
 
 fn io_error(error: std::io::Error) -> AppError {
     AppError::internal(anyhow::Error::from(error))
+}
+
+#[cfg(test)]
+mod image_header_tests {
+    use super::inspect_image;
+
+    #[test]
+    fn reads_png_dimensions_when_extension_says_jpeg() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        image::RgbImage::from_pixel(8, 6, image::Rgb([10, 20, 30]))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+
+        let header = inspect_image(&path).expect("header");
+        assert_eq!((header.width, header.height), (8, 6));
+        assert!(!header.jpeg);
+    }
 }
 
 #[cfg(test)]

@@ -2252,10 +2252,14 @@
             info.width && info.height
               ? `${info.width}×${info.height}`
               : t($language, '未知尺寸');
-          showNoticeAction(
+          const message =
             info.reason === 'max_source'
               ? t($language, '文件过大，无法预览')
-              : t($language, '图片过大 {size}，无法预览', { size }),
+              : info.reason === 'unsupported'
+                ? t($language, '无法识别图片格式')
+                : t($language, '图片过大 {size}，无法预览', { size });
+          showNoticeAction(
+            message,
             t($language, '无法预览'),
             t($language, '下载文件'),
             () => downloadEntry(entry),
