@@ -150,13 +150,15 @@
     color: var(--text);
   }
   .audit-list {
+    overflow-x: auto;
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--surface);
   }
   .audit-row {
     display: grid;
-    grid-template-columns: 150px 110px 130px 130px minmax(120px, 1fr) minmax(100px, 1fr);
+    min-width: 900px;
+    grid-template-columns: 185px 110px 130px 130px minmax(120px, 1fr) minmax(100px, 1fr);
     gap: 10px;
     padding: 9px 12px;
     border-bottom: 1px solid var(--border);
@@ -169,6 +171,9 @@
   .detail {
     color: var(--text-2);
     font-family: var(--font-mono);
+  }
+  .time {
+    white-space: nowrap;
   }
   .ip {
     min-width: 0;
