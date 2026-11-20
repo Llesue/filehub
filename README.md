@@ -12,6 +12,17 @@ The web UI is a Svelte 5 SPA embedded into the Rust binary. Data lives in SQLite
 
 Many years ago, on a WD My Cloud, I used FileBrowser for the first time and was amazed by its clean, elegant interface and how quickly it responded on low-powered hardware. Later, I needed multi-user authentication and the ability to manage arbitrary directories on my NAS, and FileBrowser gradually fell short of those needs. Then I was surprised to learn that FileBrowser had announced it was no longer being maintained—and the idea was born: build my own FileBrowser with the help of OpenCode and DeepSeek.
 
+## What's new in 0.1.9
+
+- Security hardening: terminal root guards, symlink-safe public-share uploads, login enumeration protection, per-user feature policies, stricter temporary/cache/database permissions, and a per-user entry limit.
+- Terminal commands: `help`, `-h`/`--help`, `zip`, `unzip`, `job`/`jobs`, `roots`, long-format `ls`, and a 4-digit code for high-risk deletes.
+- ZIP archive and extraction jobs with progress, cancellation, numeric conflict suffixes, Zip Slip/symlink/duplicate/encrypted-entry rejection, and zip-bomb limits.
+- Search results now support sorting, list/grid views, thumbnails, multi-select, and single-root bulk delete/share.
+- Collapsible breadcrumbs, search-aware pathbar, smarter filename shortening, and a shared file-type classifier.
+- Video audio detection and audio-only transcoding for AC3/EAC3/DTS/TrueHD tracks when `ffmpeg` is available.
+- Per-user terminal/ZIP/unzip switches, a larger system-settings surface, group resets, and live SSE updates for roots/settings/shares.
+- Parallel indexing, directory-size scans, thumbnails, archive/transcode lanes, and file-level copy parallelism.
+
 ## Use cases
 
 - Browser entry point for a home NAS or an external drive
@@ -28,14 +39,14 @@ Many years ago, on a WD My Cloud, I used FileBrowser for the first time and was 
 ## Features
 
 - Browse, upload, download, rename, copy, move, and delete files and directories
-- Chunked, resumable uploads and streamed multi-file ZIP downloads
-- Directory index with full-text filename search
+- Chunked, resumable uploads, streamed multi-file ZIP downloads, and in-place ZIP archive/extract jobs
+- Directory index with full-text filename search and sortable, multi-select search results
 - Thumbnails for common image formats, with optional `ffmpeg` video frames
 - Public file and directory shares with password, expiry, read-only mode, visit counts, and optional uploads for writable directory shares
 - Inline text editor with ETag-based optimistic locking and Markdown preview
 - Per-user preferences, avatars, quotas, and read-only/writable storage roots
-- Admin console for users, external paths, quotas, global feature switches, and audit logs
-- Restricted command panel over WebSocket: no shell, only FileHub filesystem commands
+- Admin console for users, external paths, quotas, per-user feature switches, expanded system settings, and audit logs
+- Restricted command panel over WebSocket: `help`, `ls`, `tree`, `cp`, `mv`, `rm`, `zip`, `unzip`, `job`, `roots`, and safe-delete confirmation codes
 - Linux single-binary deployment; Windows LocalSystem service support
 
 ## Quick start
