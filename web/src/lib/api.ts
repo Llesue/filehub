@@ -46,6 +46,7 @@ export interface User {
   created_at: number;
   updated_at: number;
   last_login_at: number | null;
+  online?: boolean;
 }
 
 export interface AuthResponse {
@@ -59,6 +60,7 @@ export interface SetupStatus {
 }
 
 export interface SettingsResponse {
+  platform: string;
   settings: Record<string, unknown>;
   sources: Record<string, string>;
   restart_required: string[];
@@ -144,6 +146,7 @@ export interface ShareInfo {
   is_dir: boolean;
   has_password: boolean;
   expires_at: number | null;
+  expired: boolean;
   read_only: boolean;
   revoked: boolean;
   created_at: number;
@@ -246,6 +249,9 @@ export interface FileContent {
   line_ending?: 'lf' | 'crlf' | 'mixed';
   writable?: boolean;
   read_only_reason?: 'file' | 'directory' | null;
+  encoding?: string;
+  bom?: boolean;
+  lossy?: boolean;
 }
 
 export interface ShareEntry {
@@ -742,8 +748,14 @@ export const api = {
     );
   },
 
-  getFile(root: number, path: string): Promise<FileContent> {
+  dirVersion(root: number, path: string): Promise<{ mtime: number }> {
     const query = new URLSearchParams({ root: String(root), path });
+    return request<{ mtime: number }>(`/fs/dir-version?${query.toString()}`);
+  },
+
+  getFile(root: number, path: string, encoding?: string): Promise<FileContent> {
+    const query = new URLSearchParams({ root: String(root), path });
+    if (encoding) query.set('encoding', encoding);
     return request<FileContent>(`/file?${query.toString()}`);
   },
 
@@ -753,6 +765,8 @@ export const api = {
     content: string,
     etag: string,
     csrf: string,
+    encoding?: string,
+    bom?: boolean,
   ): Promise<{ etag: string; size: number }> {
     const query = new URLSearchParams({ root: String(root), path });
     return request<{ etag: string; size: number }>(
@@ -760,7 +774,7 @@ export const api = {
       {
         method: 'PUT',
         headers: { 'If-Match': etag },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, encoding, bom }),
       },
       csrf,
     );
@@ -1182,6 +1196,10 @@ export const api = {
     csrf: string,
   ): Promise<void> {
     return request<void>(`/shares/${id}`, { method: 'PUT', body: JSON.stringify(payload) }, csrf);
+  },
+
+  shareUrl(id: number): Promise<{ token: string; url: string }> {
+    return request<{ token: string; url: string }>(`/shares/${id}/url`);
   },
 
   rotateShare(id: number, csrf: string): Promise<{ token: string; url: string }> {

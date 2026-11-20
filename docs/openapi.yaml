@@ -450,6 +450,22 @@ paths:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
         '200': { description: OK }
+  /api/v1/fs/dir-version:
+    get:
+      tags: [files]
+      summary: 目录变更探测（mtime）
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Directory mtime
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mtime: { type: integer, format: int64 }
   /api/v1/fs/delete/preview:
     post:
       tags: [files]
@@ -739,6 +755,27 @@ paths:
       responses:
         '200': { description: Token returned once }
   /api/v1/shares/{id}:
+    put:
+      tags: [shares]
+      summary: 修改分享（权限、过期、密码、启停）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                read_only: { type: boolean }
+                expires_at: { type: integer, format: int64 }
+                clear_expires: { type: boolean }
+                password: { type: string }
+                clear_password: { type: boolean }
+                revoked: { type: boolean }
+      responses:
+        '200': { description: Updated }
+        '400': { description: Share would still be expired }
     delete:
       tags: [shares]
       summary: 撤销分享
@@ -746,6 +783,38 @@ paths:
         - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
       responses:
         '204': { description: Revoked }
+  /api/v1/shares/{id}/url:
+    get:
+      tags: [shares]
+      summary: 获取稳定的分享链接
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: Stable link
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  url: { type: string }
+  /api/v1/shares/{id}/rotate:
+    post:
+      tags: [shares]
+      summary: 重置分享链接（旧链接立即失效）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: New link
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  url: { type: string }
   /api/v1/public/shares/{token}:
     get:
       tags: [shares]
@@ -1071,6 +1140,214 @@ paths:
       responses:
         '200': { description: OK }
 
+  /api/v1/fs/copy:
+    post:
+      tags: [files]
+      summary: 复制到目录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, paths, dest]
+              properties:
+                root: { type: integer, format: int64 }
+                paths: { type: array, items: { type: string } }
+                dest: { type: string }
+      responses:
+        '200': { description: OK }
+  /api/v1/fs/move:
+    post:
+      tags: [files]
+      summary: 移动到目录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, paths, dest]
+              properties:
+                root: { type: integer, format: int64 }
+                paths: { type: array, items: { type: string } }
+                dest: { type: string }
+      responses:
+        '200': { description: OK }
+  /api/v1/fs/mkdir:
+    post:
+      tags: [files]
+      summary: 新建目录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, path]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string }
+      responses:
+        '200': { description: OK }
+  /api/v1/fs/rename:
+    post:
+      tags: [files]
+      summary: 重命名
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, path, name]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string }
+                name: { type: string }
+      responses:
+        '200': { description: OK }
+  /api/v1/fs/touch:
+    post:
+      tags: [files]
+      summary: 新建空文件
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, path]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string }
+      responses:
+        '200': { description: OK }
+  /api/v1/archive/zip:
+    post:
+      tags: [files]
+      summary: 创建 ZIP 打包任务
+      responses:
+        '200': { description: Job submitted }
+  /api/v1/archive/unzip:
+    post:
+      tags: [files]
+      summary: 创建解压任务
+      responses:
+        '200': { description: Job submitted }
+  /api/v1/media/audio-info:
+    get:
+      tags: [files]
+      summary: 读取视频音轨信息
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+  /api/v1/media/transcode:
+    post:
+      tags: [files]
+      summary: 提交音频转码任务
+      responses:
+        '200': { description: Job submitted }
+  /api/v1/media/transcoded:
+    get:
+      tags: [files]
+      summary: 下载转码缓存
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Transcoded media
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+  /api/v1/public/shares/{token}/thumb:
+    get:
+      tags: [shares]
+      summary: 公开分享缩略图
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: JPEG thumbnail
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+  /api/v1/public/shares/{token}/upload:
+    post:
+      tags: [shares]
+      summary: 向可写分享上传文件
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+  /api/v1/public/shares/{token}/zip:
+    post:
+      tags: [shares]
+      summary: 打包下载公开分享
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: ZIP stream
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+  /api/v1/admin/restart:
+    post:
+      tags: [admin]
+      summary: 重启服务进程
+      responses:
+        '200': { description: Restart accepted }
+  /api/v1/admin/settings/reset:
+    post:
+      tags: [admin]
+      summary: 恢复一组设置的默认值
+      responses:
+        '200': { description: OK }
+  /api/v1/admin/verify-password:
+    post:
+      tags: [admin]
+      summary: 校验管理员密码（高风险设置解锁）
+      responses:
+        '200': { description: Valid }
+        '401': { description: Invalid }
+  /api/v1/usage:
+    get:
+      tags: [files]
+      summary: 当前用户用量与配额
+      responses:
+        '200': { description: OK }
+  /api/v1/thumb/status:
+    get:
+      tags: [files]
+      summary: 查询缩略图状态
+      responses:
+        '200': { description: OK }
+  /api/v1/thumb/retry:
+    post:
+      tags: [files]
+      summary: 重试失败的缩略图
+      responses:
+        '200': { description: OK }
+  /api/v1/shares/{id}/purge:
+    delete:
+      tags: [shares]
+      summary: 删除分享记录
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '204': { description: Deleted }
+  /api/v1/admin/users/{id}/usage:
+    get:
+      tags: [admin]
+      summary: 查询指定用户用量
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200': { description: OK }
 components:
   securitySchemes:
     cookieAuth:

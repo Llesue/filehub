@@ -113,7 +113,7 @@
   .upload-panel {
     position: fixed;
     right: 20px;
-    bottom: 20px;
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
     z-index: 86;
     display: grid;
     width: min(460px, calc(100vw - 32px));

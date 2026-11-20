@@ -50,6 +50,11 @@ fn index_response() -> Response {
 
 fn asset_response(path: &str, file: EmbeddedFile) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let content_type = if path.ends_with(".webmanifest") {
+        "application/manifest+json"
+    } else {
+        mime.as_ref()
+    };
     let cache_control = if path.starts_with("assets/") {
         "public, max-age=31536000, immutable"
     } else {
@@ -59,7 +64,7 @@ fn asset_response(path: &str, file: EmbeddedFile) -> Response {
     let mut response = Response::new(Body::from(file.data.into_owned()));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        header::HeaderValue::from_str(mime.as_ref())
+        header::HeaderValue::from_str(content_type)
             .unwrap_or_else(|_| header::HeaderValue::from_static("application/octet-stream")),
     );
     response.headers_mut().insert(

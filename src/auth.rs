@@ -159,6 +159,19 @@ pub async fn current_user(
 
         validate_session(&session)?;
 
+        if session
+            .last_seen_at
+            .is_none_or(|at| crate::db::unix_now().saturating_sub(at) >= 60)
+        {
+            let db = state.db.clone();
+            let hash = token_hash.clone();
+            tokio::spawn(async move {
+                if let Err(error) = db.touch_session(&hash).await {
+                    tracing::warn!(%error, "failed to update session last_seen_at");
+                }
+            });
+        }
+
         return Ok(CurrentUser {
             user: session.user,
             csrf_token: Some(session.csrf_token),
@@ -293,7 +306,7 @@ fn forwarded_ip(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+pub(crate) fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
         std::net::IpAddr::V6(value) => value
             .to_ipv4_mapped()
@@ -324,7 +337,7 @@ fn parse_ip_rule(rule: &str) -> Option<(std::net::IpAddr, u8)> {
     Some((normalize_ip(address), prefix))
 }
 
-fn ip_matches_rule(peer: std::net::IpAddr, rule: &str) -> bool {
+pub(crate) fn ip_matches_rule(peer: std::net::IpAddr, rule: &str) -> bool {
     let Some((network, prefix)) = parse_ip_rule(rule) else {
         return false;
     };
@@ -390,12 +403,22 @@ struct LoginAttempt {
 }
 
 pub struct RateLimiter {
+    max_failures: u32,
+    window: std::time::Duration,
+    capacity: usize,
     attempts: Mutex<HashMap<String, LoginAttempt>>,
 }
 
 impl RateLimiter {
     pub fn new() -> Self {
+        Self::with(MAX_LOGIN_FAILURES, LOGIN_WINDOW, 4096)
+    }
+
+    pub fn with(max_failures: u32, window: std::time::Duration, capacity: usize) -> Self {
         Self {
+            max_failures,
+            window,
+            capacity,
             attempts: Mutex::new(HashMap::new()),
         }
     }
@@ -407,23 +430,29 @@ impl RateLimiter {
             return false;
         };
 
-        if attempt.first_failure.elapsed() > LOGIN_WINDOW {
+        if attempt.first_failure.elapsed() > self.window {
             attempts.remove(&key);
             return false;
         }
 
-        attempt.failures >= MAX_LOGIN_FAILURES
+        attempt.failures >= self.max_failures
     }
 
     pub fn record_failure(&self, username: &str) {
         let key = login_key(username);
         let mut attempts = self.attempts.lock();
+        if attempts.len() >= self.capacity {
+            attempts.retain(|_, attempt| attempt.first_failure.elapsed() <= self.window);
+            if attempts.len() >= self.capacity {
+                attempts.clear();
+            }
+        }
         let attempt = attempts.entry(key).or_insert(LoginAttempt {
             failures: 0,
             first_failure: Instant::now(),
         });
 
-        if attempt.first_failure.elapsed() > LOGIN_WINDOW {
+        if attempt.first_failure.elapsed() > self.window {
             attempt.failures = 0;
             attempt.first_failure = Instant::now();
         }

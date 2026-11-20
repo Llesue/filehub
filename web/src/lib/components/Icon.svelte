@@ -35,7 +35,8 @@
     | 'unlink'
     | 'volume'
     | 'volume-muted'
-    | 'bell';
+    | 'bell'
+    | 'more';
 
   let { name, size = 20 }: { name: IconName; size?: number } = $props();
 </script>
@@ -161,5 +162,9 @@
   {:else if name === 'bell'}
     <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
     <path d="M10 21h4" />
+  {:else if name === 'more'}
+    <circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
+    <circle cx="19" cy="12" r="1.3" fill="currentColor" stroke="none" />
   {/if}
 </svg>

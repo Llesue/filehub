@@ -7,17 +7,21 @@
 
   let {
     root,
+    userId,
     cwd,
     csrf,
     minimized = false,
+    visible = true,
     onClose,
     onMinimize,
     onRefresh,
   }: {
     root: number;
+    userId: number;
     cwd: string;
     csrf: string;
     minimized?: boolean;
+    visible?: boolean;
     onClose: () => void;
     onMinimize?: () => void;
     onRefresh: () => void;
@@ -29,6 +33,10 @@
   let input = $state('');
   let lines = $state<Line[]>([]);
   let busy = $state(false);
+  let started = false;
+  let history: string[] = [];
+  let historyIndex = -1;
+  let historyDraft = '';
   let pendingDelete = $state<string | null>(null);
   let pendingCode = $state<string | null>(null);
   let pendingCodeLine = $state<string | null>(null);
@@ -162,6 +170,14 @@
     return true;
   }
 
+  function disconnect(): void {
+    socket?.close();
+    socket = null;
+    connected = false;
+    started = false;
+    append('system', t($language, '已断开连接。'));
+  }
+
   function connect(): void {
     socket?.close();
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -213,11 +229,66 @@
 
   onMount(() => {
     workdir = cwd;
+    try {
+      const stored = JSON.parse(localStorage.getItem(`filehub.terminal.history:${userId}`) ?? '[]');
+      if (Array.isArray(stored)) {
+        history = stored.filter((value): value is string => typeof value === 'string').slice(-200);
+      }
+    } catch (error) {
+      console.warn('terminal history is corrupted', error);
+    }
+    historyIndex = history.length;
     void loadInfo();
-    connect();
-    requestAnimationFrame(() => inputElement?.focus());
+    if (visible) {
+      started = true;
+      connect();
+      requestAnimationFrame(() => inputElement?.focus());
+    }
     return () => socket?.close();
   });
+
+  $effect(() => {
+    if (!visible) return;
+    if (!started) {
+      started = true;
+      connect();
+    }
+    requestAnimationFrame(() => inputElement?.focus());
+  });
+
+  function pushHistory(line: string): void {
+    if (!line) return;
+    if (history[history.length - 1] !== line) history.push(line);
+    if (history.length > 200) history.shift();
+    historyIndex = history.length;
+    historyDraft = '';
+    try {
+      localStorage.setItem(`filehub.terminal.history:${userId}`, JSON.stringify(history));
+    } catch (error) {
+      console.warn('failed to persist terminal history', error);
+    }
+  }
+
+  function navigateHistory(direction: 1 | -1): void {
+    if (history.length === 0) return;
+    if (direction === -1) {
+      if (historyIndex === history.length) historyDraft = input;
+      if (historyIndex > 0) historyIndex -= 1;
+      input = history[historyIndex] ?? '';
+    } else {
+      if (historyIndex < history.length - 1) {
+        historyIndex += 1;
+        input = history[historyIndex] ?? '';
+      } else {
+        historyIndex = history.length;
+        input = historyDraft;
+      }
+    }
+    requestAnimationFrame(() => {
+      const element = inputElement;
+      if (element) element.selectionStart = element.selectionEnd = element.value.length;
+    });
+  }
 
   function focusInput(): void {
     requestAnimationFrame(() => inputElement?.focus());
@@ -268,6 +339,7 @@
     lines = [...lines, { kind: 'input', text: `$ ${line}` }];
 
     if (line === 'exit' || line === 'quit') {
+      disconnect();
       onClose();
       return;
     }
@@ -294,6 +366,7 @@
       return;
     }
 
+    pushHistory(line);
     execute(line, false);
   }
 </script>
@@ -309,6 +382,7 @@
 <div
   class="terminal-overlay"
   class:minimized
+  class:hidden={!visible}
   role="presentation"
   use:overlayGuard={minimizeOrClose}
 >
@@ -340,7 +414,15 @@
             <Icon name="minimize" size={16} />
           </button>
         {/if}
-        <button type="button" class="close" aria-label={t($language, '关闭终端')} onclick={onClose}>
+        <button
+          type="button"
+          class="close"
+          aria-label={t($language, '关闭终端')}
+          onclick={() => {
+            disconnect();
+            onClose();
+          }}
+        >
           <Icon name="close" size={16} />
         </button>
       </div>
@@ -366,6 +448,15 @@
           bind:value={input}
           disabled={busy || !connected}
           spellcheck="false"
+          onkeydown={(event) => {
+            if (event.key === 'ArrowUp') {
+              event.preventDefault();
+              navigateHistory(-1);
+            } else if (event.key === 'ArrowDown') {
+              event.preventDefault();
+              navigateHistory(1);
+            }
+          }}
         />
         {#if !connected}
           <button type="button" class="reconnect" onclick={connect}>{t($language, '重连')}</button>
@@ -384,13 +475,17 @@
     display: none;
   }
 
+  .terminal-overlay.hidden {
+    display: none;
+  }
+
   .terminal-overlay {
     position: fixed;
     inset: 0;
     z-index: 75;
     display: grid;
     place-items: center;
-    padding: 24px;
+    padding: 24px 24px max(24px, env(safe-area-inset-bottom, 24px));
     background: transparent;
   }
 

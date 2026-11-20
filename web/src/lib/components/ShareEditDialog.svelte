@@ -39,7 +39,7 @@
     onclick={(event) => event.stopPropagation()}
   >
     <header>
-      <h2>{t($language, '编辑共享')}</h2>
+      <h2>{t($language, '编辑分享')}</h2>
       <button type="button" class="icon-button" aria-label={t($language, '关闭')} onclick={onClose}>
         <Icon name="close" size={18} />
       </button>

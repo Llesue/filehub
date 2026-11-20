@@ -61,6 +61,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (26, include_str!("../migrations/0026_name_bigrams.sql")),
     (27, include_str!("../migrations/0027_user_features.sql")),
     (28, include_str!("../migrations/0028_job_kinds_archive.sql")),
+    (
+        29,
+        include_str!("../migrations/0029_share_stable_token.sql"),
+    ),
+    (30, include_str!("../migrations/0030_session_last_seen.sql")),
 ];
 
 pub fn unix_now() -> i64 {
@@ -112,6 +117,7 @@ pub struct SessionUser {
     pub user: User,
     pub csrf_token: String,
     pub expires_at: i64,
+    pub last_seen_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +278,7 @@ pub struct Share {
     pub kind: String,
     pub item_count: i64,
     pub token_hash: String,
+    pub token_nonce: i64,
     pub creator_id: i64,
     pub real_path: String,
     pub is_dir: bool,
@@ -745,7 +752,8 @@ impl Db {
         self.call(move |connection| {
             connection
                 .query_row(
-                    "SELECT u.*, s.csrf_token AS session_csrf, s.expires_at AS session_expires \
+                    "SELECT u.*, s.csrf_token AS session_csrf, s.expires_at AS session_expires, \
+                     s.last_seen_at AS session_last_seen \
                      FROM sessions s JOIN users u ON u.id = s.user_id \
                      WHERE s.token_hash = ?1 AND u.deleted_at IS NULL",
                     params![token_hash],
@@ -754,6 +762,7 @@ impl Db {
                             user: User::from_row(row)?,
                             csrf_token: row.get("session_csrf")?,
                             expires_at: row.get("session_expires")?,
+                            last_seen_at: row.get("session_last_seen")?,
                         })
                     },
                 )
@@ -1527,6 +1536,30 @@ impl Db {
                 |row| row.get::<_, i64>(0),
             )?;
             Ok(count.max(0) as usize)
+        })
+        .await
+    }
+
+    pub async fn touch_session(&self, token_hash: &str) -> anyhow::Result<()> {
+        let token_hash = token_hash.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE sessions SET last_seen_at = ?1 WHERE token_hash = ?2",
+                params![unix_now(), token_hash],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn online_user_ids(&self, since: i64, now: i64) -> anyhow::Result<Vec<i64>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT user_id FROM sessions \
+                 WHERE expires_at > ?1 AND COALESCE(last_seen_at, 0) >= ?2",
+            )?;
+            let rows = statement.query_map(params![now, since], |row| row.get(0))?;
+            rows.collect()
         })
         .await
     }
@@ -3649,7 +3682,8 @@ impl Db {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, creator_id, real_path, is_dir, password_hash, \
                  expires_at, read_only, revoked, created_at, visit_count, kind, \
-                 (SELECT COUNT(*) FROM share_items i WHERE i.share_id = shares.id) AS item_count \
+                 (SELECT COUNT(*) FROM share_items i WHERE i.share_id = shares.id) AS item_count, \
+                 token_nonce \
                  FROM shares WHERE creator_id = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
             )?;
             let rows = statement.query_map(params![creator_id, limit, offset], share_from_row)?;
@@ -3740,6 +3774,85 @@ impl Db {
         .await
     }
 
+    pub async fn find_share_by_id(&self, id: i64) -> anyhow::Result<Option<Share>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, token_hash, creator_id, real_path, is_dir, password_hash, \
+                     expires_at, read_only, revoked, created_at, visit_count, kind, \
+                     (SELECT COUNT(*) FROM share_items i WHERE i.share_id = shares.id) AS item_count, \
+                     token_nonce \
+                     FROM shares WHERE id = ?1",
+                    params![id],
+                    share_from_row,
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn share_token_secret(&self) -> anyhow::Result<String> {
+        self.call(move |connection| {
+            let existing: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM server_secrets WHERE name = 'share.token_secret'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(value) = existing {
+                return Ok(value);
+            }
+            let value = format!(
+                "{}{}",
+                crate::auth::random_token(24),
+                crate::auth::random_token(24)
+            );
+            connection.execute(
+                "INSERT OR IGNORE INTO server_secrets (name, value) \
+                 VALUES ('share.token_secret', ?1)",
+                params![value],
+            )?;
+            connection.query_row(
+                "SELECT value FROM server_secrets WHERE name = 'share.token_secret'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .await
+    }
+
+    pub async fn bump_share_nonce(&self, id: i64, creator_id: i64) -> anyhow::Result<Option<i64>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "UPDATE shares SET token_nonce = token_nonce + 1 \
+                     WHERE id = ?1 AND creator_id = ?2 RETURNING token_nonce",
+                    params![id, creator_id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn update_share_token_hash(
+        &self,
+        id: i64,
+        creator_id: i64,
+        token_hash: &str,
+    ) -> anyhow::Result<bool> {
+        let token_hash = token_hash.to_owned();
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "UPDATE shares SET token_hash = ?1 WHERE id = ?2 AND creator_id = ?3",
+                params![token_hash, id, creator_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
     pub async fn purge_share(&self, id: i64, creator_id: i64) -> anyhow::Result<bool> {
         self.call(move |connection| {
             let changed = connection.execute(
@@ -3768,7 +3881,8 @@ impl Db {
             connection
                 .query_row(
                     "SELECT id, token_hash, creator_id, real_path, is_dir, password_hash, \
-                     expires_at, read_only, revoked, created_at, visit_count, kind, 0 AS item_count \
+                     expires_at, read_only, revoked, created_at, visit_count, kind, 0 AS item_count, \
+                     token_nonce \
                      FROM shares WHERE token_hash = ?1",
                     params![token_hash],
                     share_from_row,
@@ -3805,6 +3919,7 @@ fn share_from_row(row: &Row<'_>) -> rusqlite::Result<Share> {
         visit_count: row.get(10)?,
         kind: row.get(11)?,
         item_count: row.get(12)?,
+        token_nonce: row.get(13)?,
     })
 }
 

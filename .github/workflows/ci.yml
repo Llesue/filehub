@@ -45,6 +45,11 @@ jobs:
           pnpm test
           pnpm build
 
+      - name: Settings and i18n coverage
+        run: |
+          node scripts/check-setting-keys.mjs
+          node scripts/check-i18n.mjs
+
       - name: Rust checks
         run: |
           cargo fmt --all -- --check

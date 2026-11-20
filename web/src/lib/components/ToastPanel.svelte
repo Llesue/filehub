@@ -10,7 +10,7 @@
   .toast {
     position: fixed;
     right: 20px;
-    bottom: 20px;
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
     z-index: 95;
     max-width: min(360px, calc(100vw - 40px));
     padding: 11px 16px;

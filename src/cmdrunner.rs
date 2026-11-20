@@ -664,6 +664,9 @@ pub(crate) async fn execute(
             let target_path = target.absolute.clone();
             let link_path = link.absolute.clone();
             let symlink = flags.contains(&'s');
+            if symlink && !state.settings().settings.symlinks.allow_create {
+                return Err(AppError::Forbidden);
+            }
             tokio::task::spawn_blocking(move || {
                 if symlink {
                     crate::platform::create_symlink(&target_path, &link_path)

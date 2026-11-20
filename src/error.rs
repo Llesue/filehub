@@ -27,6 +27,8 @@ pub enum AppError {
     ConfirmRequired,
     #[error("precondition failed")]
     PreconditionFailed,
+    #[error("the selected encoding cannot represent the content")]
+    EncodingUnrepresentable,
     #[error("unsupported media: {0}")]
     UnsupportedMedia(String),
     #[error("setup required")]
@@ -82,6 +84,7 @@ impl AppError {
             Self::Conflict(_) => "CONFLICT",
             Self::ConfirmRequired => "CONFIRM_REQUIRED",
             Self::PreconditionFailed => "PRECONDITION_FAILED",
+            Self::EncodingUnrepresentable => "ENCODING_UNREPRESENTABLE",
             Self::UnsupportedMedia(_) => "UNSUPPORTED_MEDIA",
             Self::SetupRequired => "SETUP_REQUIRED",
             Self::TooManyRequests => "RATE_LIMITED",
@@ -136,6 +139,11 @@ impl IntoResponse for AppError {
                 StatusCode::PRECONDITION_FAILED,
                 "PRECONDITION_FAILED",
                 "The file has changed".to_owned(),
+            ),
+            Self::EncodingUnrepresentable => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ENCODING_UNREPRESENTABLE",
+                "The selected encoding cannot represent the content".to_owned(),
             ),
             Self::UnsupportedMedia(message) => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,

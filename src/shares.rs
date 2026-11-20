@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::time::Duration;
 
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
+
 use crate::auth;
 use crate::authz;
 use crate::db::{Root, Share, unix_now};
@@ -18,6 +21,40 @@ use crate::error::AppError;
 use crate::fsops;
 use crate::pathresolver;
 use crate::state::{AppState, ShareTicket};
+
+type ShareHmac = Hmac<Sha256>;
+
+fn share_token_signature(secret: &str, id: i64, nonce: i64) -> Option<String> {
+    let mut mac = ShareHmac::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(format!("filehub-share:{id}:{nonce}").as_bytes());
+    let digest = mac.finalize().into_bytes();
+    Some(
+        digest
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn derive_share_token(secret: &str, id: i64, nonce: i64) -> Option<String> {
+    Some(format!(
+        "sh2_{id}_{nonce}_{}",
+        share_token_signature(secret, id, nonce)?
+    ))
+}
+
+fn parse_derived_share_token(token: &str) -> Option<(i64, i64, &str)> {
+    let rest = token.strip_prefix("sh2_")?;
+    let mut parts = rest.split('_');
+    let id = parts.next()?.parse().ok()?;
+    let nonce = parts.next()?.parse().ok()?;
+    let signature = parts.next()?;
+    if parts.next().is_some() || signature.len() != 32 {
+        return None;
+    }
+    Some((id, nonce, signature))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateShareRequest {
@@ -79,8 +116,14 @@ pub async fn create(
         ),
         None => None,
     };
-    let token = format!("sh_{}", auth::random_token(12));
-    let token_hash = auth::sha256_hex(&token);
+    let token_secret = state
+        .db
+        .share_token_secret()
+        .await
+        .map_err(AppError::internal)?;
+    // The real token is derived from the row id, so insert with an
+    // unreachable placeholder hash first.
+    let token_hash = auth::sha256_hex(&format!("pending-{}", auth::random_token(16)));
 
     let (id, audit_path, item_count) = if collection {
         let entries: Vec<(String, String, bool)> = items
@@ -127,6 +170,15 @@ pub async fn create(
             .map_err(AppError::internal)?;
         (id, real_path, 1)
     };
+
+    let token = derive_share_token(&token_secret, id, 0)
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("share token derivation failed")))?;
+    let real_hash = auth::sha256_hex(&token);
+    state
+        .db
+        .update_share_token_hash(id, current.user.id, &real_hash)
+        .await
+        .map_err(AppError::internal)?;
 
     audit(
         &state,
@@ -200,6 +252,29 @@ pub async fn update(
 ) -> Result<Json<Value>, AppError> {
     let current = auth::current_user(&state, &headers).await?;
     auth::require_csrf(&current, &headers)?;
+    let share = state
+        .db
+        .find_share_by_id(id)
+        .await
+        .map_err(AppError::internal)?
+        .filter(|share| share.creator_id == current.user.id)
+        .ok_or(AppError::NotFound)?;
+    if let Some(expires_at) = request.expires_at
+        && expires_at <= unix_now()
+    {
+        return Err(AppError::bad_request("expires_at must be in the future"));
+    }
+    let final_expiry = if request.clear_expires.unwrap_or(false) {
+        None
+    } else {
+        request.expires_at.or(share.expires_at)
+    };
+    let final_revoked = request.revoked.unwrap_or(share.revoked);
+    if !final_revoked && final_expiry.is_some_and(|expires| expires <= unix_now()) {
+        return Err(AppError::bad_request(
+            "share would still be expired; set a new expiry or clear it",
+        ));
+    }
     let mut changed = false;
     if let Some(read_only) = request.read_only {
         changed |= state
@@ -262,6 +337,41 @@ pub async fn update(
     Ok(Json(json!({ "ok": true })))
 }
 
+pub async fn url(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let share = state
+        .db
+        .find_share_by_id(id)
+        .await
+        .map_err(AppError::internal)?
+        .filter(|share| share.creator_id == current.user.id)
+        .ok_or(AppError::NotFound)?;
+    if share.revoked {
+        return Err(AppError::ShareRevoked);
+    }
+    if share
+        .expires_at
+        .is_some_and(|expires| expires <= unix_now())
+    {
+        return Err(AppError::ShareExpired);
+    }
+    let secret = state
+        .db
+        .share_token_secret()
+        .await
+        .map_err(AppError::internal)?;
+    let token = derive_share_token(&secret, share.id, share.token_nonce)
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("share token derivation failed")))?;
+    Ok(Json(json!({
+        "token": token,
+        "url": format!("/s/{token}"),
+    })))
+}
+
 pub async fn rotate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -269,16 +379,25 @@ pub async fn rotate(
 ) -> Result<Json<Value>, AppError> {
     let current = auth::current_user(&state, &headers).await?;
     auth::require_csrf(&current, &headers)?;
-    let token = format!("sh_{}", auth::random_token(12));
-    let token_hash = auth::sha256_hex(&token);
-    let changed = state
+    let secret = state
         .db
-        .rotate_share_token(id, current.user.id, &token_hash)
+        .share_token_secret()
         .await
         .map_err(AppError::internal)?;
-    if !changed {
-        return Err(AppError::NotFound);
-    }
+    let nonce = state
+        .db
+        .bump_share_nonce(id, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let token = derive_share_token(&secret, id, nonce)
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("share token derivation failed")))?;
+    let token_hash = auth::sha256_hex(&token);
+    state
+        .db
+        .update_share_token_hash(id, current.user.id, &token_hash)
+        .await
+        .map_err(AppError::internal)?;
     Ok(Json(json!({
         "token": token,
         "url": format!("/s/{token}"),
@@ -936,14 +1055,21 @@ pub async fn unlock(
     let Some(password_hash) = share.password_hash.as_deref() else {
         return Err(AppError::bad_request("share does not require a password"));
     };
-    let key = format!("share:{}", share.id);
+    let ip = auth::client_ip(&headers).unwrap_or_else(|| "unknown".to_owned());
+    let key = format!("share:{}:{ip}", share.id);
     if state.rate_limiter.is_blocked(&key) {
         return Err(AppError::TooManyRequests);
     }
 
+    let permit = state
+        .password_semaphore
+        .acquire()
+        .await
+        .map_err(|_| AppError::internal(anyhow::anyhow!("password semaphore closed")))?;
     let valid = auth::verify_password_async(request.password, password_hash.to_owned())
         .await
         .map_err(AppError::internal)?;
+    drop(permit);
     if !valid {
         state.rate_limiter.record_failure(&key);
         return Err(AppError::Unauthorized);
@@ -1569,13 +1695,36 @@ fn resolved_filename(share: &Share, path: &str) -> String {
 }
 
 async fn load_public_share(state: &Arc<AppState>, token: &str) -> Result<Share, AppError> {
-    let hash = auth::sha256_hex(token);
-    let share = state
-        .db
-        .find_share_by_hash(&hash)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or(AppError::NotFound)?;
+    let share = if let Some((id, nonce, signature)) = parse_derived_share_token(token) {
+        let secret = state
+            .db
+            .share_token_secret()
+            .await
+            .map_err(AppError::internal)?;
+        let expected = share_token_signature(&secret, id, nonce)
+            .ok_or_else(|| AppError::internal(anyhow::anyhow!("share token derivation failed")))?;
+        if !auth::constant_time_eq(&expected, signature) {
+            return Err(AppError::NotFound);
+        }
+        let share = state
+            .db
+            .find_share_by_id(id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?;
+        if share.token_nonce != nonce {
+            return Err(AppError::NotFound);
+        }
+        share
+    } else {
+        let hash = auth::sha256_hex(token);
+        state
+            .db
+            .find_share_by_hash(&hash)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or(AppError::NotFound)?
+    };
     if share.revoked {
         return Err(AppError::ShareRevoked);
     }
@@ -1685,6 +1834,7 @@ fn share_json(share: &Share) -> Value {
         "is_dir": share.is_dir,
         "has_password": share.password_hash.is_some(),
         "expires_at": share.expires_at,
+        "expired": share.expires_at.is_some_and(|expires| expires <= unix_now()),
         "read_only": share.read_only,
         "revoked": share.revoked,
         "created_at": share.created_at,
@@ -1713,4 +1863,37 @@ async fn audit(state: &Arc<AppState>, user_id: i64, action: &str, path: &str, he
             ip: auth::client_ip(headers),
         })
         .await;
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::{derive_share_token, parse_derived_share_token, share_token_signature};
+
+    #[test]
+    fn derives_verifiable_tokens() {
+        let token = derive_share_token("secret", 7, 0).expect("token");
+        assert!(token.starts_with("sh2_7_0_"));
+        let (id, nonce, signature) = parse_derived_share_token(&token).expect("parse");
+        assert_eq!((id, nonce), (7, 0));
+        assert_eq!(
+            share_token_signature("secret", id, nonce).as_deref(),
+            Some(signature)
+        );
+        assert_ne!(
+            share_token_signature("secret", 7, 1).as_deref(),
+            Some(signature)
+        );
+        assert_ne!(
+            share_token_signature("other", 7, 0).as_deref(),
+            Some(signature)
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_and_malformed_tokens() {
+        assert!(parse_derived_share_token("sh_abcdefghijkl").is_none());
+        assert!(parse_derived_share_token("sh2_7_0_short").is_none());
+        assert!(parse_derived_share_token("sh2_x_0_00").is_none());
+        assert!(parse_derived_share_token("sh2_7_0_00_extra").is_none());
+    }
 }

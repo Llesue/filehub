@@ -95,6 +95,19 @@ pub async fn index_path(
         && settings.settings.thumbnails.video
         && state.ffmpeg.is_some();
     let usn_states = state.db.usn_states().await.unwrap_or_default();
+    let scan_limits = ScanLimits {
+        follow_symlinks: settings.settings.symlinks.follow_in_index,
+        max_depth: settings.settings.symlinks.max_depth,
+        max_entries: settings.settings.index.max_entries_per_dir,
+    };
+    let scan_roots: Vec<String> = state
+        .db
+        .list_roots(user_id)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .map(|root| root.real_path)
+        .collect();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
     let scan_cancel = cancel.clone();
     let scan_base = base.clone();
@@ -106,6 +119,8 @@ pub async fn index_path(
             &scan_cancel,
             sender,
             &usn_states,
+            &scan_limits,
+            &scan_roots,
         )
     });
 
@@ -246,6 +261,13 @@ pub struct QuickScanStats {
     pub errors: Vec<String>,
 }
 
+#[derive(Clone)]
+struct ScanLimits {
+    follow_symlinks: bool,
+    max_depth: usize,
+    max_entries: usize,
+}
+
 struct QuickScanChange {
     path: String,
     mtime_ns: i64,
@@ -268,6 +290,7 @@ fn quick_scan_batch(
     ignore: &[String],
     cancel: &CancellationToken,
     video_enabled: bool,
+    limits: &ScanLimits,
 ) -> Result<QuickScanBatch, AppError> {
     let mut batch = QuickScanBatch {
         checked: 0,
@@ -314,7 +337,7 @@ fn quick_scan_batch(
         if mtime_ns == database_mtime && status == "ready" {
             continue;
         }
-        match read_directory_contents(real_path, ignore, cancel) {
+        match read_directory_contents(real_path, ignore, cancel, limits, roots, 0) {
             Ok(mut contents) => {
                 enrich_entries(&mut contents.entries, video_enabled);
                 batch.changes.push(QuickScanChange {
@@ -421,6 +444,11 @@ pub async fn quick_scan(
             .map(|(path, _id, mtime, status)| (path, mtime, status))
             .collect();
         let workers = state.settings().settings.index.scan_workers.clamp(1, 16);
+        let scan_limits = Arc::new(ScanLimits {
+            follow_symlinks: state.settings().settings.symlinks.follow_in_index,
+            max_depth: state.settings().settings.symlinks.max_depth,
+            max_entries: state.settings().settings.index.max_entries_per_dir,
+        });
         let chunk_size = 250_usize;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(workers));
         let batch_roots = Arc::new(roots.clone());
@@ -436,9 +464,10 @@ pub async fn quick_scan(
                 let ignore = Arc::clone(&batch_ignore);
                 let cancel = cancel.clone();
                 let chunk = chunk.to_vec();
+                let limits = Arc::clone(&scan_limits);
                 handles.push(tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    quick_scan_batch(chunk, &roots, &ignore, &cancel, video_enabled)
+                    quick_scan_batch(chunk, &roots, &ignore, &cancel, video_enabled, &limits)
                 }));
             }
             for handle in handles {
@@ -803,6 +832,7 @@ fn enrich_entries(entries: &mut [IndexEntry], video_enabled: bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_dirs_channel(
     base: &Path,
     recursive: bool,
@@ -810,7 +840,10 @@ fn collect_dirs_channel(
     cancel: &CancellationToken,
     sender: tokio::sync::mpsc::Sender<DirScan>,
     usn_states: &[crate::db::UsnState],
+    limits: &ScanLimits,
+    roots: &[String],
 ) -> Result<ScanOutcome, AppError> {
+    let mut visited: HashSet<(i64, i64)> = HashSet::new();
     #[cfg(windows)]
     if recursive {
         let volume = crate::winindex::volume_name(base).ok();
@@ -848,7 +881,17 @@ fn collect_dirs_channel(
                     }
                 }
                 for new_dir in &changes.new_dirs {
-                    match scan_walk(new_dir, true, ignore, cancel, &sender) {
+                    match scan_walk(
+                        new_dir,
+                        true,
+                        ignore,
+                        cancel,
+                        &sender,
+                        limits,
+                        roots,
+                        0,
+                        &mut visited,
+                    ) {
                         Ok(_) => {}
                         Err(AppError::Cancelled) => return Err(AppError::Cancelled),
                         Err(error) => {
@@ -904,7 +947,17 @@ fn collect_dirs_channel(
         }
     }
     let _ = usn_states;
-    scan_walk(base, recursive, ignore, cancel, &sender)?;
+    scan_walk(
+        base,
+        recursive,
+        ignore,
+        cancel,
+        &sender,
+        limits,
+        roots,
+        0,
+        &mut visited,
+    )?;
     Ok(ScanOutcome {
         removed: Vec::new(),
         usn: None,
@@ -923,6 +976,9 @@ fn read_directory_contents(
     path: &Path,
     ignore: &[String],
     cancel: &CancellationToken,
+    limits: &ScanLimits,
+    roots: &[String],
+    depth: usize,
 ) -> Result<DirectoryContents, AppError> {
     if cancel.is_cancelled() {
         return Err(AppError::Cancelled);
@@ -947,7 +1003,20 @@ fn read_directory_contents(
         Ok(entries) => entries,
         Err(error) => return Err(io_error(error)),
     };
+    let mut seen_entries = 0usize;
     for entry in read_dir {
+        seen_entries += 1;
+        if seen_entries > limits.max_entries {
+            partial = true;
+            if errors.len() < 10 {
+                errors.push(format!(
+                    "{}: entry limit {} reached",
+                    path.display(),
+                    limits.max_entries
+                ));
+            }
+            break;
+        }
         if cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
@@ -984,6 +1053,22 @@ fn read_directory_contents(
             }
         };
         if file_type.is_symlink() {
+            if !limits.follow_symlinks || depth >= limits.max_depth {
+                continue;
+            }
+            let Ok(target) = std::fs::canonicalize(entry.path()) else {
+                continue;
+            };
+            if !roots
+                .iter()
+                .any(|root| crate::platform::path_within(&target, std::path::Path::new(root)))
+            {
+                continue;
+            }
+            match std::fs::metadata(&target) {
+                Ok(metadata) if metadata.is_dir() => child_dirs.push(target),
+                _ => {}
+            }
             continue;
         }
         let metadata = match entry.metadata() {
@@ -1039,24 +1124,58 @@ fn read_directory_contents(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_walk(
     path: &Path,
     recursive: bool,
     ignore: &[String],
     cancel: &CancellationToken,
     sender: &tokio::sync::mpsc::Sender<DirScan>,
+    limits: &ScanLimits,
+    roots: &[String],
+    depth: usize,
+    visited: &mut HashSet<(i64, i64)>,
 ) -> Result<(bool, Vec<String>), AppError> {
+    if depth > limits.max_depth {
+        return Ok((
+            true,
+            vec![format!(
+                "{}: max depth {} reached",
+                path.display(),
+                limits.max_depth
+            )],
+        ));
+    }
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let identity = crate::platform::metadata_identity(&metadata);
+        if !visited.insert(identity) {
+            return Ok((
+                true,
+                vec![format!("{}: symlink loop skipped", path.display())],
+            ));
+        }
+    }
     let DirectoryContents {
         mtime_ns,
         entries,
         child_dirs,
         mut partial,
         mut errors,
-    } = read_directory_contents(path, ignore, cancel)?;
+    } = read_directory_contents(path, ignore, cancel, limits, roots, depth)?;
 
     if recursive {
         for child in child_dirs {
-            match scan_walk(&child, true, ignore, cancel, sender) {
+            match scan_walk(
+                &child,
+                true,
+                ignore,
+                cancel,
+                sender,
+                limits,
+                roots,
+                depth + 1,
+                visited,
+            ) {
                 Ok((child_partial, child_errors)) => {
                     partial |= child_partial;
                     for error in child_errors {
@@ -1094,4 +1213,72 @@ fn scan_walk(
 
 fn io_error(error: std::io::Error) -> AppError {
     AppError::internal(anyhow::Error::from(error))
+}
+
+#[cfg(all(test, unix))]
+mod scan_limit_tests {
+    use super::{ScanLimits, read_directory_contents};
+    use std::os::unix::fs::symlink;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn follows_symlinks_only_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("file.txt"), b"x").unwrap();
+        symlink(&target, root.join("link")).unwrap();
+
+        let roots = vec![root.to_string_lossy().to_string()];
+        let cancel = CancellationToken::new();
+        let enabled = ScanLimits {
+            follow_symlinks: true,
+            max_depth: 8,
+            max_entries: 100,
+        };
+        let contents = read_directory_contents(root, &[], &cancel, &enabled, &roots, 0).unwrap();
+        // The real directory plus the followed symlink both resolve to `target`.
+        assert_eq!(
+            contents
+                .child_dirs
+                .iter()
+                .filter(|path| path.ends_with("target"))
+                .count(),
+            2
+        );
+
+        let disabled = ScanLimits {
+            follow_symlinks: false,
+            max_depth: 8,
+            max_entries: 100,
+        };
+        let contents = read_directory_contents(root, &[], &cancel, &disabled, &roots, 0).unwrap();
+        assert_eq!(
+            contents
+                .child_dirs
+                .iter()
+                .filter(|path| path.ends_with("target"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn caps_entries_per_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            std::fs::write(dir.path().join(format!("file-{index}.txt")), b"x").unwrap();
+        }
+        let limits = ScanLimits {
+            follow_symlinks: false,
+            max_depth: 8,
+            max_entries: 2,
+        };
+        let contents =
+            read_directory_contents(dir.path(), &[], &CancellationToken::new(), &limits, &[], 0)
+                .unwrap();
+        assert_eq!(contents.entries.len(), 2);
+        assert!(contents.partial);
+    }
 }

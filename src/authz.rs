@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use crate::config::SymlinkSettings;
 use crate::db::{Root, TrustedLink};
 use crate::error::AppError;
 use crate::pathresolver::ResolvedPath;
@@ -30,10 +31,13 @@ pub async fn resolve(
         .await
         .map_err(AppError::internal)?;
     let path = path.to_owned();
+    let symlinks = state.settings().settings.symlinks.clone();
 
-    tokio::task::spawn_blocking(move || resolve_sync(root, roots, path, require_write, &links))
-        .await
-        .map_err(|err| AppError::internal(anyhow::anyhow!("authorization task failed: {err}")))?
+    tokio::task::spawn_blocking(move || {
+        resolve_sync(root, roots, path, require_write, &links, &symlinks)
+    })
+    .await
+    .map_err(|err| AppError::internal(anyhow::anyhow!("authorization task failed: {err}")))?
 }
 
 pub async fn resolve_many(
@@ -58,10 +62,20 @@ pub async fn resolve_many(
         .list_trusted_links()
         .await
         .map_err(AppError::internal)?;
+    let symlinks = state.settings().settings.symlinks.clone();
     tokio::task::spawn_blocking(move || {
         paths
             .into_iter()
-            .map(|path| resolve_sync(root.clone(), roots.clone(), path, require_write, &links))
+            .map(|path| {
+                resolve_sync(
+                    root.clone(),
+                    roots.clone(),
+                    path,
+                    require_write,
+                    &links,
+                    &symlinks,
+                )
+            })
             .collect()
     })
     .await
@@ -74,6 +88,7 @@ fn resolve_sync(
     path: String,
     require_write: bool,
     links: &[TrustedLink],
+    symlinks: &SymlinkSettings,
 ) -> Result<ResolvedPath, AppError> {
     if path.len() > 4096 || path.contains('\0') || path.contains('\\') || path.starts_with('/') {
         return Err(AppError::invalid_path("invalid path"));
@@ -119,6 +134,7 @@ fn resolve_sync(
     let mut current = root_path.clone();
     let mut access_override: Option<bool> = None;
     let mut used_trusted = false;
+    let mut hops = 0usize;
 
     for (index, component) in components.iter().enumerate() {
         let next = current.join(component);
@@ -126,6 +142,10 @@ fn resolve_sync(
 
         if let Ok(metadata) = std::fs::symlink_metadata(&next) {
             if metadata.file_type().is_symlink() {
+                hops += 1;
+                if hops > symlinks.max_hops {
+                    return Err(AppError::invalid_path("too many symbolic link hops"));
+                }
                 let link_path = next.to_string_lossy().to_string();
                 let target = std::fs::canonicalize(&next)
                     .map_err(|_| AppError::invalid_path("broken symlink"))?;
@@ -138,6 +158,11 @@ fn resolve_sync(
                 });
 
                 if !inside_root {
+                    if !symlinks.follow_admin_links {
+                        return Err(AppError::invalid_path(
+                            "symlink target is outside the authorized roots",
+                        ));
+                    }
                     let Some(link) = trusted.get(link_path.as_str()) else {
                         return Err(AppError::invalid_path(
                             "symlink target is outside the authorized roots",

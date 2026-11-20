@@ -83,18 +83,38 @@ async fn resolve_client_ip(
     next: Next,
 ) -> Response {
     let header = HeaderName::from_static(crate::auth::CLIENT_IP_HEADER);
-    // Never trust a client-supplied value for the internal header.
+    let scheme_header = HeaderName::from_static("x-filehub-scheme");
+    // Never trust client-supplied values for the internal headers.
     request.headers_mut().remove(&header);
+    request.headers_mut().remove(&scheme_header);
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
     if let Some(peer) = peer {
         let trusted = &state.settings().settings.security.trusted_proxies;
+        let peer_ip = crate::auth::normalize_ip(peer.ip());
+        let from_trusted_proxy = trusted
+            .iter()
+            .any(|rule| crate::auth::ip_matches_rule(peer_ip, rule));
         if let Some(ip) = crate::auth::resolve_client_ip(peer, request.headers(), trusted)
             && let Ok(value) = HeaderValue::from_str(&ip)
         {
             request.headers_mut().insert(header, value);
+        }
+        let forwarded = request
+            .headers()
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .unwrap_or("http");
+        let scheme = if from_trusted_proxy {
+            forwarded
+        } else {
+            request.uri().scheme_str().unwrap_or("http")
+        };
+        if let Ok(value) = HeaderValue::from_str(scheme) {
+            request.headers_mut().insert(scheme_header, value);
         }
     }
     next.run(request).await

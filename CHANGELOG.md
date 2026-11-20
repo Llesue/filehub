@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.1.11 - 2026-11-20
+
+### Added
+
+- Share QR codes in the share list and after creating a share.
+- Editor encoding picker with UTF-16, GBK/GB18030, Big5, Shift_JIS, EUC-KR and Windows-1252 round-trips.
+- Terminal command history via ↑/↓, persisted in localStorage.
+- Online indicator next to active users in the admin console.
+- CodeMirror 6 editor with lazy-loaded language support and Prism highlighting in Markdown previews.
+- PWA manifest, icons and iOS meta tags for installing FileHub to the home screen.
+
+### Changed
+
+- Share links are now stable: copying no longer rotates the token; a separate "Reset link" action does.
+- Expired shares are shown as stopped; enabling one extends it by one day and reports the new expiry.
+- The share expiry control is now an action selector instead of a misleading current-value dropdown.
+- Share list actions update in place instead of unmounting the list and jumping to the top.
+- Terminal close now hides the window and keeps the session and scrollback.
+- The viewed directory polls its mtime every 5 seconds and refreshes in place after external changes.
+- Admin settings apply the six previously inert symlink/index switches; restart-only fields are labelled.
+- Windows-only log retention is hidden on other platforms.
+- Markdown previews debounce rendering, pause live preview above 300KB, and style tables, quotes, lists and images.
+
+- Share dates use relative labels ("3 days ago", "in 5 hours") with the absolute time on hover.
+- Stopped shares only expose "Enable share" and "Delete"; other controls return after enabling.
+- The account menu is anchored below the avatar on mobile instead of the bottom edge.
+- Closing the terminal disconnects the WebSocket; minimizing keeps the session alive.
+
+- English translation coverage is now checked in `make check` and CI; missing keys fail the build.
+
+- Login is rate-limited per IP and Argon2 verifications are capped, preventing random-username CPU and memory abuse.
+- Share password attempts are limited per share and IP instead of locking the share globally.
+- The editor rejects known binary signatures before encoding detection.
+- Terminal close now disconnects and destroys the session; minimize keeps it alive.
+
+- Terminal command history is namespaced per user and cleared on logout.
+- `security.cookie_secure` is rejected unless the request arrives over HTTPS.
+- The PWA manifest uses a dedicated maskable icon with a safe margin.
+
+- The public share page no longer shows the live-connection dot; activity messages remain.
+
+### Fixed
+
+- Share management "copy link" no longer invalidates previously shared links.
+- Expired shares no longer make every expiry dropdown read "permanent".
+- Enabling an expired share is no longer a silent no-op.
+- Mobile dialogs are bottom sheets, respect safe areas and lock background scrolling.
+- Mobile file actions are reachable through a visible "⋯" menu.
+
 ## v0.1.10 - 2026-11-20
 
 ### Fixed

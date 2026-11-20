@@ -96,10 +96,10 @@
         needsPassword = true;
       } else if (err instanceof ApiError && err.code === 'SHARE_REVOKED') {
         data = null;
-        error = t($language, '共享已停止');
+        error = t($language, '分享已停止');
       } else if (err instanceof ApiError && err.code === 'SHARE_EXPIRED') {
         data = null;
-        error = t($language, '共享已过期');
+        error = t($language, '分享已过期');
       } else if (err instanceof ApiError && err.status === 404) {
         data = null;
         error = t($language, '分享不存在或链接无效');
@@ -223,7 +223,7 @@
     if (type === 'share.revoked') {
       closeShareEvents();
       data = null;
-      error = t($language, '共享已停止');
+      error = t($language, '分享已停止');
       return;
     }
     if (type === 'share.uploaded') {
@@ -584,19 +584,11 @@
       </div>
       {#if data}
         <h1>{data.name}</h1>
-        <div class="share-live">
-          <span
-            class="live-dot"
-            class:on={shareEventsConnected}
-            title={shareEventsConnected ? t($language, '实时更新已连接') : t($language, '实时更新未连接')}
-            aria-label={shareEventsConnected
-              ? t($language, '实时更新已连接')
-              : t($language, '实时更新未连接')}
-          ></span>
-          {#if shareActivity}
+        {#if shareActivity}
+          <div class="share-live">
             <span class="share-activity" role="status">{shareActivity}</span>
-          {/if}
-        </div>
+          </div>
+        {/if}
       {/if}
     </header>
 
@@ -989,17 +981,6 @@
     margin-top: 8px;
     color: var(--text-2);
     font-size: 12px;
-  }
-
-  .live-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--border);
-  }
-
-  .live-dot.on {
-    background: var(--file-sheet);
   }
 
   .share-activity {

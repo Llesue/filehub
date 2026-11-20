@@ -135,7 +135,7 @@
   <header class="page-header">
     <div>
       <h1>{t($language, '设置')}</h1>
-      <p>{t($language, '个人资料、偏好与共享管理')}</p>
+      <p>{t($language, '个人资料、偏好与分享管理')}</p>
     </div>
     <Icon name="settings" size={24} />
   </header>
@@ -148,7 +148,7 @@
       >{t($language, '偏好设置')}</button
     >
     <button type="button" class:active={tab === 'shares'} onclick={() => (tab = 'shares')}
-      >{t($language, '共享设置')}</button
+      >{t($language, '分享设置')}</button
     >
     <button type="button" class:active={tab === 'tokens'} onclick={() => (tab = 'tokens')}
       >API Token</button
@@ -517,5 +517,40 @@
 
   .danger {
     color: var(--danger);
+  }
+
+  @media (max-width: 640px) {
+    .settings-page {
+      padding: 12px;
+    }
+
+    dl {
+      grid-template-columns: 84px minmax(0, 1fr);
+    }
+
+    .token-form {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .token-form button {
+      width: 100%;
+    }
+
+    .share-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 12px;
+      padding: 10px 0;
+    }
+
+    .share-row .mono {
+      flex: 1 1 100%;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+
+    .share-row button {
+      margin-left: auto;
+    }
   }
 </style>

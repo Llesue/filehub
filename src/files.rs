@@ -1,7 +1,7 @@
 use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -2907,4 +2907,35 @@ mod tests {
         head[9..11].copy_from_slice(b"xx");
         assert_eq!(aac_primer_skip(&head), None);
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DirVersionQuery {
+    root: i64,
+    path: String,
+}
+
+/// Cheap change probe for the currently viewed directory. The client polls
+/// this while the tab is visible and reloads the listing in place when the
+/// mtime changes (for example after an SMB or rsync write).
+pub async fn dir_version(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DirVersionQuery>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let resolved = authz::resolve(&state, current.user.id, query.root, &query.path, false).await?;
+    let metadata = tokio::fs::metadata(&resolved.absolute)
+        .await
+        .map_err(fsops::io_error)?;
+    if !metadata.is_dir() {
+        return Err(AppError::NotFound);
+    }
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    Ok(Json(json!({ "mtime": mtime })))
 }

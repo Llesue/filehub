@@ -46,6 +46,8 @@ check: web-install
 	cd $(WEB) && $(PNPM) lint
 	cd $(WEB) && $(PNPM) check
 	cd $(WEB) && $(PNPM) test
+	node scripts/check-setting-keys.mjs
+	node scripts/check-i18n.mjs
 
 test: web-install
 	$(CARGO) test --all-targets

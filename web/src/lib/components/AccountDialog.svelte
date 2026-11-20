@@ -170,4 +170,22 @@
   .menu-section button.danger {
     color: var(--danger);
   }
+
+  @media (max-width: 640px) {
+    .account-overlay {
+      align-items: flex-start;
+      justify-content: flex-end;
+      padding: 60px 12px 12px;
+    }
+
+    .account-dialog {
+      width: min(300px, 100%);
+      max-height: calc(100dvh - 72px);
+      overflow-y: auto;
+    }
+
+    .menu-section button {
+      min-height: 44px;
+    }
+  }
 </style>

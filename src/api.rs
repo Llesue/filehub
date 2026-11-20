@@ -109,6 +109,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             put(crate::shares::update).delete(crate::shares::revoke),
         )
         .route("/shares/{id}/purge", delete(crate::shares::purge))
+        .route("/shares/{id}/url", get(crate::shares::url))
         .route("/shares/{id}/rotate", post(crate::shares::rotate))
         .route("/public/shares/{token}", get(crate::shares::public_meta))
         .route("/public/shares/{token}/unlock", post(crate::shares::unlock))
@@ -173,6 +174,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(crate::files::job_status).delete(crate::files::job_cancel),
         )
         .route("/fs/delete/preview", post(crate::files::delete_preview))
+        .route("/fs/dir-version", get(crate::files::dir_version))
         .route("/fs/delete", post(crate::files::delete_confirm))
         .route(
             "/admin/users/{id}/roots",
@@ -357,6 +359,23 @@ struct LoginRequest {
     password: String,
 }
 
+async fn verify_password_with_limit(
+    state: &Arc<AppState>,
+    password: String,
+    hash: String,
+) -> Result<bool, AppError> {
+    let permit = state
+        .password_semaphore
+        .acquire()
+        .await
+        .map_err(|_| AppError::internal(anyhow::anyhow!("password semaphore closed")))?;
+    let result = auth::verify_password_async(password, hash)
+        .await
+        .map_err(AppError::internal);
+    drop(permit);
+    result
+}
+
 async fn login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -364,6 +383,11 @@ async fn login(
 ) -> Result<Response, AppError> {
     let Json(request) = payload.map_err(json_rejection)?;
 
+    let client_ip = auth::client_ip(&headers).unwrap_or_else(|| "unknown".to_owned());
+    let ip_key = format!("login-ip:{client_ip}");
+    if state.ip_limiter.is_blocked(&ip_key) {
+        return Err(AppError::TooManyRequests);
+    }
     if state.rate_limiter.is_blocked(&request.username) {
         return Err(AppError::TooManyRequests);
     }
@@ -376,13 +400,14 @@ async fn login(
     else {
         // Burn the same Argon2 cost as a real account so timing does not
         // reveal whether the username exists.
-        auth::verify_password_async(
+        verify_password_with_limit(
+            &state,
             request.password.clone(),
             auth::DUMMY_PASSWORD_HASH.to_owned(),
         )
-        .await
-        .map_err(AppError::internal)?;
+        .await?;
         state.rate_limiter.record_failure(&request.username);
+        state.ip_limiter.record_failure(&ip_key);
         audit(
             &state,
             None,
@@ -396,19 +421,19 @@ async fn login(
     };
 
     if user.disabled {
-        auth::verify_password_async(request.password.clone(), user.password_hash.clone())
-            .await
-            .map_err(AppError::internal)?;
+        verify_password_with_limit(&state, request.password.clone(), user.password_hash.clone())
+            .await?;
         state.rate_limiter.record_failure(&request.username);
+        state.ip_limiter.record_failure(&ip_key);
         return Err(AppError::Unauthorized);
     }
 
-    let valid = auth::verify_password_async(request.password, user.password_hash.clone())
-        .await
-        .map_err(AppError::internal)?;
+    let valid =
+        verify_password_with_limit(&state, request.password, user.password_hash.clone()).await?;
 
     if !valid {
         state.rate_limiter.record_failure(&request.username);
+        state.ip_limiter.record_failure(&ip_key);
         audit(
             &state,
             Some(user.id),
@@ -615,9 +640,25 @@ async fn list_users(
     auth::require_admin(&current)?;
 
     let users = state.db.list_users().await.map_err(AppError::internal)?;
-    Ok(Json(json!({
-        "users": users.iter().map(user_json).collect::<Vec<_>>()
-    })))
+    let now = unix_now();
+    let online: std::collections::HashSet<i64> = state
+        .db
+        .online_user_ids(now - 300, now)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .collect();
+    let users_json: Vec<Value> = users
+        .iter()
+        .map(|user| {
+            let mut value = user_json(user);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("online".to_owned(), json!(online.contains(&user.id)));
+            }
+            value
+        })
+        .collect();
+    Ok(Json(json!({ "users": users_json })))
 }
 
 async fn create_user(
@@ -963,6 +1004,17 @@ fn notify_settings_changed(state: &Arc<AppState>, keys: &[String]) {
     );
 }
 
+fn request_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-filehub-scheme")
+        .and_then(|value| value.to_str().ok())
+        == Some("https")
+}
+
+fn cookie_secure_blocked(headers: &HeaderMap, value: &Value) -> bool {
+    value.as_bool() == Some(true) && !request_is_https(headers)
+}
+
 async fn put_setting(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -979,6 +1031,11 @@ async fn put_setting(
     if config::is_bootstrap_key(&request.key) {
         return Err(AppError::bad_request(
             "this setting is bootstrap-only and cannot be changed from the database",
+        ));
+    }
+    if request.key == "security.cookie_secure" && cookie_secure_blocked(&headers, &request.value) {
+        return Err(AppError::bad_request(
+            "security.cookie_secure requires HTTPS; enable it only behind TLS",
         ));
     }
 
@@ -1056,6 +1113,13 @@ async fn patch_settings(
     }
     if request.values.len() > 32 {
         return Err(AppError::bad_request("at most 32 settings per request"));
+    }
+    if let Some(value) = request.values.get("security.cookie_secure")
+        && cookie_secure_blocked(&headers, value)
+    {
+        return Err(AppError::bad_request(
+            "security.cookie_secure requires HTTPS; enable it only behind TLS",
+        ));
     }
 
     let mut encoded_values = Vec::with_capacity(request.values.len());
@@ -1348,6 +1412,7 @@ fn settings_json(state: &Arc<AppState>) -> Value {
         "settings": snapshot.effective,
         "sources": snapshot.sources,
         "restart_required": snapshot.restart_required,
+        "platform": std::env::consts::OS,
     })
 }
 

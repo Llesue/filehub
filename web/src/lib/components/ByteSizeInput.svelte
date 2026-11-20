@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { language, t } from '../i18n';
+
   let {
     value,
     min = 0,
@@ -49,7 +51,7 @@
     const selected = UNITS[unit] ?? UNITS[0]!;
     const bytes = Math.round(Number(number) * selected.factor);
     if (!Number.isFinite(bytes) || bytes < min || bytes > max) {
-      error = `范围 ${min} – ${max} 字节`;
+      error = t($language, '范围 {min} – {max} 字节', { min, max });
       const next = pick(value);
       number = Number(next.number.toFixed(2));
       unit = next.unit;

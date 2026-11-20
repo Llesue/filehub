@@ -39,7 +39,7 @@
   .progress-panel {
     position: fixed;
     right: 20px;
-    bottom: 20px;
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
     z-index: 85;
     width: min(360px, calc(100vw - 40px));
     padding: 12px 14px;

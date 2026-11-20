@@ -500,6 +500,26 @@
       });
   }
 
+  let touchStartX = 0;
+  let touchStartY = 0;
+
+  function onTouchStart(event: TouchEvent): void {
+    const touch = event.touches[0];
+    if (!touch) return;
+    touchStartX = touch.clientX;
+    touchStartY = touch.clientY;
+  }
+
+  function onTouchEnd(event: TouchEvent): void {
+    const touch = event.changedTouches[0];
+    if (!touch) return;
+    const dx = touch.clientX - touchStartX;
+    const dy = touch.clientY - touchStartY;
+    if (Math.abs(dx) < 60 || Math.abs(dy) > 50) return;
+    if (dx > 0) previous();
+    else next();
+  }
+
   function previous(): void {
     if (index > 0) {
       resetView();
@@ -563,23 +583,27 @@
   }
 </script>
 
+{#snippet imageTools()}
+  {#if current && !isVideo(current.name) && !isAudio(current.name) && !isPdf(current.name)}
+    <button type="button" onclick={() => (zoom = Math.max(0.2, zoom - 0.2))}>−</button>
+    <span class="zoom-value">{Math.round(zoom * 100)}%</span>
+    <button type="button" onclick={() => (zoom = Math.min(8, zoom + 0.2))}>+</button>
+    <button type="button" onclick={() => resetView()}>{t($language, '复位')}</button>
+    {#if !isSvgPreview && !isGifPreview}
+      <button type="button" onclick={toggleOriginal}>
+        {showOriginal ? t($language, '显示预览图') : t($language, '显示原图')}
+      </button>
+    {/if}
+  {/if}
+{/snippet}
+
 <svelte:window onkeydown={onKeydown} onpointermove={drag} onpointerup={endDrag} />
 
 <div class="lightbox" role="presentation" onclick={onClose}>
   <header class="lightbox-bar" role="presentation" onclick={(event) => event.stopPropagation()}>
     <strong><FileName name={current?.name ?? ''} /></strong>
     <div class="lightbox-actions">
-      {#if current && !isVideo(current.name) && !isAudio(current.name) && !isPdf(current.name)}
-        <button type="button" onclick={() => (zoom = Math.max(0.2, zoom - 0.2))}>−</button>
-        <span>{Math.round(zoom * 100)}%</span>
-        <button type="button" onclick={() => (zoom = Math.min(8, zoom + 0.2))}>+</button>
-        <button type="button" onclick={() => resetView()}>{t($language, '复位')}</button>
-        {#if !isSvgPreview && !isGifPreview}
-          <button type="button" onclick={toggleOriginal}>
-            {showOriginal ? t($language, '显示预览图') : t($language, '显示原图')}
-          </button>
-        {/if}
-      {/if}
+      <span class="desktop-image-tools">{@render imageTools()}</span>
       {#if current && isSvgPreview && onEditSource}
         <button type="button" onclick={() => onEditSource(current)}>
           {t($language, '编辑源码')}
@@ -600,6 +624,8 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="lightbox-stage"
+    ontouchstart={onTouchStart}
+    ontouchend={onTouchEnd}
     role="presentation"
     onclick={() => {
       if (dragged) {
@@ -690,15 +716,92 @@
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <footer class="lightbox-footer" onclick={(event) => event.stopPropagation()}>
-    <button type="button" onclick={previous} disabled={index <= 0}>{t($language, '上一项')}</button>
-    <span>{index + 1} / {items.length}</span>
-    <button type="button" onclick={next} disabled={index >= items.length - 1}
-      >{t($language, '下一项')}</button
-    >
+    <div class="lightbox-mobile-tools">{@render imageTools()}</div>
+    <div class="lightbox-nav">
+      <button type="button" onclick={previous} disabled={index <= 0}
+        >{t($language, '上一项')}</button
+      >
+      <span>{index + 1} / {items.length}</span>
+      <button type="button" onclick={next} disabled={index >= items.length - 1}
+        >{t($language, '下一项')}</button
+      >
+    </div>
   </footer>
 </div>
 
 <style>
+  .lightbox-mobile-tools {
+    display: none;
+  }
+
+  .lightbox-actions button,
+  .lightbox-footer button {
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+
+  .lightbox-nav {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+  }
+
+  @media (max-width: 640px) {
+    .lightbox-bar {
+      padding: 6px 8px;
+      padding-top: max(6px, env(safe-area-inset-top, 6px));
+    }
+
+    .lightbox-actions button {
+      width: 44px;
+      height: 44px;
+    }
+
+    .lightbox-bar strong {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .lightbox-actions {
+      flex: 0 0 auto;
+    }
+
+    .desktop-image-tools {
+      display: none;
+    }
+
+    .lightbox-footer {
+      flex-direction: column;
+      padding-bottom: max(8px, env(safe-area-inset-bottom, 8px));
+    }
+
+    .lightbox-mobile-tools {
+      display: flex;
+      width: 100%;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+
+    .lightbox-mobile-tools button {
+      min-height: 40px;
+      padding: 0 10px;
+    }
+
+    .lightbox-nav {
+      width: 100%;
+    }
+
+    .lightbox-nav button {
+      min-height: 40px;
+    }
+  }
+
   .lightbox {
     position: fixed;
     inset: 0;

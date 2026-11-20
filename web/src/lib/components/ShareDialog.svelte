@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api, ApiError } from '../api';
   import Icon from './Icon.svelte';
+  import ShareQrDialog from './ShareQrDialog.svelte';
   import FileName from './FileName.svelte';
   import { copyText } from '../clipboard';
   import { language, t } from '../i18n';
@@ -29,6 +30,7 @@
   let error = $state('');
   let busy = $state(false);
   let created = $state<{ url: string; token: string } | null>(null);
+  let qrOpen = $state(false);
 
   async function create(): Promise<void> {
     busy = true;
@@ -80,10 +82,11 @@
 
     {#if created}
       <div class="created">
-        <p>{t($language, '分享已创建，链接只显示一次：')}</p>
+        <p>{t($language, '分享已创建：')}</p>
         <code>{window.location.origin}{created.url}</code>
         <div class="actions">
           <button type="button" onclick={() => void copyLink()}>{t($language, '复制链接')}</button>
+          <button type="button" onclick={() => (qrOpen = true)}>{t($language, '二维码')}</button>
           <button type="button" class="primary" onclick={onClose}>{t($language, '完成')}</button>
         </div>
       </div>
@@ -132,6 +135,14 @@
     {/if}
   </dialog>
 </div>
+
+{#if created && qrOpen}
+  <ShareQrDialog
+    url={`${window.location.origin}${created.url}`}
+    title={t($language, '分享二维码')}
+    onClose={() => (qrOpen = false)}
+  />
+{/if}
 
 <style>
   .share-overlay {

@@ -23,6 +23,18 @@ Many years ago, on a WD My Cloud, I used FileBrowser for the first time and was 
 - Per-user terminal/ZIP/unzip switches, a larger system-settings surface, group resets, and live SSE updates for roots/settings/shares.
 - Parallel indexing, directory-size scans, thumbnails, archive/transcode lanes, and file-level copy parallelism.
 
+## What's new in 0.1.11
+
+- Stable share links: copying no longer rotates the token; "Reset link" is explicit.
+- Expired shares appear as stopped; enabling one extends it by one day.
+- QR codes for shares, on the share list and right after creation.
+- Non-UTF-8 editing with an encoding picker (GBK/GB18030, Big5, Shift_JIS, EUC-KR, UTF-16, Windows-1252) and BOM-preserving round trips.
+- CodeMirror 6 editor with lazy-loaded language support, plus Prism highlighting in Markdown previews.
+- Markdown preview now styles tables, quotes, lists, images and code blocks, and pauses live rendering above 300KB.
+- Installable PWA with manifest, icons and iOS meta tags.
+- Online indicator in the admin user list.
+- Six previously inert system settings now work (symlink limits/following and per-directory index entry limit).
+
 ## Use cases
 
 - Browser entry point for a home NAS or an external drive

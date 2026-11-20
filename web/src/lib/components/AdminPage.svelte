@@ -815,6 +815,21 @@
     { key: 'log.retention_days', label: '日志保留天数', min: 1, max: 365, unit: '天' },
   ];
 
+  const RESTART_KEYS = new Set([
+    'jobs.io_workers',
+    'jobs.interactive_workers',
+    'jobs.dir_size_workers',
+    'jobs.index_workers',
+    'jobs.archive_workers',
+    'jobs.media_workers',
+    'jobs.queue_max',
+    'jobs.thumbnail_queue_max',
+    'thumbnails.workers',
+    'thumbnails.preview_workers',
+    'thumbnails.video',
+    'media.audio_transcode',
+  ]);
+
   const FEATURE_KEYS = ['thumbnails.enabled', 'editor.enabled', 'terminal_enabled'];
   const DOWNLOAD_KEYS = [
     'downloads.zip_max_bytes',
@@ -979,6 +994,10 @@
   {/if}
 {/snippet}
 
+{#snippet restartBadge(key: string)}
+  {#if RESTART_KEYS.has(key)}<small class="setting-restart">{t($language, '重启生效')}</small>{/if}
+{/snippet}
+
 {#snippet groupHeading(title: string, keys: string[])}
   <div class="group-heading">
     <h3>{t($language, title)}</h3>
@@ -993,7 +1012,7 @@
     <span
       >{t($language, field.label)}
       <small class="setting-source">{settingSource(field.key)}</small>
-      {@render saveState(field.key)}</span
+      {@render saveState(field.key)}{@render restartBadge(field.key)}</span
     >
     <div class="quota-setting">
       <input
@@ -1017,7 +1036,7 @@
     <span
       >{t($language, field.label)}
       <small class="setting-source">{settingSource(field.key)}</small>
-      {@render saveState(field.key)}</span
+      {@render saveState(field.key)}{@render restartBadge(field.key)}</span
     >
     <div class="quota-setting">
       <ByteSizeInput
@@ -1041,7 +1060,7 @@
     <span
       >{t($language, field.label)}
       <small class="setting-source">{settingSource(field.key)}</small>
-      {@render saveState(field.key)}</span
+      {@render saveState(field.key)}{@render restartBadge(field.key)}</span
     >
     <input
       type="checkbox"
@@ -1057,7 +1076,7 @@
     <span
       >{t($language, field.label)}
       <small class="setting-source">{settingSource(field.key)}</small>
-      {@render saveState(field.key)}</span
+      {@render saveState(field.key)}{@render restartBadge(field.key)}</span
     >
     <textarea
       rows="4"
@@ -1206,6 +1225,9 @@
         <article class="user-card">
           <div class="user-line">
             <strong>{user.username}</strong>
+            {#if user.online}
+              <span class="online-dot" title={t($language, '在线')}></span>
+            {/if}
             <button type="button" class="pill-button" onclick={() => void toggleRole(user)}
               >{user.role === 'admin' ? t($language, '管理员') : t($language, '成员')}</button
             >
@@ -1444,12 +1466,14 @@
         </div>
       </div>
 
-      <div class="settings-group">
-        {@render groupHeading('日志', LOG_KEYS)}
-        <div class="setting-grid">
-          {#each logNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+      {#if settings?.platform === 'windows'}
+        <div class="settings-group">
+          {@render groupHeading('日志', LOG_KEYS)}
+          <div class="setting-grid">
+            {#each logNumberFields as field (field.key)}{@render numberRow(field)}{/each}
+          </div>
         </div>
-      </div>
+      {/if}
 
       <div class="settings-group">
         {@render groupHeading('缩略图与预览', PREVIEW_KEYS)}
@@ -1705,7 +1729,7 @@
         <p class="settings-warning">
           {t($language, '重启会中断所有请求和正在运行的任务。只在确认没有任务运行时操作。')}
         </p>
-        <div>
+        <div class="server-actions">
           <button type="button" class="small restart-button" onclick={() => (restartConfirm = true)}
             >{t($language, '重启服务器')}</button
           >
@@ -1905,6 +1929,30 @@
     background: var(--surface);
     color: var(--text);
   }
+  .setting-restart {
+    margin-left: 6px;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-2);
+    font-size: 10.5px;
+  }
+
+  .online-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--online);
+  }
+
+  .server-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+
   .restart-button {
     border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
     color: var(--danger);

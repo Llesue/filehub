@@ -22,6 +22,7 @@
   import PreferencesPage from './lib/components/PreferencesPage.svelte';
   import ShareDialog from './lib/components/ShareDialog.svelte';
   import TerminalPanel from './lib/components/TerminalPanel.svelte';
+  import CodeEditor from './lib/components/CodeEditor.svelte';
   import TransferDialog from './lib/components/TransferDialog.svelte';
   import AuthScreen from './lib/components/AuthScreen.svelte';
   import SharePage from './lib/components/SharePage.svelte';
@@ -174,8 +175,18 @@
   let editorSaving = $state(false);
   let editorPreview = $state(false);
   let editorReadOnly = $state(false);
-  let editorReadOnlyReason = $state<'file' | 'directory' | 'policy' | null>(null);
+  let editorReadOnlyReason = $state<'file' | 'directory' | 'policy' | 'lossy' | null>(null);
   let editorLineEnding = $state<'lf' | 'crlf' | 'mixed'>('lf');
+  let editorEncoding = $state('utf-8');
+  let editorBom = $state(false);
+  let editorLossy = $state(false);
+  // Live Markdown preview and the line-number gutter are debounced: parsing a
+  // multi-megabyte document on every keystroke stalls the main thread.
+  const LIVE_PREVIEW_LIMIT = 300_000;
+  let editorPreviewSource = $state('');
+  let editorPreviewStale = $state(false);
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
+  let previewElement = $state<HTMLDivElement | null>(null);
   let thumbVersions = $state<Record<string, number>>({});
   let thumbFailures = $state<Record<string, boolean>>({});
   let remoteEditors = $state<Record<string, Record<string, number>>>({});
@@ -196,7 +207,6 @@
       return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     }
   })();
-  let lineNumbersElement = $state<HTMLPreElement | null>(null);
   let usage = $state<Usage | null>(null);
   let marquee = $state<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   let marqueePreview = $state<string[]>([]);
@@ -206,6 +216,8 @@
   let sharesMounted = $state(false);
   let adminMounted = $state(false);
   let contextMenu = $state<{ x: number; y: number; entry: Entry } | null>(null);
+  let searchMenu = $state<{ x: number; y: number; result: SearchEntry } | null>(null);
+  let searchShareTarget = $state<SearchEntry | null>(null);
   let contextMenuElement = $state<HTMLElement | null>(null);
   let contextMenuLeft = $state(false);
   let contextMenuUp = $state(false);
@@ -223,6 +235,8 @@
   let terminalOpen = $state(false);
   let terminalMinimized = $state(false);
   let rootsRefreshTimer: number | null = null;
+  let dirVersionTimer: ReturnType<typeof setInterval> | null = null;
+  let lastDirVersion = '';
   let jobProgressRestored = $state(false);
   let terminalAvailable = $derived(
     capabilities.terminal &&
@@ -269,9 +283,6 @@
     action: (value: string) => void;
   } | null>(null);
   let editorDirty = $derived(editorContent !== editorOriginalContent);
-  let editorLineNumbers = $derived(
-    Array.from({ length: editorContent.split('\n').length }, (_, index) => index + 1),
-  );
   let editorPresenceKey = $derived(activeRootId === null ? '' : `${activeRootId}:${editorPath}`);
   let editorPeerEditing = $derived(
     editorOpen &&
@@ -279,8 +290,128 @@
       Object.keys(remoteEditors[editorPresenceKey] ?? {}).length > 0,
   );
   let previewHtml = $derived(
-    editorPreview ? DOMPurify.sanitize(String(marked.parse(editorContent))) : '',
+    editorPreview ? DOMPurify.sanitize(String(marked.parse(editorPreviewSource))) : '',
   );
+
+  $effect(() => {
+    const html = previewHtml;
+    const element = previewElement;
+    if (!editorPreview || !html || !element) return;
+    let cancelled = false;
+    void Promise.all([
+      import('prismjs'),
+      import('prismjs/components/prism-javascript'),
+      import('prismjs/components/prism-typescript'),
+      import('prismjs/components/prism-json'),
+      import('prismjs/components/prism-python'),
+      import('prismjs/components/prism-rust'),
+      import('prismjs/components/prism-bash'),
+      import('prismjs/components/prism-markup'),
+      import('prismjs/components/prism-css'),
+      import('prismjs/components/prism-markdown'),
+      import('prismjs/components/prism-yaml'),
+      import('prismjs/components/prism-sql'),
+    ])
+      .then(([module]) => {
+        if (cancelled) return;
+        const Prism = module.default;
+        for (const code of element.querySelectorAll('pre code')) {
+          Prism.highlightElement(code);
+        }
+      })
+      .catch((error) => {
+        console.warn('Prism failed to load', error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  $effect(() => {
+    const root = activeRootId;
+    const path = currentPath;
+    const view = appView;
+    if (dirVersionTimer) {
+      clearInterval(dirVersionTimer);
+      dirVersionTimer = null;
+    }
+    lastDirVersion = '';
+    if (root === null || view !== 'files') return;
+    let disposed = false;
+    const check = async (): Promise<void> => {
+      if (document.visibilityState === 'hidden') return;
+      try {
+        const result = await api.dirVersion(root, path);
+        if (disposed) return;
+        const next = String(result.mtime);
+        if (lastDirVersion === '') {
+          lastDirVersion = next;
+          return;
+        }
+        if (lastDirVersion !== next) {
+          lastDirVersion = next;
+          void loadList(root, path);
+        }
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 404) {
+          console.warn('directory change probe failed', error);
+        }
+      }
+    };
+    void check();
+    dirVersionTimer = setInterval(() => void check(), 5_000);
+    return () => {
+      disposed = true;
+      if (dirVersionTimer) {
+        clearInterval(dirVersionTimer);
+        dirVersionTimer = null;
+      }
+    };
+  });
+
+  $effect(() => {
+    const content = editorContent;
+    const active = editorPreview;
+    if (!editorOpen || !active) {
+      editorPreviewSource = '';
+      editorPreviewStale = false;
+      return;
+    }
+    if (content.length > LIVE_PREVIEW_LIMIT) {
+      editorPreviewStale = true;
+      return;
+    }
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => {
+      previewTimer = null;
+      editorPreviewSource = content;
+      editorPreviewStale = false;
+    }, 120);
+    return () => {
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+        previewTimer = null;
+      }
+    };
+  });
+
+  function toggleEditorPreview(): void {
+    editorPreview = !editorPreview;
+    if (!editorPreview) return;
+    if (editorContent.length > LIVE_PREVIEW_LIMIT) {
+      editorPreviewSource = '';
+      editorPreviewStale = true;
+    } else {
+      editorPreviewSource = editorContent;
+      editorPreviewStale = false;
+    }
+  }
+
+  function refreshEditorPreview(): void {
+    editorPreviewSource = editorContent;
+    editorPreviewStale = false;
+  }
+
   let menuTargets = $derived(
     contextMenu
       ? selected.includes(contextMenu.entry.name) && selected.length > 1
@@ -896,6 +1027,14 @@
       preferences = null;
       csrf = '';
       disconnectEvents();
+      try {
+        for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+          const key = localStorage.key(index);
+          if (key?.startsWith('filehub.terminal.history')) localStorage.removeItem(key);
+        }
+      } catch (error) {
+        console.warn('failed to clear terminal history', error);
+      }
       roots = [];
       entries = [];
       currentPath = '';
@@ -1805,6 +1944,23 @@
     }
   }
 
+  function openSearchMenu(event: MouseEvent, result: SearchEntry): void {
+    event.preventDefault();
+    event.stopPropagation();
+    const button = event.currentTarget as HTMLElement | null;
+    const rect = button?.getBoundingClientRect();
+    searchMenu = {
+      x: rect ? Math.max(8, rect.right - 180) : event.clientX,
+      y: rect ? rect.bottom + 4 : event.clientY,
+      result,
+    };
+  }
+
+  function downloadSearchResult(result: SearchEntry): void {
+    window.location.href = api.downloadUrl(result.rootId, result.path);
+    searchMenu = null;
+  }
+
   function openSearchResult(entry: SearchEntry): void {
     const root = entry.rootId ?? activeRootId;
     if (root === null) return;
@@ -2140,6 +2296,19 @@
     if (window.matchMedia('(pointer: coarse)').matches) {
       enterEntry(entry);
     }
+  }
+
+  function openEntryMenu(event: MouseEvent, entry: Entry): void {
+    event.preventDefault();
+    event.stopPropagation();
+    const button = event.currentTarget as HTMLElement | null;
+    const rect = button?.getBoundingClientRect();
+    if (!isSelected(entry.name)) selected = [entry.name];
+    contextMenu = {
+      x: rect ? rect.right : event.clientX,
+      y: rect ? rect.bottom + 4 : event.clientY,
+      entry,
+    };
   }
 
   function menuPosition(x: number, y: number): { x: number; y: number } {
@@ -3206,6 +3375,12 @@
       return;
     }
     endEditPresence();
+    if (previewTimer) {
+      clearTimeout(previewTimer);
+      previewTimer = null;
+    }
+    editorPreviewSource = '';
+    editorPreviewStale = false;
     editorOpen = false;
   }
 
@@ -3235,6 +3410,8 @@
       editorEtag = file.etag;
       editorError = '';
       editorPreview = false;
+      editorPreviewSource = '';
+      editorPreviewStale = false;
       editorReadOnly = file.writable === false || currentReadOnly;
       editorReadOnlyReason = file.writable === false
         ? (file.read_only_reason ?? 'file')
@@ -3242,6 +3419,13 @@
           ? 'policy'
           : null;
       editorLineEnding = file.line_ending ?? 'lf';
+      editorEncoding = file.encoding ?? 'utf-8';
+      editorBom = file.bom ?? false;
+      editorLossy = file.lossy ?? false;
+      if (editorLossy) {
+        editorReadOnly = true;
+        editorReadOnlyReason = 'lossy';
+      }
       editorOpen = true;
       if (!editorReadOnly) beginEditPresence(activeRootId, path);
     } catch (error) {
@@ -3251,6 +3435,68 @@
         handleFilesError(error);
       }
     }
+  }
+
+  function applyEditorFile(file: {
+    content: string;
+    etag: string;
+    line_ending?: 'lf' | 'crlf' | 'mixed';
+    writable?: boolean;
+    read_only_reason?: 'file' | 'directory' | null;
+    encoding?: string;
+    bom?: boolean;
+    lossy?: boolean;
+  }): void {
+    editorContent = file.content;
+    editorOriginalContent = file.content;
+    editorEtag = file.etag;
+    editorLineEnding = file.line_ending ?? 'lf';
+    editorEncoding = file.encoding ?? 'utf-8';
+    editorBom = file.bom ?? false;
+    editorLossy = file.lossy ?? false;
+    editorPreviewSource = '';
+    editorPreviewStale = false;
+    editorReadOnly = file.writable === false || currentReadOnly || editorLossy;
+    editorReadOnlyReason = editorLossy
+      ? 'lossy'
+      : file.writable === false
+        ? (file.read_only_reason ?? 'file')
+        : currentReadOnly
+          ? 'policy'
+          : null;
+  }
+
+  async function reloadEditorEncoding(encoding: string): Promise<void> {
+    if (activeRootId === null || !editorOpen) return;
+    try {
+      const file = await api.getFile(
+        activeRootId,
+        editorPath,
+        encoding === 'auto' ? undefined : encoding,
+      );
+      applyEditorFile(file);
+      if (editorReadOnly) endEditPresence();
+      else beginEditPresence(activeRootId, editorPath);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '读取文件失败'));
+    }
+  }
+
+  function changeEditorEncoding(value: string): void {
+    if (value === editorEncoding) return;
+    if (editorDirty) {
+      confirmState = {
+        title: t($language, '切换编码'),
+        message: t($language, '有未保存修改，切换编码会丢弃，确定？'),
+        requireText: null,
+        action: () => {
+          confirmState = null;
+          void reloadEditorEncoding(value);
+        },
+      };
+      return;
+    }
+    void reloadEditorEncoding(value);
   }
 
   function contentForSave(): string {
@@ -3269,6 +3515,8 @@
         contentForSave(),
         editorEtag,
         csrf,
+        editorEncoding,
+        editorBom,
       );
       editorEtag = saved.etag;
       editorOriginalContent = editorContent;
@@ -3288,6 +3536,18 @@
         editorReadOnlyReason = 'policy';
         endEditPresence();
         editorError = t($language, '目录已设为只读，无法保存');
+      } else if (error instanceof ApiError && error.code === 'ENCODING_UNREPRESENTABLE') {
+        confirmState = {
+          title: t($language, '无法用当前编码保存'),
+          message: t($language, '当前编码无法表示部分字符，改为 UTF-8 保存？'),
+          requireText: null,
+          action: () => {
+            confirmState = null;
+            editorEncoding = 'utf-8';
+            editorBom = false;
+            void saveEditor();
+          },
+        };
       } else {
         editorError = error instanceof Error ? error.message : t($language, '保存失败');
       }
@@ -4058,6 +4318,15 @@
                           />
                           <button
                             type="button"
+                            class="search-more"
+                            aria-label={t($language, '更多操作')}
+                            title={t($language, '更多操作')}
+                            onclick={(event) => openSearchMenu(event, result)}
+                          >
+                            <Icon name="more" size={16} />
+                          </button>
+                          <button
+                            type="button"
                             class="search-card-open"
                             onclick={() => openSearchResult(result)}
                           >
@@ -4118,6 +4387,15 @@
                             checked={searchSelected.includes(key)}
                             onchange={() => toggleSearchSelection(result)}
                           />
+                          <button
+                            type="button"
+                            class="search-more"
+                            aria-label={t($language, '更多操作')}
+                            title={t($language, '更多操作')}
+                            onclick={(event) => openSearchMenu(event, result)}
+                          >
+                            <Icon name="more" size={16} />
+                          </button>
                           <button
                             type="button"
                             class="search-result"
@@ -4414,6 +4692,15 @@
                               <button
                                 type="button"
                                 class="row-action"
+                                aria-label={t($language, '更多操作')}
+                                title={t($language, '更多操作')}
+                                onclick={(event) => openEntryMenu(event, entry)}
+                              >
+                                <Icon name="more" size={16} />
+                              </button>
+                              <button
+                                type="button"
+                                class="row-action"
                                 aria-label={t($language, '删除 {name}', { name: entry.name })}
                                 title={t($language, '删除')}
                                 disabled={!activeRoot || currentReadOnly}
@@ -4493,6 +4780,15 @@
                             onclick={(event) => event.stopPropagation()}
                             onchange={() => toggleSelection(entry.name)}
                           />
+                          <button
+                            type="button"
+                            class="card-menu"
+                            aria-label={t($language, '更多操作')}
+                            title={t($language, '更多操作')}
+                            onclick={(event) => openEntryMenu(event, entry)}
+                          >
+                            <Icon name="more" size={16} />
+                          </button>
                           <div class="card-icon">
                             <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={40} />
                             {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && entry.has_preview && activeRootId !== null && !thumbFailures[thumbId]}
@@ -4597,6 +4893,15 @@
                             onclick={(event) => event.stopPropagation()}
                             onchange={() => toggleSelection(entry.name)}
                           />
+                          <button
+                            type="button"
+                            class="card-menu"
+                            aria-label={t($language, '更多操作')}
+                            title={t($language, '更多操作')}
+                            onclick={(event) => openEntryMenu(event, entry)}
+                          >
+                            <Icon name="more" size={16} />
+                          </button>
                           <div class="tile-icon">
                             <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={34} />
                             {#if systemFeatures.thumbnails && preferences?.show_thumbnails !== false && !entry.is_dir && entry.has_preview && activeRootId !== null && !thumbFailures[thumbId]}
@@ -4768,6 +5073,52 @@
           onclick={() => runContextAction('delete')}>{t($language, '删除')}</button
         >
       {/if}
+    </div>
+  {/if}
+
+  {#if searchMenu}
+    <button
+      type="button"
+      class="menu-backdrop"
+      aria-label={t($language, '关闭')}
+      onclick={() => (searchMenu = null)}
+    ></button>
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div
+      class="context-menu search-menu"
+      role="menu"
+      tabindex="-1"
+      style={`left:${searchMenu.x}px;top:${searchMenu.y}px`}
+      onclick={(event) => event.stopPropagation()}
+    >
+      <button
+        type="button"
+        role="menuitem"
+        onclick={() => {
+          const result = searchMenu?.result;
+          searchMenu = null;
+          if (result) openSearchResult(result);
+        }}>{t($language, '打开所在位置')}</button
+      >
+      {#if !searchMenu.result.is_dir}
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            const result = searchMenu?.result;
+            searchMenu = null;
+            if (result) downloadSearchResult(result);
+          }}>{t($language, '下载')}</button
+        >
+      {/if}
+      <button
+        type="button"
+        role="menuitem"
+        onclick={() => {
+          searchShareTarget = searchMenu?.result ?? null;
+          searchMenu = null;
+        }}>{t($language, '分享')}</button
+      >
     </div>
   {/if}
 
@@ -4989,12 +5340,14 @@
     />
   {/if}
 
-  {#if terminalOpen && activeRootId !== null}
+  {#if (terminalOpen || terminalMinimized) && activeRootId !== null}
     <TerminalPanel
       root={activeRootId}
+      userId={user?.id ?? 0}
       cwd={currentPath}
       {csrf}
       minimized={terminalMinimized}
+      visible={terminalOpen}
       onMinimize={() => (terminalMinimized = true)}
       onClose={() => {
         terminalOpen = false;
@@ -5003,6 +5356,17 @@
       onRefresh={() => {
         if (activeRootId !== null) void loadList(activeRootId, currentPath);
       }}
+    />
+  {/if}
+
+  {#if searchShareTarget}
+    <ShareDialog
+      root={searchShareTarget.rootId}
+      paths={[searchShareTarget.path]}
+      name={searchShareTarget.name}
+      isDir={searchShareTarget.is_dir}
+      {csrf}
+      onClose={() => (searchShareTarget = null)}
     />
   {/if}
 
@@ -5059,7 +5423,9 @@
                 ? t($language, '目录已设为只读')
                 : editorReadOnlyReason === 'directory'
                   ? t($language, '所在目录不可写（原子保存需要目录写权限）')
-                  : t($language, '文件本身不可写')}
+                  : editorReadOnlyReason === 'lossy'
+                    ? t($language, '编码无法完整解码，只能只读')
+                    : t($language, '文件本身不可写')}
               >{t($language, '只读')}</span
             >
           {/if}
@@ -5070,7 +5436,7 @@
           {/if}
           <div class="editor-actions">
             {#if isMarkdown(editorName)}
-              <button type="button" class="ghost" onclick={() => (editorPreview = !editorPreview)}>
+              <button type="button" class="ghost" onclick={() => toggleEditorPreview()}>
                 {editorPreview ? t($language, '编辑') : t($language, '预览')}
               </button>
             {/if}
@@ -5086,24 +5452,29 @@
         </header>
 
         {#if editorPreview}
-          <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-          <div class="markdown-preview">{@html previewHtml}</div>
+          {#if editorPreviewStale}
+            <div class="preview-stale" role="status">
+              <span>{t($language, '文档较大，已暂停实时预览')}</span>
+              <button type="button" class="ghost" onclick={refreshEditorPreview}>
+                {t($language, '刷新预览')}
+              </button>
+            </div>
+          {/if}
+          <div
+            class="markdown-preview"
+            bind:this={previewElement}
+          >
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+            {@html previewHtml}
+          </div>
         {:else}
           <div class="editor-body">
-            <pre
-              bind:this={lineNumbersElement}
-              class="line-numbers">{#each editorLineNumbers as number (number)}<span>{number}</span
-                >{/each}</pre>
-            <textarea
-              bind:value={editorContent}
-              spellcheck="false"
+            <CodeEditor
+              value={editorContent}
+              filename={editorName}
               readonly={editorReadOnly}
-              wrap="off"
-              onscroll={(event) => {
-                if (lineNumbersElement) {
-                  lineNumbersElement.scrollTop = event.currentTarget.scrollTop;
-                }
-              }}></textarea>
+              onchange={(next) => (editorContent = next)}
+            />
           </div>
         {/if}
 
@@ -5118,7 +5489,23 @@
             {:else}
               {editorDirty ? t($language, '有未保存修改') : t($language, '已保存')} ·
             {/if}
-            UTF-8 · {editorContent.length} chars
+            <select
+              class="editor-encoding"
+              value={editorEncoding}
+              disabled={editorSaving}
+              onchange={(event) => changeEditorEncoding(event.currentTarget.value)}
+            >
+              <option value="auto">{t($language, '自动检测')}</option>
+              <option value="utf-8">UTF-8</option>
+              <option value="gbk">GBK / GB18030</option>
+              <option value="big5">Big5</option>
+              <option value="shift_jis">Shift_JIS</option>
+              <option value="euc-kr">EUC-KR</option>
+              <option value="windows-1252">Windows-1252</option>
+              <option value="utf-16le">UTF-16LE</option>
+              <option value="utf-16be">UTF-16BE</option>
+            </select>
+            · {editorContent.length} chars
             {#if editorLineEnding === 'mixed'}
               · {t($language, '原文件混合换行，保存后统一为 LF')}
             {/if}
@@ -5487,8 +5874,8 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    height: var(--topbar-height);
-    padding: 0 20px;
+    height: calc(var(--topbar-height) + env(safe-area-inset-top, 0px));
+    padding: env(safe-area-inset-top, 0px) 20px 0;
     background: var(--surface);
     border-bottom: 1px solid var(--border);
   }
@@ -6225,6 +6612,37 @@
     opacity: 0.5;
   }
 
+  .menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 54;
+    border: 0;
+    background: transparent;
+  }
+
+  .search-menu {
+    z-index: 56;
+  }
+
+  .search-more {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    flex: 0 0 auto;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-2);
+  }
+
+  .search-card .search-more {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    z-index: 2;
+  }
+
   .search-row {
     display: flex;
     align-items: center;
@@ -6512,6 +6930,139 @@
     display: none;
   }
 
+  :global(.confirm-panel),
+  :global(.notice-dialog),
+  :global(.share-panel),
+  :global(.assign-dialog),
+  :global(.user-dialog),
+  :global(.path-dialog),
+  :global(.edit-dialog),
+  :global(.quota-dialog),
+  :global(.account-dialog) {
+    max-height: min(85dvh, 720px);
+    overflow-y: auto;
+  }
+
+  :global(.dialog-overlay),
+  :global(.notice-overlay),
+  :global(.share-overlay),
+  :global(.confirm-overlay) {
+    padding-bottom: max(24px, env(safe-area-inset-bottom, 24px));
+  }
+
+  @media (pointer: coarse) {
+    :global(.confirm-panel button),
+    :global(.notice-dialog button) {
+      min-height: 44px;
+    }
+  }
+
+  @media (max-width: 640px) {
+    :global(.confirm-overlay),
+    :global(.notice-overlay),
+    :global(.share-overlay),
+    :global(.dialog-overlay),
+    :global(.qr-overlay) {
+      align-items: end;
+      padding: 0;
+    }
+
+    :global(.confirm-panel),
+    :global(.notice-dialog),
+    :global(.share-panel),
+    :global(.assign-dialog),
+    :global(.user-dialog),
+    :global(.path-dialog),
+    :global(.edit-dialog),
+    :global(.quota-dialog),
+    :global(.account-dialog),
+    :global(.qr-dialog) {
+      width: 100%;
+      max-height: 88dvh;
+      border-radius: 16px 16px 0 0;
+      padding-bottom: max(20px, env(safe-area-inset-bottom, 20px));
+    }
+
+    :global(.confirm-panel button),
+    :global(.notice-dialog button),
+    :global(.share-panel button),
+    :global(.qr-dialog button) {
+      min-height: 44px;
+    }
+  }
+
+  .card-menu {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 2;
+    display: grid;
+    width: 32px;
+    height: 32px;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
+    color: var(--text-2);
+  }
+
+  @media (hover: hover) {
+    .file-card .card-menu,
+    .file-tile .card-menu {
+      opacity: 0;
+    }
+
+    .file-card:hover .card-menu,
+    .file-tile:hover .card-menu,
+    .card-menu:focus-visible {
+      opacity: 1;
+    }
+  }
+
+  :global(textarea),
+  :global(.markdown-preview),
+  :global(.dialog-overlay),
+  :global(.notice-overlay),
+  :global(.share-overlay),
+  :global(.confirm-overlay) {
+    overscroll-behavior: contain;
+  }
+
+  @media (pointer: coarse) {
+    :global(input),
+    :global(textarea),
+    :global(select) {
+      font-size: 16px;
+    }
+
+    :global(button),
+    :global([role='button']) {
+      touch-action: manipulation;
+    }
+
+    .row-action {
+      width: 40px;
+      height: 40px;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .context-menu {
+      left: 12px !important;
+      right: 12px;
+      top: auto !important;
+      bottom: calc(12px + env(safe-area-inset-bottom, 0px)) !important;
+      width: auto;
+      max-height: 70dvh;
+      border-radius: 16px;
+    }
+
+    .context-menu button[role='menuitem'] {
+      min-height: 44px;
+      font-size: 15px;
+    }
+  }
+
   .context-menu {
     position: fixed;
     z-index: 55;
@@ -6703,26 +7254,6 @@
     flex: 1;
   }
 
-  .line-numbers span {
-    display: block;
-  }
-
-  .line-numbers {
-    width: 52px;
-    min-width: 52px;
-    margin: 0;
-    padding: 16px 8px 16px 0;
-    overflow: hidden;
-    border-right: 1px solid var(--border);
-    background: var(--surface-2);
-    color: var(--text-2);
-    font-family: var(--font-mono);
-    font-size: 14.5px;
-    line-height: 1.6;
-    text-align: right;
-    user-select: none;
-  }
-
   .editor-readonly {
     flex: 0 0 auto;
     padding: 1px 6px;
@@ -6734,18 +7265,15 @@
     white-space: nowrap;
   }
 
-  .editor-panel textarea {
-    min-width: 0;
-    flex: 1;
-    padding: 16px;
-    border: 0;
-    outline: 0;
-    resize: none;
-    background: var(--surface);
-    color: var(--text);
-    font-family: var(--font-mono);
-    font-size: 14.5px;
-    line-height: 1.6;
+  .preview-stale {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 20px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-2);
+    font-size: 13px;
   }
 
   .markdown-preview {
@@ -6778,6 +7306,129 @@
 
   .markdown-preview :global(a) {
     color: var(--accent-text);
+  }
+
+  .markdown-preview :global(p),
+  .markdown-preview :global(ul),
+  .markdown-preview :global(ol),
+  .markdown-preview :global(blockquote),
+  .markdown-preview :global(table),
+  .markdown-preview :global(pre) {
+    margin: 0 0 14px;
+  }
+
+  .markdown-preview :global(h4),
+  .markdown-preview :global(h5),
+  .markdown-preview :global(h6) {
+    color: var(--text);
+    line-height: 1.4;
+  }
+
+  .markdown-preview :global(ul),
+  .markdown-preview :global(ol) {
+    padding-left: 22px;
+  }
+
+  .markdown-preview :global(li + li) {
+    margin-top: 4px;
+  }
+
+  .markdown-preview :global(li > input[type='checkbox']) {
+    margin-right: 6px;
+  }
+
+  .markdown-preview :global(blockquote) {
+    margin-left: 0;
+    padding: 2px 0 2px 12px;
+    border-left: 3px solid var(--border);
+    color: var(--text-2);
+  }
+
+  .markdown-preview :global(hr) {
+    margin: 18px 0;
+    border: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .markdown-preview :global(table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+  }
+
+  .markdown-preview :global(th),
+  .markdown-preview :global(td) {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .markdown-preview :global(thead th) {
+    background: var(--surface-2);
+    font-weight: 600;
+  }
+
+  .markdown-preview :global(img) {
+    max-width: 100%;
+    height: auto;
+  }
+
+  .markdown-preview :global(del) {
+    color: var(--text-2);
+  }
+
+  .markdown-preview :global(code) {
+    padding: 1px 5px;
+  }
+
+  .markdown-preview :global(pre code) {
+    padding: 0;
+    background: transparent;
+  }
+
+  .markdown-preview :global(.token.comment),
+  .markdown-preview :global(.token.prolog),
+  .markdown-preview :global(.token.doctype),
+  .markdown-preview :global(.token.cdata) {
+    color: var(--text-2);
+  }
+
+  .markdown-preview :global(.token.keyword),
+  .markdown-preview :global(.token.selector),
+  .markdown-preview :global(.token.important) {
+    color: var(--file-image);
+  }
+
+  .markdown-preview :global(.token.string),
+  .markdown-preview :global(.token.attr-value) {
+    color: var(--file-sheet);
+  }
+
+  .markdown-preview :global(.token.number),
+  .markdown-preview :global(.token.boolean) {
+    color: var(--file-video);
+  }
+
+  .markdown-preview :global(.token.function),
+  .markdown-preview :global(.token.class-name) {
+    color: var(--file-doc);
+  }
+
+  .markdown-preview :global(.token.operator),
+  .markdown-preview :global(.token.punctuation) {
+    color: var(--text-2);
+  }
+
+  .editor-encoding {
+    height: 26px;
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 12px;
   }
 
   .editor-footer .ghost,
