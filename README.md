@@ -12,29 +12,6 @@ The web UI is a Svelte 5 SPA embedded into the Rust binary. Data lives in SQLite
 
 Many years ago, on a WD My Cloud, I used FileBrowser for the first time and was amazed by its clean, elegant interface and how quickly it responded on low-powered hardware. Later, I needed multi-user authentication and the ability to manage arbitrary directories on my NAS, and FileBrowser gradually fell short of those needs. Then I was surprised to learn that FileBrowser had announced it was no longer being maintained—and the idea was born: build my own FileBrowser with the help of OpenCode and DeepSeek.
 
-## What's new in 0.1.9
-
-- Security hardening: terminal root guards, symlink-safe public-share uploads, login enumeration protection, per-user feature policies, stricter temporary/cache/database permissions, and a per-user entry limit.
-- Terminal commands: `help`, `-h`/`--help`, `zip`, `unzip`, `job`/`jobs`, `roots`, long-format `ls`, and a 4-digit code for high-risk deletes.
-- ZIP archive and extraction jobs with progress, cancellation, numeric conflict suffixes, Zip Slip/symlink/duplicate/encrypted-entry rejection, and zip-bomb limits.
-- Search results now support sorting, list/grid views, thumbnails, multi-select, and single-root bulk delete/share.
-- Collapsible breadcrumbs, search-aware pathbar, smarter filename shortening, and a shared file-type classifier.
-- Video audio detection and audio-only transcoding for AC3/EAC3/DTS/TrueHD tracks when `ffmpeg` is available.
-- Per-user terminal/ZIP/unzip switches, a larger system-settings surface, group resets, and live SSE updates for roots/settings/shares.
-- Parallel indexing, directory-size scans, thumbnails, archive/transcode lanes, and file-level copy parallelism.
-
-## What's new in 0.1.11
-
-- Stable share links: copying no longer rotates the token; "Reset link" is explicit.
-- Expired shares appear as stopped; enabling one extends it by one day.
-- QR codes for shares, on the share list and right after creation.
-- Non-UTF-8 editing with an encoding picker (GBK/GB18030, Big5, Shift_JIS, EUC-KR, UTF-16, Windows-1252) and BOM-preserving round trips.
-- CodeMirror 6 editor with lazy-loaded language support, plus Prism highlighting in Markdown previews.
-- Markdown preview now styles tables, quotes, lists, images and code blocks, and pauses live rendering above 300KB.
-- Installable PWA with manifest, icons and iOS meta tags.
-- Online indicator in the admin user list.
-- Six previously inert system settings now work (symlink limits/following and per-directory index entry limit).
-
 ## Use cases
 
 - Browser entry point for a home NAS or an external drive
