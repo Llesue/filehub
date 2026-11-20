@@ -34,6 +34,10 @@
 - Minimizable terminal that can be restored from the sidebar.
 - `jobs.archive_workers` / `jobs.archive_per_user` (defaults 1/2) bound archive/unzip concurrency.
 
+### Fixed
+
+- Linux aarch64 builds use `access(2)` instead of `faccessat2`, which Android/Termux seccomp rejects with `SIGSYS` (the process died with `invalid system call` right after startup).
+
 ## v0.1.8 - 2026-11-19
 
 ### Added

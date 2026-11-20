@@ -727,14 +727,12 @@ pub(crate) fn io_error(error: std::io::Error) -> AppError {
 /// fall back to the configured/policy value.
 #[cfg(unix)]
 pub fn directory_writable(path: &Path) -> Option<bool> {
-    use rustix::fs::{Access, AtFlags, CWD, StatVfsMountFlags, accessat, statvfs};
+    use rustix::fs::{Access, StatVfsMountFlags, access, statvfs};
 
-    match accessat(
-        CWD,
-        path,
-        Access::WRITE_OK | Access::EXEC_OK,
-        AtFlags::EACCESS,
-    ) {
+    // `access` checks the real UID/GID. FileHub runs as the same user (or as
+    // root), so the real/effective distinction does not matter here. Android
+    // seccomp kills `faccessat2` with SIGSYS on Termux, so avoid it.
+    match access(path, Access::WRITE_OK | Access::EXEC_OK) {
         Ok(()) => {}
         Err(rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS | rustix::io::Errno::PERM) => {
             return Some(false);
@@ -754,9 +752,9 @@ pub fn directory_writable(_path: &Path) -> Option<bool> {
 
 #[cfg(unix)]
 pub fn file_writable(path: &Path) -> Option<bool> {
-    use rustix::fs::{Access, AtFlags, CWD, accessat};
+    use rustix::fs::{Access, access};
 
-    match accessat(CWD, path, Access::WRITE_OK, AtFlags::EACCESS) {
+    match access(path, Access::WRITE_OK) {
         Ok(()) => Some(true),
         Err(rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS | rustix::io::Errno::PERM) => {
             Some(false)

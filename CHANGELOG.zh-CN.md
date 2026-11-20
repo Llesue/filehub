@@ -51,6 +51,10 @@
 - 终端可最小化，回到左侧终端入口恢复。
 - `jobs.archive_workers` / `jobs.archive_per_user`（默认 1/2）限制 archive/unzip 并发。
 
+### 修复
+
+- Linux aarch64 改用 `access(2)`，避免 Android/Termux 的 seccomp 拦截 `faccessat2` 导致启动后立刻 `invalid system call`（SIGSYS）。
+
 ## v0.1.8 - 2026-11-19
 
 ### 新增
