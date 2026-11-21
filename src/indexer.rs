@@ -598,7 +598,32 @@ async fn apply_quick_scan_batch(
         stats.missing += 1;
     }
     if !missing_targets.is_empty() {
-        state.invalidate_paths_exact(&missing_targets, None).await;
+        let mut stale_only = Vec::new();
+        for target in &missing_targets {
+            let remove = match tokio::fs::metadata(target).await {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Ok(metadata) if !metadata.is_dir() => true,
+                _ => false,
+            };
+            if remove {
+                let prefix = target.to_string_lossy().to_string();
+                loop {
+                    match state.db.delete_cached_subtree_batch(&prefix, 2000).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, path = %prefix, "failed to purge missing index subtree");
+                            break;
+                        }
+                    }
+                }
+            } else {
+                stale_only.push(target.clone());
+            }
+        }
+        if !stale_only.is_empty() {
+            state.invalidate_paths_exact(&stale_only, None).await;
+        }
         state.schedule_cache_cleanup(missing_targets);
     }
     Ok(())

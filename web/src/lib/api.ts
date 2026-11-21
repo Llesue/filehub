@@ -697,7 +697,7 @@ export const api = {
   remoteTestMount(
     id: number,
     csrf: string,
-  ): Promise<{ ok: boolean; latency_ms: number; server_version?: string; message?: string }> {
+  ): Promise<{ ok: boolean; removed?: boolean; latency_ms: number; server_version?: string; message?: string }> {
     return request(`/remote/mounts/${id}/test`, { method: 'POST' }, csrf);
   },
 

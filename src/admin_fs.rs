@@ -350,6 +350,11 @@ pub async fn delete_root(
     auth::require_admin(&current)?;
     auth::require_csrf(&current, &headers)?;
 
+    let root = state
+        .db
+        .find_root(root_id, user_id)
+        .await
+        .map_err(AppError::internal)?;
     let deleted = state
         .db
         .delete_root(root_id, user_id)
@@ -357,6 +362,20 @@ pub async fn delete_root(
         .map_err(AppError::internal)?;
     if !deleted {
         return Err(AppError::NotFound);
+    }
+    if let Some(root) = root {
+        let prefix = root.real_path;
+        loop {
+            match state.db.delete_cached_subtree_batch(&prefix, 2000).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, path = %prefix, "failed to purge index for deleted root");
+                    break;
+                }
+            }
+        }
+        state.schedule_cache_cleanup(vec![std::path::PathBuf::from(&prefix)]);
     }
 
     audit(

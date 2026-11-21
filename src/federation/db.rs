@@ -516,6 +516,20 @@ impl Db {
         .await
     }
 
+    pub async fn federation_all_mounts(&self) -> anyhow::Result<Vec<FederationMount>> {
+        self.call(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
+                        peer_version, capabilities, token_ciphertext, created_at, \
+                        last_ok_at, last_error, last_error_code \
+                 FROM federation_mounts ORDER BY id",
+            )?;
+            let rows = statement.query_map([], mount_from_row)?;
+            rows.collect()
+        })
+        .await
+    }
+
     pub async fn federation_mount_by_root(
         &self,
         root_id: i64,

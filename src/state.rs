@@ -281,6 +281,7 @@ impl AppState {
             federation_cache: Mutex::new(HashMap::new()),
             federation_streams: Mutex::new(HashMap::new()),
         });
+        tokio::spawn(crate::federation::mounts::health_loop(Arc::clone(&state)));
         state.schedule_directory_size_counts_refresh();
         state.schedule_bigram_backfill();
         crate::media::warm_cache(&state).await;

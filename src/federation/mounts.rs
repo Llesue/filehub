@@ -300,6 +300,11 @@ pub async fn create(
         request.alias,
     )
     .await?;
+    state.events.publish(
+        "roots.changed",
+        Some(current.user.id),
+        json!({ "user_id": current.user.id }),
+    );
     Ok(Json(json!({
         "id": mount_id,
         "root_id": root_id,
@@ -401,6 +406,11 @@ pub async fn attach_grant(
         None,
     )
     .await?;
+    state.events.publish(
+        "roots.changed",
+        Some(current.user.id),
+        json!({ "user_id": current.user.id }),
+    );
     Ok(Json(json!({
         "id": mount_id,
         "root_id": root_id,
@@ -408,6 +418,52 @@ pub async fn attach_grant(
         "mode": mode,
         "grant_id": grant_id,
     })))
+}
+
+pub(crate) async fn health_loop(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let mounts = match state.db.federation_all_mounts().await {
+            Ok(mounts) => mounts,
+            Err(error) => {
+                tracing::warn!(%error, "federation health check could not list mounts");
+                continue;
+            }
+        };
+        for mount in mounts {
+            let Ok(client) = client_for_mount(&state, &mount).await else {
+                continue;
+            };
+            match client.grants().await {
+                Ok(_) => {
+                    let _ = state
+                        .db
+                        .federation_update_mount_state(mount.id, true, None, None)
+                        .await;
+                }
+                Err(error) => {
+                    if is_auth_error(&error) {
+                        tracing::info!(
+                            mount = mount.id,
+                            code = %error.code,
+                            "remote token is invalid; unmounting"
+                        );
+                        let _ = remove_mount(&state, mount.user_id, &mount).await;
+                    } else {
+                        let _ = state
+                            .db
+                            .federation_update_mount_state(
+                                mount.id,
+                                false,
+                                Some(&error.message),
+                                Some(&error.code),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn directory_size(path: &std::path::Path) -> u64 {
@@ -519,26 +575,18 @@ pub async fn list(
     Ok(Json(json!({ "mounts": items })))
 }
 
-pub async fn delete(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<Response, AppError> {
-    let current = auth::current_user(&state, &headers).await?;
-    auth::require_csrf(&current, &headers)?;
-    let mount = state
-        .db
-        .federation_mount(id, current.user.id)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or(AppError::NotFound)?;
+pub(crate) async fn remove_mount(
+    state: &Arc<AppState>,
+    user_id: i64,
+    mount: &FederationMount,
+) -> Result<bool, AppError> {
     let deleted = state
         .db
-        .federation_delete_mount(id, current.user.id)
+        .federation_delete_mount(mount.id, user_id)
         .await
         .map_err(AppError::internal)?;
-    if !deleted {
-        return Err(AppError::NotFound);
+    if deleted {
+        let _ = state.db.delete_root(mount.root_id, user_id).await;
     }
     state.federation_clients.lock().remove(&mount.root_id);
     state.federation_streams.lock().remove(&mount.id);
@@ -553,6 +601,38 @@ pub async fn delete(
         .join("federation-thumbs")
         .join(mount.id.to_string());
     let _ = tokio::fs::remove_dir_all(thumb_dir).await;
+    state.events.publish(
+        "roots.changed",
+        Some(user_id),
+        json!({ "user_id": user_id }),
+    );
+    Ok(deleted)
+}
+
+fn is_auth_error(error: &crate::federation::client::PeerError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "UNAUTHORIZED" | "TOKEN_REVOKED" | "TOKEN_EXPIRED" | "GRANT_REVOKED"
+    ) || error.status == 401
+}
+
+pub async fn delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    let mount = state
+        .db
+        .federation_mount(id, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let deleted = remove_mount(&state, current.user.id, &mount).await?;
+    if !deleted {
+        return Err(AppError::NotFound);
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -570,35 +650,71 @@ pub async fn test(
         .ok_or(AppError::NotFound)?;
     let started = Instant::now();
     let client = client_for_mount(&state, &mount).await?;
-    let result = client.info().await;
-    let latency = started.elapsed().as_millis() as i64;
-    match result {
-        Ok(info) => {
-            state
-                .db
-                .federation_update_mount_state(id, true, None, None)
-                .await
-                .map_err(AppError::internal)?;
-            Ok(Json(json!({
-                "ok": true,
-                "latency_ms": latency,
-                "server_version": info.get("server_version").cloned().unwrap_or(Value::Null),
-            })))
-        }
+    let info = match client.info().await {
+        Ok(info) => info,
         Err(error) => {
             state
                 .db
                 .federation_update_mount_state(id, false, Some(&error.message), Some(&error.code))
                 .await
                 .map_err(AppError::internal)?;
-            Ok(Json(json!({
+            return Ok(Json(json!({
                 "ok": false,
+                "removed": false,
+                "latency_ms": started.elapsed().as_millis() as i64,
+                "code": error.code,
+                "message": error.message,
+            })));
+        }
+    };
+    let latency = started.elapsed().as_millis() as i64;
+    if let Err(error) = client.grants().await {
+        if is_auth_error(&error) {
+            remove_mount(&state, current.user.id, &mount).await?;
+            return Ok(Json(json!({
+                "ok": false,
+                "removed": true,
                 "latency_ms": latency,
                 "code": error.code,
                 "message": error.message,
-            })))
+            })));
         }
+        state
+            .db
+            .federation_update_mount_state(id, false, Some(&error.message), Some(&error.code))
+            .await
+            .map_err(AppError::internal)?;
+        return Ok(Json(json!({
+            "ok": false,
+            "removed": false,
+            "latency_ms": latency,
+            "code": error.code,
+            "message": error.message,
+        })));
     }
+    state
+        .db
+        .federation_update_mount_state(id, true, None, None)
+        .await
+        .map_err(AppError::internal)?;
+    let capabilities = info
+        .get("capabilities")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let _ = state
+        .db
+        .federation_update_mount_capabilities(
+            id,
+            current.user.id,
+            &serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".to_owned()),
+        )
+        .await;
+    Ok(Json(json!({
+        "ok": true,
+        "removed": false,
+        "latency_ms": latency,
+        "server_version": info.get("server_version").cloned().unwrap_or(Value::Null),
+    })))
 }
 
 #[derive(Debug, Deserialize)]

@@ -26,6 +26,7 @@
     | 'minimize'
     | 'copy'
     | 'share'
+    | 'chevrons-down'
     | 'settings'
     | 'logout'
     | 'file'
@@ -132,6 +133,9 @@
   {:else if name === 'copy'}
     <rect x="9" y="9" width="11" height="11" rx="2" />
     <path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" />
+  {:else if name === 'chevrons-down'}
+    <path d="m6 6 6 6 6-6" />
+    <path d="m6 12 6 6 6-6" />
   {:else if name === 'share'}
     <circle cx="18" cy="5" r="3" />
     <circle cx="6" cy="12" r="3" />

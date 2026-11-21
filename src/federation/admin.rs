@@ -81,6 +81,11 @@ pub async fn create_grant(
         )
         .await
         .map_err(AppError::internal)?;
+    state.events.publish(
+        "roots.changed",
+        Some(current.user.id),
+        json!({ "user_id": current.user.id }),
+    );
     Ok(Json(json!({
         "id": id,
         "label": request.label.trim(),
@@ -137,6 +142,11 @@ pub async fn revoke_grant(
     if !changed {
         return Err(AppError::NotFound);
     }
+    state.events.publish(
+        "roots.changed",
+        Some(current.user.id),
+        json!({ "user_id": current.user.id }),
+    );
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

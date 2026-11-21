@@ -469,6 +469,13 @@
   );
   const localRoots = $derived(roots.filter((root) => root.kind !== 'remote'));
   const remoteRoots = $derived(roots.filter((root) => root.kind === 'remote'));
+  const onlineRemoteRoots = $derived(
+    remoteRoots.filter((root) => !remoteStateBadge(root.id)),
+  );
+  const offlineRemoteRoots = $derived(
+    remoteRoots.filter((root) => !!remoteStateBadge(root.id)),
+  );
+  let offlineOpen = $state(false);
   let remoteCaps = $state<Record<number, string[]>>({});
   let remoteMounts = $state<Record<number, RemoteMount>>({});
   let currentStale = $state(false);
@@ -501,12 +508,36 @@
     void loadList(root.id, '');
   }
 
+  function openOfflineRoot(root: Root): void {
+    appView = 'files';
+    activeRootId = root.id;
+    void (async () => {
+      await loadList(root.id, '');
+      confirmState = {
+        title: t($language, '远程目录已离线'),
+        message: t($language, '当前显示的是缓存列表。目标目录恢复连接前无法修改。'),
+        requireText: null,
+        action: () => {
+          confirmState = null;
+          const fallback = localRoots[0];
+          if (fallback) {
+            activeRootId = fallback.id;
+            void loadList(fallback.id, '');
+          }
+        },
+      };
+    })();
+  }
+
   function remoteTitle(rootId: number, fallback: string): string {
     const mount = remoteMounts[rootId];
     if (!mount) return fallback;
     const mode = mount.mode === 'rw' ? t($language, '读写') : t($language, '只读');
     const state = remoteStateLabel(mount.state);
-    return `${mount.alias} · ${mount.base_url} · ${mount.grant_label} · ${mode} · ${state}`;
+    const lastSeen = mount.last_ok_at
+      ? new Date(mount.last_ok_at * 1000).toLocaleString()
+      : t($language, '从未连接');
+    return `${mount.alias} · ${mount.base_url} · ${mount.grant_label} · ${mode} · ${state} · ${t($language, '上次在线')} ${lastSeen}`;
   }
 
   function remoteStateLabel(state: RemoteMount['state']): string {
@@ -639,6 +670,11 @@
 
     const unsubscribeEvents = realtimeEvent.subscribe((event) => {
       if (!event) return;
+      if (event.type === 'roots.changed') {
+        void refreshRoots();
+        void refreshRemoteCaps();
+        return;
+      }
       if (event.type === 'usage.updated') {
         void loadUsage();
       }
@@ -1728,7 +1764,7 @@
         { type: blob.type },
       );
       event.preventDefault();
-      uploadManager.enqueue([{ file }], activeRootId, currentPath);
+      enqueueUploads([{ file, relativePath: file.name }]);
       return;
     }
     if (textFile) {
@@ -1740,7 +1776,7 @@
         { type: 'text/plain' },
       );
       event.preventDefault();
-      uploadManager.enqueue([{ file }], activeRootId, currentPath);
+      enqueueUploads([{ file, relativePath: file.name }]);
       return;
     }
     if (text) {
@@ -1752,7 +1788,7 @@
         { type: 'text/plain' },
       );
       event.preventDefault();
-      uploadManager.enqueue([{ file }], activeRootId, currentPath);
+      enqueueUploads([{ file, relativePath: file.name }]);
     }
   }
 
@@ -4147,7 +4183,7 @@
           {/if}
           {#if remoteRoots.length > 0}
             <div class="nav-sep"></div>
-            {#each remoteRoots as root (root.id)}
+            {#each onlineRemoteRoots as root (root.id)}
               <button
                 type="button"
                 class:active={appView === 'files' && root.id === activeRootId}
@@ -4173,8 +4209,41 @@
               </button>
             {/each}
           {/if}
+          {#if offlineRemoteRoots.length > 0}
+            <button
+              type="button"
+              class="nav-item nav-collapse"
+              title={t($language, '离线目录')}
+              aria-expanded={offlineOpen}
+              onclick={() => (offlineOpen = !offlineOpen)}
+            >
+              <span class:open={offlineOpen} class="collapse-icon">
+                <Icon name="chevrons-down" size={16} />
+              </span>
+              <span class="nav-count">{offlineRemoteRoots.length}</span>
+            </button>
+            {#if offlineOpen}
+              {#each offlineRemoteRoots as root (root.id)}
+                <button
+                  type="button"
+                  class="nav-item offline"
+                  title={remoteTitle(root.id, rootLabel(root.alias))}
+                  onclick={() => openOfflineRoot(root)}
+                >
+                  <Icon name="link" size={18} />
+                  <span class="nav-label">{rootLabel(root.alias)}</span>
+                  <span
+                    class="nav-state"
+                    role="img"
+                    aria-label={remoteStateBadge(root.id)}
+                    title={remoteStateBadge(root.id)}
+                  ></span>
+                </button>
+              {/each}
+            {/if}
+          {/if}
           {#if canMountRemote && preferences?.remote_mount_enabled !== false}
-            {#if remoteRoots.length === 0}
+            {#if onlineRemoteRoots.length === 0 && offlineRemoteRoots.length === 0}
               <div class="nav-sep"></div>
             {/if}
             <button
@@ -6185,6 +6254,29 @@
     margin-left: 4px;
     color: var(--text-2);
     vertical-align: middle;
+  }
+
+  .nav-collapse {
+    color: var(--text-2);
+  }
+
+  .nav-collapse .nav-count {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-2);
+  }
+
+  .collapse-icon {
+    display: inline-flex;
+    transition: transform 160ms var(--ease);
+  }
+
+  .collapse-icon.open {
+    transform: rotate(180deg);
+  }
+
+  .nav-item.offline {
+    opacity: 0.65;
   }
 
   .nav-state {

@@ -71,6 +71,11 @@
       const result = await api.remoteTestMount(id, csrf);
       if (!result.ok) {
         error = result.message ?? t($language, '连接失败');
+        if (result.removed) {
+          onMounted(null);
+          await load();
+          return;
+        }
       } else {
         latency = { ...latency, [id]: result.latency_ms };
       }
