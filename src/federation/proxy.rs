@@ -75,7 +75,7 @@ pub async fn list(
         });
         return Ok(render_list(root, &mount, &value, path_text));
     }
-    let value = client
+    let value = match client
         .list(
             mount.grant_id,
             path_text,
@@ -85,7 +85,13 @@ pub async fn list(
             order_text,
         )
         .await
-        .map_err(|error| error.into_app())?;
+    {
+        Ok(value) => value,
+        Err(error) => {
+            mark_mount_error(state, &mount, &error).await;
+            return Err(error.into_app());
+        }
+    };
     sync_mode(state, &mount, &value).await;
     store_cache(state, key, value.clone());
     Ok(render_list(root, &mount, &value, path_text))
@@ -229,10 +235,13 @@ pub async fn download(
     let permit = semaphore
         .try_acquire_owned()
         .map_err(|_| AppError::TooManyRequests)?;
-    let response = client
-        .download(mount.grant_id, path, inline, headers)
-        .await
-        .map_err(|error| error.into_app())?;
+    let response = match client.download(mount.grant_id, path, inline, headers).await {
+        Ok(response) => response,
+        Err(error) => {
+            mark_mount_error(state, &mount, &error).await;
+            return Err(error.into_app());
+        }
+    };
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
@@ -257,6 +266,23 @@ pub async fn download(
     builder
         .body(Body::from_stream(stream))
         .map_err(|error| AppError::internal(anyhow::anyhow!(error)))
+}
+
+pub(crate) async fn mark_mount_error(
+    state: &Arc<AppState>,
+    mount: &crate::federation::db::FederationMount,
+    error: &crate::federation::client::PeerError,
+) {
+    let code = match error.code.as_str() {
+        "TOKEN_REVOKED" | "TOKEN_EXPIRED" => "TOKEN_REVOKED",
+        "GRANT_REVOKED" => "GRANT_REVOKED",
+        "PEER_UNREACHABLE" => "OFFLINE",
+        _ => return,
+    };
+    let _ = state
+        .db
+        .federation_update_mount_state(mount.id, false, Some(&error.message), Some(code))
+        .await;
 }
 
 pub(crate) async fn audit_remote(

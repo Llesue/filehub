@@ -98,9 +98,10 @@ pub async fn probe(
     {
         return Err(AppError::TooManyRequests);
     }
-    let target = target_for(&state, &request.url).await?;
+    let url = ssrf::normalize_url(&request.url);
+    let target = target_for(&state, &url).await?;
     let client = PeerClient::new(
-        &request.url,
+        &url,
         &target.host,
         target.ip,
         target.port,
@@ -136,9 +137,10 @@ pub async fn preview(
 ) -> Result<Json<Value>, AppError> {
     let current = auth::current_user(&state, &headers).await?;
     require_outbound(&state, &current.user)?;
-    let target = target_for(&state, &request.url).await?;
+    let url = ssrf::normalize_url(&request.url);
+    let target = target_for(&state, &url).await?;
     let client = PeerClient::new(
-        &request.url,
+        &url,
         &target.host,
         target.ip,
         target.port,
@@ -178,9 +180,10 @@ pub async fn create(
     {
         return Err(AppError::TooManyRequests);
     }
-    let target = target_for(&state, &request.url).await?;
+    let url = ssrf::normalize_url(&request.url);
+    let target = target_for(&state, &url).await?;
     let client = PeerClient::new(
-        &request.url,
+        &url,
         &target.host,
         target.ip,
         target.port,
@@ -234,7 +237,7 @@ pub async fn create(
             .federation_create_mount(
                 current.user.id,
                 root_id,
-                &request.url,
+                &url,
                 request.grant_id,
                 &label,
                 &mode,

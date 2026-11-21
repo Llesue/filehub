@@ -52,6 +52,12 @@
     return `${base} (${index})`;
   }
 
+  function normalizedUrl(value: string): string {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.includes('://')) return trimmed;
+    return `https://${trimmed}`;
+  }
+
   function message(value: unknown): string {
     if (value instanceof ApiError) return value.message;
     if (value instanceof Error) return value.message;
@@ -75,8 +81,9 @@
     busy = true;
     error = '';
     probe = null;
+    url = normalizedUrl(url);
     try {
-      const result = await api.remoteProbe(url.trim(), csrf);
+      const result = await api.remoteProbe(url, csrf);
       probe = {
         server_version: result.server_version,
         resolved_ips: result.resolved_ips,
@@ -105,7 +112,8 @@
     grants = [];
     selected = null;
     try {
-      const result = await api.remotePreview(url.trim(), token.trim(), csrf);
+      url = normalizedUrl(url);
+      const result = await api.remotePreview(url, token.trim(), csrf);
       grants = result.grants;
       const first = grants[0];
       if (grants.length === 1 && first) {
@@ -126,7 +134,7 @@
     error = '';
     try {
       const created = await api.remoteCreateMount(
-        url.trim(),
+        normalizedUrl(url),
         token.trim(),
         selected,
         alias.trim(),
@@ -187,7 +195,8 @@
               }
             }}
             onblur={() => {
-              if (!probe && url.trim() && !busy) void probeAddress(false);
+              url = normalizedUrl(url);
+              if (!probe && url && !busy) void probeAddress(false);
             }}
           />
         </label>

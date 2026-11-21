@@ -17,11 +17,10 @@ pub struct PeerError {
 impl PeerError {
     pub fn into_app(self) -> AppError {
         match self.code.as_str() {
-            "TOKEN_REVOKED" => AppError::TokenRevoked,
-            "TOKEN_EXPIRED" => AppError::TokenExpired,
-            "GRANT_REVOKED" => AppError::GrantRevoked,
+            "TOKEN_REVOKED" | "TOKEN_EXPIRED" => AppError::RemoteTokenInvalid,
+            "GRANT_REVOKED" => AppError::RemoteGrantRevoked,
             _ => match self.status {
-                401 => AppError::Unauthorized,
+                401 => AppError::RemoteTokenInvalid,
                 403 => AppError::Forbidden,
                 404 => AppError::NotFound,
                 409 => AppError::Conflict(self.message),
@@ -464,5 +463,35 @@ impl PeerClient {
         };
         self.json(self.auth(request).header("idempotency-key", key).json(body))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_auth_failures_stay_remote() {
+        let unauthorized = PeerError {
+            status: 401,
+            code: "PEER_ERROR".to_owned(),
+            message: "no".to_owned(),
+        };
+        assert!(matches!(
+            unauthorized.into_app(),
+            AppError::RemoteTokenInvalid
+        ));
+        let revoked = PeerError {
+            status: 410,
+            code: "TOKEN_REVOKED".to_owned(),
+            message: "no".to_owned(),
+        };
+        assert!(matches!(revoked.into_app(), AppError::RemoteTokenInvalid));
+        let grant = PeerError {
+            status: 410,
+            code: "GRANT_REVOKED".to_owned(),
+            message: "no".to_owned(),
+        };
+        assert!(matches!(grant.into_app(), AppError::RemoteGrantRevoked));
     }
 }

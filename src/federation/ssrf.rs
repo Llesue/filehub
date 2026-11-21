@@ -50,6 +50,15 @@ impl SsrfError {
     }
 }
 
+pub fn normalize_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains("://") {
+        trimmed.to_owned()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
 pub async fn resolve(
     raw: &str,
     allow_loopback: bool,
@@ -58,7 +67,8 @@ pub async fn resolve(
     if raw.len() > MAX_URL_LEN {
         return Err(SsrfError::Invalid);
     }
-    let url = reqwest::Url::parse(raw.trim()).map_err(|_| SsrfError::Invalid)?;
+    let raw = normalize_url(raw);
+    let url = reqwest::Url::parse(&raw).map_err(|_| SsrfError::Invalid)?;
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         return Err(SsrfError::Invalid);
     }

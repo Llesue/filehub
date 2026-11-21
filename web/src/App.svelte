@@ -484,6 +484,18 @@
     return remoteStateLabel(mount.state);
   }
 
+  function openRemoteRoot(root: Root): void {
+    const badge = remoteStateBadge(root.id);
+    if (badge) {
+      showToast(t($language, '远程目录不可用，请在挂载设置中重新连接'));
+      mountDialogOpen = true;
+      return;
+    }
+    appView = 'files';
+    activeRootId = root.id;
+    void loadList(root.id, '');
+  }
+
   function remoteTitle(rootId: number, fallback: string): string {
     const mount = remoteMounts[rootId];
     if (!mount) return fallback;
@@ -1668,6 +1680,18 @@
   }
 
   function handleFilesError(error: unknown): void {
+    if (
+      error instanceof ApiError &&
+      (error.code === 'REMOTE_TOKEN_INVALID' || error.code === 'REMOTE_GRANT_REVOKED')
+    ) {
+      showNotice(
+        t($language, '远程目录不可用'),
+        'error',
+        t($language, '远程目录的令牌或授权已失效，请在挂载设置中重新连接。'),
+      );
+      void refreshRemoteCaps();
+      return;
+    }
     if (error instanceof ApiError && error.status === 401) {
       uploadManager.detach();
       user = null;
@@ -4021,7 +4045,7 @@
               <span class="nav-label">{rootLabel(root.alias)}</span>
               {#if root.shared}
                 <span class="nav-shared" title={t($language, '已共享给远程实例')}>
-                  <Icon name="link" size={13} />
+                  <Icon name="share" size={13} />
                 </span>
               {/if}
               {#if root.read_only}
@@ -4042,11 +4066,7 @@
                 class:active={appView === 'files' && root.id === activeRootId}
                 class="nav-item"
                 title={remoteTitle(root.id, rootLabel(root.alias))}
-                onclick={() => {
-                  appView = 'files';
-                  activeRootId = root.id;
-                  void loadList(root.id, '');
-                }}
+                onclick={() => openRemoteRoot(root)}
               >
                 <Icon name="link" size={18} />
                 <span class="nav-label">{rootLabel(root.alias)}</span>
@@ -4920,7 +4940,7 @@
                                 {/if}
                                 <span class="name-stem">{nameParts.stem}</span><span
                                   class="name-ext">{nameParts.ext}</span
-                                >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="link" size={13} /></span>{/if}
+                                >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="share" size={13} /></span>{/if}
                               </span>
                             </td>
                             <td
@@ -5081,7 +5101,7 @@
                             {/if}
                             <span class="name-stem">{nameParts.stem}</span><span class="name-ext"
                               >{nameParts.ext}</span
-                            >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="link" size={13} /></span>{/if}
+                            >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="share" size={13} /></span>{/if}
                           </span>
                           <span class="card-meta">
                             <span title={absoluteDate(entry.modified)}
@@ -5195,7 +5215,7 @@
                               {/if}
                               <span class="name-stem">{nameParts.stem}</span><span class="name-ext"
                                 >{nameParts.ext}</span
-                              >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="link" size={13} /></span>{/if}
+                              >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="share" size={13} /></span>{/if}
                             </span>
                             <span class="tile-meta">
                               <span title={absoluteDate(entry.modified)}
@@ -6061,7 +6081,9 @@
   }
 
   .nav-add {
-    color: var(--text-2);
+    color: var(--text-3, var(--text-2));
+    font-size: 13px;
+    font-weight: 400;
   }
 
   .nav-shared {
@@ -6079,6 +6101,7 @@
 
   .nav-state {
     flex: 0 0 auto;
+    margin-left: auto;
     width: 7px;
     height: 7px;
     border-radius: 50%;

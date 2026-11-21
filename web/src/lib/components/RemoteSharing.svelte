@@ -182,13 +182,25 @@
     }
   }
 
-  async function copyToken(): Promise<void> {
+  async function copyText(value: string): Promise<boolean> {
     try {
-      await navigator.clipboard.writeText(newToken);
-      copiedKind = 'token';
+      await navigator.clipboard.writeText(value);
+      return true;
     } catch {
-      copiedKind = null;
+      const area = document.createElement('textarea');
+      area.value = value;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      const copied = document.execCommand('copy');
+      area.remove();
+      return copied;
     }
+  }
+
+  async function copyToken(): Promise<void> {
+    copiedKind = (await copyText(newToken)) ? 'token' : null;
   }
 
   function inviteText(token: string): string {
@@ -196,12 +208,7 @@
   }
 
   async function copyInvite(): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(inviteText(newToken));
-      copiedKind = 'invite';
-    } catch {
-      copiedKind = null;
-    }
+    copiedKind = (await copyText(inviteText(newToken))) ? 'invite' : null;
   }
 
   async function updateTokenGrants(id: number, grantIds: number[]): Promise<void> {

@@ -31,6 +31,10 @@ pub enum AppError {
     EncodingUnrepresentable,
     #[error("unsupported media: {0}")]
     UnsupportedMedia(String),
+    #[error("remote token is no longer valid")]
+    RemoteTokenInvalid,
+    #[error("remote grant has been revoked")]
+    RemoteGrantRevoked,
     #[error("setup required")]
     SetupRequired,
     #[error("too many requests")]
@@ -105,6 +109,8 @@ impl AppError {
             Self::TokenExpired => "TOKEN_EXPIRED",
             Self::GrantRevoked => "GRANT_REVOKED",
             Self::RemoteUnsupported => "REMOTE_ROOT_UNSUPPORTED",
+            Self::RemoteTokenInvalid => "REMOTE_TOKEN_INVALID",
+            Self::RemoteGrantRevoked => "REMOTE_GRANT_REVOKED",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
     }
@@ -212,6 +218,16 @@ impl IntoResponse for AppError {
                 StatusCode::FORBIDDEN,
                 "REMOTE_ROOT_UNSUPPORTED",
                 "This operation is not supported for remote directories".to_owned(),
+            ),
+            Self::RemoteTokenInvalid => (
+                StatusCode::FAILED_DEPENDENCY,
+                "REMOTE_TOKEN_INVALID",
+                "The remote token is no longer valid".to_owned(),
+            ),
+            Self::RemoteGrantRevoked => (
+                StatusCode::FAILED_DEPENDENCY,
+                "REMOTE_GRANT_REVOKED",
+                "The remote grant has been revoked".to_owned(),
             ),
             Self::Internal(err) => {
                 tracing::error!(error = %err, "internal server error");
