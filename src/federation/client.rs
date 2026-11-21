@@ -428,6 +428,10 @@ impl PeerClient {
                 self.http
                     .put(self.endpoint(&format!("/uploads/{id}/chunks/{index}"))),
             )
+            .header(
+                "idempotency-key",
+                format!("fh_{}", crate::auth::random_token(16)),
+            )
             .body(body);
         let response = request.send().await.map_err(|error| PeerError {
             status: 0,

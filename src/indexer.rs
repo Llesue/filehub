@@ -600,11 +600,15 @@ async fn apply_quick_scan_batch(
     if !missing_targets.is_empty() {
         let mut stale_only = Vec::new();
         for target in &missing_targets {
-            let remove = match tokio::fs::metadata(target).await {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                Ok(metadata) if !metadata.is_dir() => true,
-                _ => false,
-            };
+            // A missing parent usually means the whole mount is offline.
+            // Keep the index so it can be reused when the mount returns.
+            let parent_exists = target.parent().is_some_and(|parent| parent.is_dir());
+            let remove = parent_exists
+                && match tokio::fs::metadata(target).await {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Ok(metadata) if !metadata.is_dir() => true,
+                    _ => false,
+                };
             if remove {
                 let prefix = target.to_string_lossy().to_string();
                 loop {
@@ -617,6 +621,7 @@ async fn apply_quick_scan_batch(
                         }
                     }
                 }
+                let _ = state.db.delete_pending_subtree(&prefix).await;
             } else {
                 stale_only.push(target.clone());
             }

@@ -44,7 +44,7 @@ interface PersistedUpload {
 }
 
 interface UploadCallbacks {
-  onUploaded?: (rootId: number, directory: string) => void;
+  onUploaded?: (rootId: number, directory: string, size: number) => void;
   onNotice?: (message: string, kind?: 'info' | 'warning' | 'error') => void;
   onAllDone?: () => void;
 }
@@ -459,7 +459,7 @@ class UploadManager {
     this.fileOf.delete(item.fingerprint);
     this.items = this.items.filter((candidate) => candidate.id !== item.id);
     this.savePersisted();
-    this.callbacks.onUploaded?.(item.rootId, joinPath(item.basePath, item.directory));
+    this.callbacks.onUploaded?.(item.rootId, joinPath(item.basePath, item.directory), item.size);
     if (this.items.length === 0) this.callbacks.onAllDone?.();
   }
 

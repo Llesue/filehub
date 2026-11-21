@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+
+use futures_util::StreamExt;
 use std::time::Instant;
 
 use axum::Json;
@@ -238,6 +240,18 @@ async fn mount_inner(
         .map_err(AppError::internal)?;
     let ciphertext = crypto::encrypt(&key, token).map_err(AppError::internal)?;
     let alias = alias.unwrap_or_else(|| label.clone());
+    let existing_roots = state
+        .db
+        .list_roots(user.id)
+        .await
+        .map_err(AppError::internal)?;
+    let mut unique = alias.clone();
+    let mut suffix = 2;
+    while existing_roots.iter().any(|root| root.alias == unique) {
+        unique = format!("{alias} ({suffix})");
+        suffix += 1;
+    }
+    let alias = unique;
     let sentinel = format!("/__filehub_remote__/{}", auth::random_token(12));
     let root_id = state
         .db
@@ -441,63 +455,131 @@ pub(crate) async fn health_loop(state: Arc<AppState>) {
                 continue;
             }
         };
-        for mount in mounts {
-            let Ok(client) = client_for_mount(&state, &mount).await else {
-                continue;
-            };
-            match client.grants().await {
-                Ok(value) => {
-                    let _ = state
-                        .db
-                        .federation_update_mount_state(mount.id, true, None, None)
-                        .await;
-                    if let Some(grant) =
-                        value
-                            .get("grants")
-                            .and_then(Value::as_array)
-                            .and_then(|items| {
-                                items.iter().find(|item| {
-                                    item.get("id").and_then(Value::as_i64) == Some(mount.grant_id)
-                                })
-                            })
-                    {
-                        let name = grant
-                            .get("owner_name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let version = grant
-                            .get("avatar_version")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0);
-                        let _ = state
-                            .db
-                            .federation_update_mount_owner(mount.id, name, version)
-                            .await;
-                    }
+        let check_state = Arc::clone(&state);
+        futures_util::stream::iter(mounts)
+            .for_each_concurrent(4, move |mount| {
+                let state = Arc::clone(&check_state);
+                async move {
+                    health_check(&state, mount).await;
                 }
-                Err(error) => {
-                    if is_auth_error(&error) {
-                        tracing::info!(
-                            mount = mount.id,
-                            code = %error.code,
-                            "remote token is invalid; unmounting"
-                        );
-                        let _ =
-                            remove_mount(&state, mount.user_id, &mount, Some(error.code.as_str()))
-                                .await;
-                    } else {
-                        let _ = state
-                            .db
-                            .federation_update_mount_state(
-                                mount.id,
-                                false,
-                                Some(&error.message),
-                                Some(&error.code),
-                            )
-                            .await;
-                    }
-                }
+            })
+            .await;
+    }
+}
+
+fn has_grant(value: &Value, grant_id: i64) -> bool {
+    value
+        .get("grants")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("id").and_then(Value::as_i64) == Some(grant_id))
+        })
+}
+
+async fn health_check(state: &Arc<AppState>, mount: FederationMount) {
+    let client = match client_for_mount(state, &mount).await {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = state
+                .db
+                .federation_update_mount_state(
+                    mount.id,
+                    false,
+                    Some(&error.to_string()),
+                    Some("OFFLINE"),
+                )
+                .await;
+            return;
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(10), client.grants()).await {
+        Ok(Ok(value)) => {
+            if !has_grant(&value, mount.grant_id) {
+                tracing::info!(mount = mount.id, "remote grant is gone; unmounting");
+                let _ = remove_mount(state, mount.user_id, &mount, Some("GRANT_REVOKED")).await;
+                return;
             }
+            let _ = state
+                .db
+                .federation_update_mount_state(mount.id, true, None, None)
+                .await;
+            if let Some(grant) = value
+                .get("grants")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("id").and_then(Value::as_i64) == Some(mount.grant_id))
+                })
+            {
+                let name = grant
+                    .get("owner_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let version = grant
+                    .get("avatar_version")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let _ = state
+                    .db
+                    .federation_update_mount_owner(mount.id, name, version)
+                    .await;
+                prune_avatar_cache(state, mount.id, version);
+            }
+        }
+        Ok(Err(error)) => {
+            if is_auth_error(&error) {
+                tracing::info!(
+                    mount = mount.id,
+                    code = %error.code,
+                    "remote token is invalid; unmounting"
+                );
+                let _ = remove_mount(state, mount.user_id, &mount, Some(error.code.as_str())).await;
+            } else {
+                let _ = state
+                    .db
+                    .federation_update_mount_state(
+                        mount.id,
+                        false,
+                        Some(&error.message),
+                        Some(&error.code),
+                    )
+                    .await;
+            }
+        }
+        Err(_) => {
+            let _ = state
+                .db
+                .federation_update_mount_state(
+                    mount.id,
+                    false,
+                    Some("peer check timed out"),
+                    Some("OFFLINE"),
+                )
+                .await;
+        }
+    }
+}
+
+fn prune_avatar_cache(state: &Arc<AppState>, mount_id: i64, keep_version: i64) {
+    let dir = state
+        .settings()
+        .settings
+        .cache_dir
+        .join("federation-avatars");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{mount_id}-");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name != format!("{mount_id}-{keep_version}.jpg") {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -619,6 +701,36 @@ pub(crate) async fn remove_mount(
     mount: &FederationMount,
     reason: Option<&str>,
 ) -> Result<bool, AppError> {
+    if let Ok(client) = client_for_mount(state, mount).await
+        && let Ok(uploads) = state.db.uploads_for_root(user_id, mount.root_id).await
+    {
+        for upload in uploads {
+            if let Some(peer_id) = upload.remote_upload_id.as_deref() {
+                let _ = client.cancel_upload(peer_id).await;
+            }
+            let _ = state.db.delete_upload(&upload.id, user_id).await;
+        }
+    }
+    let limit = state
+        .settings()
+        .settings
+        .federation
+        .stream_concurrency
+        .max(1) as u32;
+    let stream_semaphore = state.federation_streams.lock().get(&mount.id).cloned();
+    if let Some(semaphore) = stream_semaphore {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(permit) = semaphore.clone().try_acquire_many_owned(limit) {
+                drop(permit);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
     let deleted = state
         .db
         .federation_delete_mount(mount.id, user_id)
@@ -640,6 +752,23 @@ pub(crate) async fn remove_mount(
         .join("federation-thumbs")
         .join(mount.id.to_string());
     let _ = tokio::fs::remove_dir_all(thumb_dir).await;
+    let avatar_dir = state
+        .settings()
+        .settings
+        .cache_dir
+        .join("federation-avatars");
+    if let Ok(entries) = std::fs::read_dir(avatar_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("{}-", mount.id)))
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
     state.events.publish(
         "roots.changed",
         Some(user_id),
@@ -705,6 +834,9 @@ pub async fn avatar(
         .bytes()
         .await
         .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err(AppError::NotFound);
+    }
     let _ = crate::platform::create_private_dir_all(&cache_dir);
     let _ = crate::platform::write_private_file(&cache_path, &bytes);
     Response::builder()

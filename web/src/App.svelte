@@ -90,7 +90,7 @@
   let user = $state<User | null>(null);
   let versionInfo = $state<VersionInfo | null>(null);
   let mountDialogOpen = $state(false);
-  let avatarFailures = $state<Record<number, boolean>>({});
+  let avatarFailures = $state<Record<string, boolean>>({});
   let userRemote = $state<{ mount: boolean; share: boolean } | null>(null);
   const canMountRemote = $derived(
     userRemote?.mount ?? user?.features.federation_mount ?? false,
@@ -237,8 +237,8 @@
   let contextMenuLeft = $state(false);
   let contextMenuUp = $state(false);
   let sortMenuOpen = $state(false);
-  let uploadBatchBytes = 0;
-  let uploadBatchCount = 0;
+  let uploadBatchDone = 0;
+  let uploadBatchDoneBytes = 0;
   const shareNotifySeen = new SvelteMap<string, number>();
   let blankMenu = $state<{ x: number; y: number } | null>(null);
   let blankMenuElement = $state<HTMLElement | null>(null);
@@ -543,7 +543,7 @@
     const mode = mount.mode === 'rw' ? t($language, '读写') : t($language, '只读');
     const state = remoteStateLabel(mount.state);
     const lastSeen = mount.last_ok_at
-      ? new Date(mount.last_ok_at * 1000).toLocaleString()
+      ? formatRelativeDate(mount.last_ok_at)
       : t($language, '从未连接');
     return `${mount.alias} · ${mount.base_url} · ${mount.grant_label} · ${mode} · ${state} · ${t($language, '上次在线')} ${lastSeen}`;
   }
@@ -1071,7 +1071,9 @@
 
   function attachUploads(userId: number): void {
     uploadManager.attach(userId, () => csrf, {
-      onUploaded: (rootId, directory) => {
+      onUploaded: (rootId, directory, size) => {
+        uploadBatchDone += 1;
+        uploadBatchDoneBytes += size;
         clearDirSizeCache();
         if (rootId === activeRootId && directory === currentPath) {
           void loadList(rootId, currentPath);
@@ -1079,14 +1081,17 @@
       },
       onNotice: (message, kind) => showNotice(message, kind),
       onAllDone: () => {
-        const message = t($language, '上传完成：{count} 项 · {size}', {
-          count: uploadBatchCount,
-          size: formatSize(uploadBatchBytes),
-        });
+        const message =
+          uploadBatchDone === 0
+            ? t($language, '上传已取消')
+            : t($language, '上传完成：{count} 项 · {size}', {
+                count: uploadBatchDone,
+                size: formatSize(uploadBatchDoneBytes),
+              });
         showToast(message);
         addNotification('job_completed', message);
-        uploadBatchBytes = 0;
-        uploadBatchCount = 0;
+        uploadBatchDone = 0;
+        uploadBatchDoneBytes = 0;
       },
     });
     if (uploadManager.pendingCount > 0) {
@@ -1200,6 +1205,8 @@
       await loadList(next.id, '');
       void refreshRemoteCaps();
     } catch (error) {
+      filesLoading = false;
+      filesLoadedOnce = false;
       handleFilesError(error);
     }
   }
@@ -3370,12 +3377,6 @@
       return;
     }
     filesError = '';
-    if (uploadBatchCount === 0) {
-      uploadBatchBytes = 0;
-      uploadBatchCount = 0;
-    }
-    uploadBatchCount += candidates.length;
-    uploadBatchBytes += candidates.reduce((sum, candidate) => sum + candidate.file.size, 0);
     uploadManager.enqueue(candidates, activeRootId, basePath);
   }
 
@@ -4196,12 +4197,15 @@
                 title={remoteTitle(root.id, rootLabel(root.alias))}
                 onclick={() => openRemoteRoot(root)}
               >
-                {#if remote?.avatar_version && !avatarFailures[root.id]}
+                {#if remote?.avatar_version && !avatarFailures[`${root.id}:${remote?.avatar_version ?? 0}`]}
                   <img
                     class="nav-avatar"
                     src={api.remoteAvatarUrl(remote.id, remote.avatar_version ?? 0)}
                     alt=""
-                    onerror={() => (avatarFailures = { ...avatarFailures, [root.id]: true })}
+                    onerror={() => (avatarFailures = {
+                        ...avatarFailures,
+                        [`${root.id}:${remote?.avatar_version ?? 0}`]: true,
+                      })}
                   />
                 {:else if remote?.owner_name}
                   <span
@@ -4250,12 +4254,15 @@
                   title={remoteTitle(root.id, rootLabel(root.alias))}
                   onclick={() => openOfflineRoot(root)}
                 >
-                  {#if remote?.avatar_version && !avatarFailures[root.id]}
+                  {#if remote?.avatar_version && !avatarFailures[`${root.id}:${remote?.avatar_version ?? 0}`]}
                     <img
                       class="nav-avatar"
                       src={api.remoteAvatarUrl(remote.id, remote.avatar_version ?? 0)}
                       alt=""
-                      onerror={() => (avatarFailures = { ...avatarFailures, [root.id]: true })}
+                      onerror={() => (avatarFailures = {
+                        ...avatarFailures,
+                        [`${root.id}:${remote?.avatar_version ?? 0}`]: true,
+                      })}
                     />
                   {:else if remote?.owner_name}
                     <span

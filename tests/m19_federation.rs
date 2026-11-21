@@ -577,6 +577,50 @@ async fn federation_contract_round_trip() {
         .join("users/admin/shared/local-up.txt");
     assert_eq!(std::fs::read(&remote_copy).unwrap(), b"local body");
 
+    std::fs::write(
+        mount_instance
+            ._dir
+            .path()
+            .join("users/admin/move-local.txt"),
+        b"move body",
+    )
+    .unwrap();
+    let moved = send_json(
+        &mount_instance.router,
+        Method::POST,
+        "/api/v1/fs/transfer-jobs",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({
+            "source_root": mount_instance.root_id,
+            "paths": ["move-local.txt"],
+            "dest_root": remote_root,
+            "dest_path": "",
+            "move_items": true,
+        }),
+    )
+    .await;
+    assert_eq!(moved.status(), StatusCode::OK);
+    let moved = json_body(moved).await;
+    wait_job(&mount_instance, moved["job_id"].as_str().unwrap()).await;
+    assert_eq!(
+        std::fs::read(
+            peer_instance
+                ._dir
+                .path()
+                .join("users/admin/shared/move-local.txt")
+        )
+        .unwrap(),
+        b"move body"
+    );
+    assert!(
+        !mount_instance
+            ._dir
+            .path()
+            .join("users/admin/move-local.txt")
+            .exists()
+    );
+
     let remote_source = peer_instance
         ._dir
         .path()
@@ -634,6 +678,7 @@ async fn federation_contract_round_trip() {
             peer_instance.base
         ))
         .bearer_auth(&token)
+        .header("idempotency-key", "big-chunk-0")
         .body(vec![7_u8; 4 * 1024 * 1024])
         .send()
         .await
@@ -645,6 +690,7 @@ async fn federation_contract_round_trip() {
             peer_instance.base
         ))
         .bearer_auth(&token)
+        .header("idempotency-key", "big-chunk-1")
         .body(vec![8_u8; 1024 * 1024])
         .send()
         .await
@@ -656,6 +702,7 @@ async fn federation_contract_round_trip() {
             peer_instance.base
         ))
         .bearer_auth(&token)
+        .header("idempotency-key", "big-complete")
         .send()
         .await
         .unwrap();
@@ -872,6 +919,7 @@ async fn federation_security_and_idempotency() {
             peer_instance.base
         ))
         .bearer_auth(&raw)
+        .header("idempotency-key", "guard-chunk")
         .body("abc")
         .send()
         .await
@@ -883,6 +931,7 @@ async fn federation_security_and_idempotency() {
             peer_instance.base
         ))
         .bearer_auth(&raw)
+        .header("idempotency-key", "guard-complete")
         .send()
         .await
         .unwrap();

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -254,6 +254,45 @@ pub async fn info(
     })))
 }
 
+pub(crate) fn log_read(
+    state: &Arc<AppState>,
+    user_id: i64,
+    token_id: i64,
+    grant_id: i64,
+    op: &str,
+) {
+    let mut counts = state.federation_read_counts.lock();
+    *counts
+        .entry((user_id, token_id, grant_id, op.to_owned()))
+        .or_insert(0) += 1;
+}
+
+pub(crate) async fn read_flush_loop(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        let entries: Vec<((i64, i64, i64, String), i64)> = {
+            let mut counts = state.federation_read_counts.lock();
+            counts.drain().collect()
+        };
+        for ((user_id, token_id, grant_id, op), count) in entries {
+            let _ = state
+                .db
+                .federation_log(
+                    user_id,
+                    token_id,
+                    Some(grant_id),
+                    &format!("read:{op}"),
+                    None,
+                    200,
+                    count,
+                    0,
+                    None,
+                )
+                .await;
+        }
+    }
+}
+
 pub fn router() -> axum::Router<Arc<AppState>> {
     use axum::routing::{get, post, put};
     axum::Router::new()
@@ -289,6 +328,32 @@ pub fn router() -> axum::Router<Arc<AppState>> {
             },
         ))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(axum::middleware::map_response(
+            |response: Response| async move {
+                let is_json = response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("application/json"));
+                if !is_json {
+                    return response;
+                }
+                let (parts, body) = response.into_parts();
+                match axum::body::to_bytes(body, 8 * 1024 * 1024).await {
+                    Ok(bytes) => Response::from_parts(parts, Body::from(bytes)),
+                    Err(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": {
+                                "code": "TOO_LARGE",
+                                "message": "response exceeds the size limit"
+                            }
+                        })),
+                    )
+                        .into_response(),
+                }
+            },
+        ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +372,7 @@ pub async fn thumb(
 ) -> Result<Response, AppError> {
     let auth = authenticate(&state, &headers).await?;
     let grant = auth.grant(&state, query.grant).await?;
+    log_read(&state, auth.token.user_id, auth.token.id, grant.id, "thumb");
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let fit = crate::thumbs::Fit::from_query(query.fit.as_deref());
@@ -386,6 +452,7 @@ pub async fn grants(
     let items: Vec<Value> = auth
         .grants
         .iter()
+        .filter(|grant| std::path::Path::new(&grant.real_path).is_dir())
         .map(|grant| {
             json!({
                 "id": grant.id,
@@ -416,6 +483,7 @@ pub async fn list(
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
     let grant = auth.grant(&state, query.grant).await?;
+    log_read(&state, auth.token.user_id, auth.token.id, grant.id, "list");
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let sort = query.sort.unwrap_or_else(|| "name".to_owned());
@@ -449,6 +517,7 @@ pub async fn list(
             .filter(|entry| !entry.name.starts_with('.'))
             .collect()
     };
+    entries.retain(|entry| !entry.is_symlink);
     let video_enabled = {
         let settings = state.settings();
         settings.settings.thumbnails.enabled
@@ -508,6 +577,13 @@ pub async fn search(
         return Err(AppError::TooManyRequests);
     }
     let grant = auth.grant(&state, query.grant).await?;
+    log_read(
+        &state,
+        auth.token.user_id,
+        auth.token.id,
+        grant.id,
+        "search",
+    );
     let text = query.q.trim();
     if text.chars().count() < 2 {
         return Err(AppError::bad_request("search query is too short"));
@@ -606,6 +682,13 @@ pub async fn dir_size(
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
     let grant = auth.grant(&state, query.grant).await?;
+    log_read(
+        &state,
+        auth.token.user_id,
+        auth.token.id,
+        grant.id,
+        "dir-size",
+    );
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let absolute = resolved.absolute.clone();
@@ -632,6 +715,7 @@ pub async fn stat(
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
     let grant = auth.grant(&state, query.grant).await?;
+    log_read(&state, auth.token.user_id, auth.token.id, grant.id, "stat");
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let is_dir = resolved.absolute.is_dir();
@@ -1421,6 +1505,7 @@ pub async fn upload_chunk(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let auth = authenticate(&state, &headers).await?;
+    let _ = idempotency_key(&headers)?;
     let mut upload = peer_upload(&state, &auth, &id).await?;
     let index = index as i64;
     let chunks = (upload.total_size + upload.chunk_size - 1) / upload.chunk_size;
@@ -1487,6 +1572,7 @@ pub async fn upload_status(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
+    let _ = idempotency_key(&headers)?;
     let upload = peer_upload(&state, &auth, &id).await?;
     let chunks = (upload.total_size + upload.chunk_size - 1) / upload.chunk_size;
     let received_chunks: Vec<u32> = (0..chunks)

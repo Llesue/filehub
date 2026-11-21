@@ -1406,6 +1406,44 @@ impl Db {
         .await
     }
 
+    pub async fn uploads_for_root(
+        &self,
+        user_id: i64,
+        root_id: i64,
+    ) -> anyhow::Result<Vec<UploadSession>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, user_id, root_id, dir_path, filename, total_size, chunk_size, \
+                        received, chunk_bitmap, temp_path, expires_at, created_at, updated_at, \
+                        remote_upload_id, if_match, if_none_match, token_id \
+                 FROM upload_sessions WHERE user_id = ?1 AND root_id = ?2",
+            )?;
+            let rows = statement.query_map(params![user_id, root_id], |row| {
+                Ok(UploadSession {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    root_id: row.get(2)?,
+                    dir_path: row.get(3)?,
+                    filename: row.get(4)?,
+                    total_size: row.get(5)?,
+                    chunk_size: row.get(6)?,
+                    received: row.get(7)?,
+                    chunk_bitmap: row.get(8)?,
+                    temp_path: row.get(9)?,
+                    expires_at: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    remote_upload_id: row.get(13)?,
+                    if_match: row.get(14)?,
+                    if_none_match: row.get(15)?,
+                    token_id: row.get(16)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
     pub async fn update_upload_progress(
         &self,
         id: &str,
@@ -2548,6 +2586,24 @@ impl Db {
                 )?;
             }
             Ok(paths)
+        })
+        .await
+    }
+
+    pub async fn delete_pending_subtree(&self, prefix: &str) -> anyhow::Result<usize> {
+        let bounds = Self::subtree_bounds(prefix);
+        if bounds.is_empty() {
+            return Ok(0);
+        }
+        self.call(move |connection| {
+            let mut removed = 0usize;
+            for (start, end) in &bounds {
+                removed += connection.execute(
+                    "DELETE FROM pending_index_dirs WHERE real_path >= ?1 AND real_path < ?2",
+                    params![start, end],
+                )?;
+            }
+            Ok(removed)
         })
         .await
     }

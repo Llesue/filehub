@@ -146,6 +146,7 @@ pub struct AppState {
     pub federation_clients: Mutex<HashMap<i64, Arc<crate::federation::client::PeerClient>>>,
     pub federation_cache: FederationCache,
     pub federation_streams: Mutex<HashMap<i64, Arc<Semaphore>>>,
+    pub federation_read_counts: Mutex<HashMap<(i64, i64, i64, String), i64>>,
 }
 
 fn path_chain(target: &Path) -> Vec<String> {
@@ -280,8 +281,10 @@ impl AppState {
             federation_clients: Mutex::new(HashMap::new()),
             federation_cache: Mutex::new(HashMap::new()),
             federation_streams: Mutex::new(HashMap::new()),
+            federation_read_counts: Mutex::new(HashMap::new()),
         });
         tokio::spawn(crate::federation::mounts::health_loop(Arc::clone(&state)));
+        tokio::spawn(crate::federation::peer::read_flush_loop(Arc::clone(&state)));
         state.schedule_directory_size_counts_refresh();
         state.schedule_bigram_backfill();
         crate::media::warm_cache(&state).await;

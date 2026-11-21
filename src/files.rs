@@ -1906,6 +1906,30 @@ pub async fn delete_confirm(
     let mut remove_ns = 0_u128;
     let mut cache_ns = 0_u128;
     let root = load_root(&state, current.user.id, preview.root_id).await?;
+    if !root.is_remote() {
+        let grants = state
+            .db
+            .federation_list_grants(current.user.id)
+            .await
+            .map_err(AppError::internal)?;
+        for item in &preview.items {
+            let resolved =
+                authz::resolve(&state, current.user.id, root.id, &item.relative, false).await?;
+            if resolved.absolute.is_dir()
+                && grants.iter().any(|grant| {
+                    !grant.revoked
+                        && crate::platform::path_within(
+                            std::path::Path::new(&grant.real_path),
+                            &resolved.absolute,
+                        )
+                })
+            {
+                return Err(AppError::Conflict(
+                    "the directory contains a remote share; remove the share first".to_owned(),
+                ));
+            }
+        }
+    }
     let mut cache_targets = Vec::with_capacity(preview.items.len());
     let paths: Vec<String> = preview
         .items
