@@ -1150,6 +1150,8 @@ pub async fn download(
                 alias: "share".to_owned(),
                 read_only: share.read_only,
                 sort_order: 0,
+                kind: "local".to_owned(),
+                mount_id: None,
             },
             relative: String::new(),
             absolute: PathBuf::from(&share.real_path),
@@ -1304,6 +1306,8 @@ pub async fn thumb(
                 alias: "share".to_owned(),
                 read_only: share.read_only,
                 sort_order: 0,
+                kind: "local".to_owned(),
+                mount_id: None,
             },
             relative: String::new(),
             absolute: PathBuf::from(&share.real_path),
@@ -1365,6 +1369,8 @@ fn share_root_resolved(share: &Share) -> pathresolver::ResolvedPath {
             alias: "share".to_owned(),
             read_only: share.read_only,
             sort_order: 0,
+            kind: "local".to_owned(),
+            mount_id: None,
         },
         relative: String::new(),
         absolute: PathBuf::from(&share.real_path),
@@ -1415,6 +1421,8 @@ async fn resolve_zip_selection(
             alias: "share".to_owned(),
             read_only: true,
             sort_order: 0,
+            kind: "local".to_owned(),
+            mount_id: None,
         };
         let mut selected = Vec::new();
         for item in items {
@@ -1823,6 +1831,8 @@ async fn resolve_share_path(
         alias: "share".to_owned(),
         read_only: share.read_only,
         sort_order: 0,
+        kind: "local".to_owned(),
+        mount_id: None,
     };
     pathresolver::resolve(root, path, false).await
 }

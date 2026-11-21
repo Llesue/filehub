@@ -66,6 +66,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/0029_share_stable_token.sql"),
     ),
     (30, include_str!("../migrations/0030_session_last_seen.sql")),
+    (31, include_str!("../migrations/0031_federation.sql")),
 ];
 
 pub fn unix_now() -> i64 {
@@ -87,6 +88,8 @@ pub struct User {
     pub feature_terminal: bool,
     pub feature_zip: bool,
     pub feature_unzip: bool,
+    pub feature_federation_mount: bool,
+    pub feature_federation_share: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_login_at: Option<i64>,
@@ -105,6 +108,8 @@ impl User {
             feature_terminal: row.get::<_, i64>("feature_terminal")? != 0,
             feature_zip: row.get::<_, i64>("feature_zip")? != 0,
             feature_unzip: row.get::<_, i64>("feature_unzip")? != 0,
+            feature_federation_mount: row.get::<_, i64>("feature_federation_mount")? != 0,
+            feature_federation_share: row.get::<_, i64>("feature_federation_share")? != 0,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
             last_login_at: row.get("last_login_at")?,
@@ -148,6 +153,23 @@ pub struct Root {
     pub alias: String,
     pub read_only: bool,
     pub sort_order: i64,
+    pub kind: String,
+    pub mount_id: Option<i64>,
+}
+
+impl Root {
+    pub fn is_remote(&self) -> bool {
+        self.kind == "remote"
+    }
+
+    /// Local roots only. Remote roots deliberately have no usable path: an
+    /// empty `real_path` would silently resolve relative to the process CWD.
+    pub fn local_path(&self) -> anyhow::Result<&str> {
+        if self.is_remote() {
+            anyhow::bail!("remote root has no local path");
+        }
+        Ok(&self.real_path)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1185,7 +1207,7 @@ impl Db {
     pub async fn list_roots(&self, user_id: i64) -> anyhow::Result<Vec<Root>> {
         self.call(move |connection| {
             let mut statement = connection.prepare(
-                "SELECT id, user_id, real_path, alias, read_only, sort_order \
+                "SELECT id, user_id, real_path, alias, read_only, sort_order, kind, mount_id \
                  FROM user_roots WHERE user_id = ?1 ORDER BY sort_order, id",
             )?;
             let rows = statement.query_map(params![user_id], |row| {
@@ -1196,6 +1218,8 @@ impl Db {
                     alias: row.get(3)?,
                     read_only: row.get::<_, i64>(4)? != 0,
                     sort_order: row.get(5)?,
+                    kind: row.get(6)?,
+                    mount_id: row.get(7)?,
                 })
             })?;
             rows.collect()
@@ -1206,7 +1230,7 @@ impl Db {
     pub async fn list_all_roots(&self) -> anyhow::Result<Vec<Root>> {
         self.call(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, user_id, real_path, alias, read_only, sort_order \
+                "SELECT id, user_id, real_path, alias, read_only, sort_order, kind, mount_id \
                  FROM user_roots ORDER BY user_id, sort_order, id",
             )?;
             let rows = statement.query_map([], |row| {
@@ -1217,6 +1241,8 @@ impl Db {
                     alias: row.get(3)?,
                     read_only: row.get::<_, i64>(4)? != 0,
                     sort_order: row.get(5)?,
+                    kind: row.get(6)?,
+                    mount_id: row.get(7)?,
                 })
             })?;
             rows.collect()
@@ -1228,7 +1254,7 @@ impl Db {
         self.call(move |connection| {
             connection
                 .query_row(
-                    "SELECT id, user_id, real_path, alias, read_only, sort_order \
+                    "SELECT id, user_id, real_path, alias, read_only, sort_order, kind, mount_id \
                      FROM user_roots WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     |row| {
@@ -1239,6 +1265,8 @@ impl Db {
                             alias: row.get(3)?,
                             read_only: row.get::<_, i64>(4)? != 0,
                             sort_order: row.get(5)?,
+                            kind: row.get(6)?,
+                            mount_id: row.get(7)?,
                         })
                     },
                 )
@@ -1261,7 +1289,7 @@ impl Db {
                 "INSERT INTO user_roots \
                  (user_id, real_path, alias, read_only, sort_order, created_at) \
                  VALUES (?1, ?2, ?3, ?4, 0, ?5) \
-                 ON CONFLICT(user_id, real_path) DO NOTHING",
+                 ON CONFLICT(user_id, real_path) WHERE kind = 'local' DO NOTHING",
                 params![user_id, real_path, alias, read_only as i64, unix_now()],
             )?;
             connection.query_row(

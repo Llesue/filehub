@@ -24,6 +24,7 @@ pub struct Settings {
     pub jobs: JobsSettings,
     pub log: LogSettings,
     pub media: MediaSettings,
+    pub federation: FederationSettings,
     pub default_quota_bytes: i64,
     /// Maximum number of files+directories per user home. 0 disables the limit.
     pub max_entries_per_user: u64,
@@ -50,6 +51,7 @@ impl Default for Settings {
             jobs: JobsSettings::default(),
             log: LogSettings::default(),
             media: MediaSettings::default(),
+            federation: FederationSettings::default(),
             default_quota_bytes: 15 * 1024 * 1024 * 1024,
             max_entries_per_user: 1_000_000,
             terminal_enabled: true,
@@ -270,6 +272,56 @@ impl Default for SecuritySettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct FederationSettings {
+    /// Allow users to mount directories from another FileHub instance.
+    pub enabled_outbound: bool,
+    /// Allow users to expose their own directories to other instances.
+    pub enabled_inbound: bool,
+    /// Allow plain HTTP targets on private networks.
+    pub allow_plaintext_lan: bool,
+    /// Allow connecting to loopback. Development only.
+    pub allow_loopback: bool,
+    pub max_mounts_per_user: u32,
+    pub max_grants_per_user: u32,
+    /// Concurrent streams per mount.
+    pub stream_concurrency: usize,
+    /// Debounce for background directory revalidation.
+    pub revalidate_seconds: i64,
+    /// Global metadata cache budget, in entries.
+    pub cache_entries: usize,
+    pub request_timeout_seconds: u64,
+    pub thumb_timeout_seconds: u64,
+    pub search_timeout_seconds: u64,
+    pub thumb_warm: bool,
+    pub warm_batch: usize,
+    /// Upper bound for temporary spooling (unzip, transcode).
+    pub max_spool_bytes: u64,
+}
+
+impl Default for FederationSettings {
+    fn default() -> Self {
+        Self {
+            enabled_outbound: false,
+            enabled_inbound: false,
+            allow_plaintext_lan: true,
+            allow_loopback: false,
+            max_mounts_per_user: 10,
+            max_grants_per_user: 10,
+            stream_concurrency: 3,
+            revalidate_seconds: 15,
+            cache_entries: 20_000,
+            request_timeout_seconds: 30,
+            thumb_timeout_seconds: 180,
+            search_timeout_seconds: 10,
+            thumb_warm: true,
+            warm_batch: 100,
+            max_spool_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JobsSettings {
     pub io_workers: usize,
     pub interactive_workers: usize,
@@ -354,6 +406,27 @@ impl Settings {
         }
         if self.downloads.zip_concurrency == 0 {
             bail!("downloads.zip_concurrency must be greater than zero");
+        }
+        if self.federation.stream_concurrency == 0 {
+            bail!("federation.stream_concurrency must be greater than zero");
+        }
+        if !(1..=3600).contains(&self.federation.revalidate_seconds) {
+            bail!("federation.revalidate_seconds must be between 1 and 3600");
+        }
+        if self.federation.cache_entries < 100 {
+            bail!("federation.cache_entries must be at least 100");
+        }
+        if !(1..=500).contains(&self.federation.warm_batch) {
+            bail!("federation.warm_batch must be between 1 and 500");
+        }
+        if self.federation.request_timeout_seconds == 0
+            || self.federation.thumb_timeout_seconds == 0
+            || self.federation.search_timeout_seconds == 0
+        {
+            bail!("federation timeouts must be greater than zero");
+        }
+        if self.federation.max_spool_bytes == 0 {
+            bail!("federation.max_spool_bytes must be greater than zero");
         }
         if self.security.session_ttl_hours == 0 {
             bail!("security.session_ttl_hours must be greater than zero");
