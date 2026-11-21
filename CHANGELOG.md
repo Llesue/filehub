@@ -10,7 +10,9 @@
 - Remote thumbnails and directory sizes are proxied, with local metadata, thumbnail and transcoding caches; remote thumbnails are cached per mount with a visible cache size.
 - Capability-driven UI: actions the peer does not support are hidden or disabled.
 - Thumbnail warm-up for remote directories, token rotation, and paste-ready invite text in the mount wizard.
+- Mounting is a two-step flow (address and token on one screen, folder selection next), and the sidebar shows remote status, latency, cache usage and the mount source on hover.
 - The grant dialog includes a folder browser, and the mount manager supports renaming, latency and cache usage.
+- Remote sharing is managed from a dialog: tokens can add or remove granted folders inline, rotate, revoke, and show revoked items in a collapsed section.
 - Streaming transfers between local and remote roots, and between two remote roots, with background jobs and per-item results.
 - Peer upload sessions restore from the authorization side after a reload or crash.
 - Sidebar GitHub link and an optional update check against GitHub Releases.
