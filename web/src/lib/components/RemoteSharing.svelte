@@ -42,7 +42,20 @@
   let error = $state('');
 
   $effect(() => {
-    if (open) void load();
+    if (open) {
+      void load();
+      return;
+    }
+    // A token is shown exactly once. Closing the dialog must forget it so
+    // reopening the dialog cannot reveal it again.
+    newToken = '';
+    copiedKind = null;
+    rotated = false;
+    newGrantOpen = false;
+    newTokenOpen = false;
+    browseOpen = false;
+    addingToToken = null;
+    error = '';
   });
 
   function message(value: unknown): string {
