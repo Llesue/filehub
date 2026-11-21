@@ -32,6 +32,7 @@
     | 'trash'
     | 'download'
     | 'link'
+    | 'plus'
     | 'unlink'
     | 'volume'
     | 'volume-muted'
@@ -154,8 +155,12 @@
     <path d="M12 4v12m0 0 4-4m-4 4-4-4" />
     <path d="M4 20h16" />
   {:else if name === 'link'}
-    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    <g transform="translate(12 12) scale(0.86) translate(-12 -12)">
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </g>
+  {:else if name === 'plus'}
+    <path d="M12 5v14M5 12h14" />
   {:else if name === 'unlink'}
     <path d="M15 7h2a5 5 0 0 1 0 10h-2" />
     <path d="M9 17H7A5 5 0 0 1 7 7h2" />

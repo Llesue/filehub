@@ -20,7 +20,7 @@
   import PreviewModal from './lib/components/PreviewModal.svelte';
   import PropertiesDialog from './lib/components/PropertiesDialog.svelte';
   import PreferencesPage from './lib/components/PreferencesPage.svelte';
-  import RemoteMountWizard from './lib/components/RemoteMountWizard.svelte';
+  import RemoteMountDialog from './lib/components/RemoteMountDialog.svelte';
   import ShareDialog from './lib/components/ShareDialog.svelte';
   import TerminalPanel from './lib/components/TerminalPanel.svelte';
   import CodeEditor from './lib/components/CodeEditor.svelte';
@@ -55,6 +55,7 @@
     ApiError,
     type AuthResponse,
     type Entry,
+    type RemoteMount,
     type Root,
     type Capabilities,
     type JobInfo,
@@ -88,7 +89,7 @@
   let initialized = $state(false);
   let user = $state<User | null>(null);
   let versionInfo = $state<VersionInfo | null>(null);
-  let remoteWizardOpen = $state(false);
+  let mountDialogOpen = $state(false);
   let preferences = $state<UserPreferences | null>(null);
   let systemFeatures = $state<SystemFeatures>({ thumbnails: true, editor: true, terminal: true });
   let capabilities = $state<Capabilities>({ terminal: true, zip: true, unzip: true });
@@ -458,12 +459,37 @@
   });
 
   let activeRoot = $derived(roots.find((root) => root.id === activeRootId) ?? null);
+  const localRoots = $derived(roots.filter((root) => root.kind !== 'remote'));
+  const remoteRoots = $derived(roots.filter((root) => root.kind === 'remote'));
   let remoteCaps = $state<Record<number, string[]>>({});
+  let remoteStates = $state<Record<number, RemoteMount['state']>>({});
+  let currentStale = $state(false);
   const activeRemoteCaps = $derived(
     activeRoot?.kind === 'remote' ? (remoteCaps[activeRoot.id] ?? []) : null,
   );
   function remoteCan(capability: string): boolean {
     return activeRemoteCaps === null || activeRemoteCaps.includes(capability);
+  }
+
+  function remoteStateBadge(rootId: number): string | null {
+    const state = remoteStates[rootId];
+    if (!state || state === 'online') return null;
+    return remoteStateLabel(state);
+  }
+
+  function remoteStateLabel(state: RemoteMount['state']): string {
+    switch (state) {
+      case 'online':
+        return t($language, '在线');
+      case 'offline':
+        return t($language, '离线');
+      case 'token_invalid':
+        return t($language, '令牌无效');
+      case 'grant_revoked':
+        return t($language, '授权已撤销');
+      case 'unsupported':
+        return t($language, '对端不支持');
+    }
   }
   let pathSegments = $derived(currentPath.split('/').filter(Boolean));
   let quotaPercent = $derived(
@@ -1107,10 +1133,13 @@
     try {
       const result = await api.remoteMounts();
       const next: Record<number, string[]> = {};
+      const states: Record<number, RemoteMount['state']> = {};
       for (const mount of result.mounts) {
         next[mount.root_id] = mount.capabilities;
+        states[mount.root_id] = mount.state;
       }
       remoteCaps = next;
+      remoteStates = states;
     } catch (error) {
       console.debug('remote mount capabilities unavailable', error);
     }
@@ -1235,6 +1264,7 @@
       currentReadOnlyReason = result.read_only
         ? (result.read_only_reason ?? 'policy')
         : null;
+      currentStale = result.stale === true;
       entries = result.entries;
       nextCursor = result.next_cursor;
       scheduleRemoteThumbWarm(result.root, result.path, result.entries);
@@ -3117,7 +3147,25 @@
     const input = event.currentTarget as HTMLInputElement;
     const files = Array.from(input.files ?? []);
     input.value = '';
-    enqueueUploads(files.map((file) => ({ file, relativePath: file.name })));
+    const queued = () =>
+      enqueueUploads(files.map((file) => ({ file, relativePath: file.name })));
+    const existing = new Set(
+      entries.filter((entry) => !entry.is_dir).map((entry) => entry.name),
+    );
+    const conflicts = files.filter((file) => existing.has(file.name));
+    if (conflicts.length === 0) {
+      queued();
+      return;
+    }
+    confirmState = {
+      title: t($language, '文件已存在'),
+      message: t($language, '当前目录已有同名文件。上传会覆盖它们，继续吗？'),
+      requireText: null,
+      action: () => {
+        confirmState = null;
+        queued();
+      },
+    };
   }
 
   async function handleFolderFiles(event: Event): Promise<void> {
@@ -3586,7 +3634,7 @@
     return editorContent.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
   }
 
-  async function saveEditor(auto = false): Promise<void> {
+  async function saveEditor(auto = false, force = false): Promise<void> {
     if (activeRootId === null || !editorOpen || editorReadOnly || currentReadOnly) return;
     editorSaving = true;
     editorError = '';
@@ -3599,6 +3647,7 @@
         csrf,
         editorEncoding,
         editorBom,
+        force,
       );
       editorEtag = saved.etag;
       editorOriginalContent = editorContent;
@@ -3606,7 +3655,17 @@
       clearDirSizeCache();
       await loadList(activeRootId, currentPath);
     } catch (error) {
-      if (error instanceof ApiError && error.status === 412) {
+      if (error instanceof ApiError && error.status === 412 && !auto) {
+        confirmState = {
+          title: t($language, '文件已被修改'),
+          message: t($language, '文件已被其他操作修改。要用当前内容覆盖吗？'),
+          requireText: null,
+          action: () => {
+            confirmState = null;
+            void saveEditor(true, true);
+          },
+        };
+      } else if (error instanceof ApiError && error.status === 412) {
         editorError = t($language, '文件已被其他操作修改，请关闭后重新打开。');
       } else if (error instanceof ApiError && error.code === 'PERMISSION_DENIED') {
         editorReadOnly = true;
@@ -3929,7 +3988,7 @@
     <div class="workspace">
       <aside class:open={sidebarOpen} class="sidebar" aria-label={t($language, '主导航')}>
         <nav class="nav" aria-label={t($language, '文件导航')}>
-          {#each roots as root (root.id)}
+          {#each localRoots as root (root.id)}
             <button
               type="button"
               class:active={appView === 'files' && root.id === activeRootId}
@@ -3941,7 +4000,7 @@
                 void loadList(root.id, '');
               }}
             >
-              <Icon name={root.kind === 'remote' ? 'link' : 'folder'} size={18} />
+              <Icon name="folder" size={18} />
               <span class="nav-label">{rootLabel(root.alias)}</span>
               {#if root.read_only}
                 <span class="nav-readonly" title={t($language, '目录已设为只读')}
@@ -3950,18 +4009,53 @@
               {/if}
             </button>
           {/each}
-          {#if roots.length === 0}
+          {#if localRoots.length === 0 && remoteRoots.length === 0}
             <span class="nav-empty">{t($language, '暂无目录')}</span>
           {/if}
+          {#if remoteRoots.length > 0}
+            <div class="nav-sep"></div>
+            {#each remoteRoots as root (root.id)}
+              <button
+                type="button"
+                class:active={appView === 'files' && root.id === activeRootId}
+                class="nav-item"
+                title={rootLabel(root.alias)}
+                onclick={() => {
+                  appView = 'files';
+                  activeRootId = root.id;
+                  void loadList(root.id, '');
+                }}
+              >
+                <Icon name="link" size={18} />
+                <span class="nav-label">{rootLabel(root.alias)}</span>
+                {#if remoteStateBadge(root.id)}
+                  <span
+                    class="nav-state"
+                    role="img"
+                    aria-label={remoteStateBadge(root.id)}
+                    title={remoteStateBadge(root.id)}
+                  ></span>
+                {/if}
+                {#if root.read_only}
+                  <span class="nav-readonly" title={t($language, '目录已设为只读')}
+                    >{t($language, '只读')}</span
+                  >
+                {/if}
+              </button>
+            {/each}
+          {/if}
           {#if user?.features.federation_mount}
+            {#if remoteRoots.length === 0}
+              <div class="nav-sep"></div>
+            {/if}
             <button
               type="button"
-              class="nav-item"
-              title={t($language, '连接远程目录')}
-              onclick={() => (remoteWizardOpen = true)}
+              class="nav-item nav-add"
+              title={t($language, '挂载远程目录')}
+              onclick={() => (mountDialogOpen = true)}
             >
-              <Icon name="link" size={18} />
-              <span class="nav-label">{t($language, '连接远程目录')}</span>
+              <Icon name="plus" size={18} />
+              <span class="nav-label">{t($language, '挂载远程目录')}</span>
             </button>
           {/if}
           <div class="nav-sep"></div>
@@ -4076,8 +4170,11 @@
             {#if currentReadOnly}
               <span class="readonly-tag">{t($language, '只读')}</span>
             {/if}
-            <button type="button" class="text-button" onclick={() => (appView = 'settings')}>
-              {t($language, '连接设置')}
+            {#if currentStale}
+              <span class="stale-tag">{t($language, '数据可能已过期')}</span>
+            {/if}
+            <button type="button" class="text-button" onclick={() => (mountDialogOpen = true)}>
+              {t($language, '挂载设置')}
             </button>
           </div>
         {/if}
@@ -5432,11 +5529,18 @@
   {/if}
 
   {#if preview && activeRootId !== null}
-    <RemoteMountWizard
-      open={remoteWizardOpen}
+    <RemoteMountDialog
+      open={mountDialogOpen}
       {csrf}
-      onClose={() => (remoteWizardOpen = false)}
-      onMounted={() => void refreshRoots()}
+      onClose={() => (mountDialogOpen = false)}
+      onMounted={(rootId) => {
+        void refreshRoots();
+        if (rootId !== null) {
+          appView = 'files';
+          activeRootId = rootId;
+          void loadList(rootId, '');
+        }
+      }}
     />
 
     <PreviewModal
@@ -5943,6 +6047,30 @@
 
   .nav-item:disabled {
     opacity: 0.45;
+  }
+
+  .nav-add {
+    color: var(--text-2);
+  }
+
+  .nav-state {
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--danger);
+  }
+
+  .stale-tag {
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-2);
+    font-size: 11px;
+  }
+
+  .nav-add:hover:not(:disabled) {
+    color: var(--accent-text);
   }
 
   .nav-empty {

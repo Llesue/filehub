@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { api, ApiError, type RemoteGrant } from '../api';
   import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
@@ -12,7 +13,7 @@
     open: boolean;
     csrf: string;
     onClose: () => void;
-    onMounted: () => void;
+    onMounted: (rootId: number) => void;
   } = $props();
 
   let step = $state(1);
@@ -29,6 +30,27 @@
   let alias = $state('');
   let busy = $state(false);
   let error = $state('');
+  let showToken = $state(false);
+  let existingAliases = $state<string[]>([]);
+  const selectedGrant = $derived(grants.find((grant) => grant.id === selected) ?? null);
+
+  onMount(() => {
+    void api
+      .remoteMounts()
+      .then((result) => {
+        existingAliases = result.mounts.map((mount) => mount.alias);
+      })
+      .catch(() => {
+        existingAliases = [];
+      });
+  });
+
+  function uniqueAlias(base: string): string {
+    if (!existingAliases.includes(base)) return base;
+    let index = 2;
+    while (existingAliases.includes(`${base} (${index})`)) index += 1;
+    return `${base} (${index})`;
+  }
 
   function message(value: unknown): string {
     if (value instanceof ApiError) return value.message;
@@ -46,9 +68,10 @@
     alias = '';
     error = '';
     busy = false;
+    showToken = false;
   }
 
-  async function checkAddress(): Promise<void> {
+  async function probeAddress(jump: boolean): Promise<void> {
     busy = true;
     error = '';
     probe = null;
@@ -60,12 +83,16 @@
         address_class: result.address_class,
         plaintext: result.plaintext,
       };
-      step = 2;
+      if (jump) step = 2;
     } catch (value) {
       error = message(value);
     } finally {
       busy = false;
     }
+  }
+
+  async function checkAddress(): Promise<void> {
+    await probeAddress(true);
   }
 
   async function checkToken(): Promise<void> {
@@ -79,7 +106,7 @@
       const first = grants[0];
       if (grants.length === 1 && first) {
         selected = first.id;
-        alias = first.label;
+        alias = uniqueAlias(first.label);
       }
       step = 3;
     } catch (value) {
@@ -94,8 +121,14 @@
     busy = true;
     error = '';
     try {
-      await api.remoteCreateMount(url.trim(), token.trim(), selected, alias.trim(), csrf);
-      onMounted();
+      const created = await api.remoteCreateMount(
+        url.trim(),
+        token.trim(),
+        selected,
+        alias.trim(),
+        csrf,
+      );
+      onMounted(created.root_id);
       reset();
       onClose();
     } catch (value) {
@@ -148,13 +181,25 @@
                 parseInvite(value);
               }
             }}
+            onblur={() => {
+              if (!probe && url.trim() && !busy) void probeAddress(false);
+            }}
           />
         </label>
+        {#if probe}
+          <div class="probe">
+            <strong>FileHub {probe.server_version}</strong>
+            <span>{probe.resolved_ips.join(', ')} · {probe.address_class}</span>
+            {#if probe.plaintext}
+              <em>{t($language, '明文 HTTP，同网段可能窃取令牌')}</em>
+            {/if}
+          </div>
+        {/if}
         <p class="hint">{t($language, '先校验地址，未保存的令牌不会发送。')}</p>
         <p class="hint">{t($language, '也可以直接粘贴对方给的邀请信息。')}</p>
         <footer>
           <button type="button" disabled={busy || !url.trim()} onclick={() => void checkAddress()}>
-            {t($language, '检测地址')}
+            {probe ? t($language, '下一步') : t($language, '检测地址')}
           </button>
         </footer>
       {:else if step === 2}
@@ -169,18 +214,23 @@
         {/if}
         <label class="field">
           <span>{t($language, '令牌')}</span>
-          <input
-            bind:value={token}
-            type="password"
-            placeholder="fhfed_..."
-            autocomplete="off"
-            oninput={(event) => {
-              const value = event.currentTarget.value;
-              if (value.includes('https://') || value.includes('http://')) {
-                parseInvite(value);
-              }
-            }}
-          />
+          <div class="secret">
+            <input
+              bind:value={token}
+              type={showToken ? 'text' : 'password'}
+              placeholder="fhfed_..."
+              autocomplete="off"
+              oninput={(event) => {
+                const value = event.currentTarget.value;
+                if (value.includes('https://') || value.includes('http://')) {
+                  parseInvite(value);
+                }
+              }}
+            />
+            <button type="button" class="ghost" onclick={() => (showToken = !showToken)}>
+              {showToken ? t($language, '隐藏') : t($language, '显示')}
+            </button>
+          </div>
         </label>
         <footer>
           <button type="button" class="ghost" onclick={() => (step = 1)}>
@@ -205,6 +255,9 @@
             <p class="hint">{t($language, '这个令牌没有可用的目录。')}</p>
           {/if}
         </div>
+        {#if selectedGrant?.mode === 'rw'}
+          <p class="hint warn">{t($language, '对方可以修改、删除和覆盖文件。')}</p>
+        {/if}
         <label class="field">
           <span>{t($language, '挂载名称')}</span>
           <input bind:value={alias} />
@@ -298,6 +351,23 @@
     font-size: 12px;
   }
 
+  .secret {
+    display: flex;
+    gap: 8px;
+  }
+
+  .secret input {
+    flex: 1;
+  }
+
+  .secret button {
+    flex: 0 0 auto;
+  }
+
+  .hint.warn {
+    color: var(--danger);
+  }
+
   .error {
     margin: 0;
     color: var(--danger);
@@ -374,5 +444,14 @@
   button:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+
+  @media (max-width: 640px) {
+    .wizard {
+      width: 100vw;
+      height: 100vh;
+      max-height: none;
+      border-radius: 0;
+    }
   }
 </style>

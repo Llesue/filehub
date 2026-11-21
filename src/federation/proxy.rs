@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use futures_util::StreamExt;
+
 use axum::Json;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -42,6 +44,7 @@ pub async fn list(
     let cached = state.federation_cache.lock().get(&key).cloned();
     if let Some((at, value)) = cached {
         if now.saturating_sub(at) < revalidate {
+            sync_mode(state, &mount, &value).await;
             return Ok(render_list(root, &mount, &value, path_text));
         }
         let state_clone = Arc::clone(state);
@@ -65,11 +68,9 @@ pub async fn list(
                 )
                 .await
             {
-                let mut cache = state_clone.federation_cache.lock();
-                if cache.len() > 500 {
-                    cache.clear();
-                }
-                cache.insert(key_clone, (crate::db::unix_now(), value));
+                store_cache(&state_clone, key_clone, value);
+            } else {
+                mark_stale(&state_clone, &key_clone);
             }
         });
         return Ok(render_list(root, &mount, &value, path_text));
@@ -85,14 +86,84 @@ pub async fn list(
         )
         .await
         .map_err(|error| error.into_app())?;
-    {
-        let mut cache = state.federation_cache.lock();
-        if cache.len() > 500 {
-            cache.clear();
-        }
-        cache.insert(key, (now, value.clone()));
-    }
+    sync_mode(state, &mount, &value).await;
+    store_cache(state, key, value.clone());
     Ok(render_list(root, &mount, &value, path_text))
+}
+
+async fn sync_mode(
+    state: &Arc<AppState>,
+    mount: &crate::federation::db::FederationMount,
+    value: &Value,
+) {
+    let Some(read_only) = value.get("read_only").and_then(Value::as_bool) else {
+        return;
+    };
+    let mode = if read_only { "ro" } else { "rw" };
+    if mode == mount.mode {
+        return;
+    }
+    let _ = state
+        .db
+        .federation_update_mount_mode(mount.id, mount.root_id, mode, read_only)
+        .await;
+}
+
+fn store_cache(state: &Arc<AppState>, key: crate::state::FederationCacheKey, value: Value) {
+    let max_entries = state.settings().settings.federation.cache_entries.max(100);
+    let entries = value
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if entries > 2000 {
+        return;
+    }
+    let mut cache = state.federation_cache.lock();
+    cache.insert(key, (crate::db::unix_now(), value));
+    let mut total: usize = cache
+        .values()
+        .map(|(_, value)| {
+            value
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+        })
+        .sum();
+    if total <= max_entries {
+        return;
+    }
+    let mut keys: Vec<(crate::state::FederationCacheKey, i64)> = cache
+        .iter()
+        .map(|(key, (at, _))| (key.clone(), *at))
+        .collect();
+    keys.sort_by_key(|(_, at)| *at);
+    for (key, _) in keys {
+        cache.remove(&key);
+        total = cache
+            .values()
+            .map(|(_, value)| {
+                value
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            })
+            .sum();
+        if total <= max_entries {
+            break;
+        }
+    }
+}
+
+fn mark_stale(state: &Arc<AppState>, key: &crate::state::FederationCacheKey) {
+    let mut cache = state.federation_cache.lock();
+    if let Some((_, value)) = cache.get_mut(key)
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("stale".to_owned(), json!(true));
+    }
 }
 
 fn render_list(
@@ -113,20 +184,25 @@ fn render_list(
         }
     }
     let total = entries.as_array().map(Vec::len).unwrap_or(0);
+    let read_only = value
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(mount.mode != "rw");
     Json(json!({
         "root": {
             "id": root.id,
             "alias": root.alias,
-            "read_only": mount.mode != "rw",
+            "read_only": read_only,
             "kind": root.kind,
             "mount_id": root.mount_id,
         },
         "path": value.get("path").cloned().unwrap_or_else(|| json!(path)),
         "entries": entries,
         "next_cursor": value.get("next_cursor").cloned().unwrap_or(Value::Null),
+        "stale": value.get("stale").and_then(Value::as_bool).unwrap_or(false),
         "total": total,
-        "read_only": mount.mode != "rw",
-        "read_only_reason": if mount.mode != "rw" { json!("policy") } else { Value::Null },
+        "read_only": read_only,
+        "read_only_reason": if read_only { json!("policy") } else { Value::Null },
         "root_id": root.id,
         "root_alias": root.alias,
     }))
@@ -148,6 +224,11 @@ pub async fn download(
     headers: &HeaderMap,
 ) -> Result<Response, AppError> {
     let (client, mount) = client_for_root(state, user_id, root.id).await?;
+    let limit = state.settings().settings.federation.stream_concurrency;
+    let semaphore = state.federation_stream_semaphore(mount.id, limit);
+    let permit = semaphore
+        .try_acquire_owned()
+        .map_err(|_| AppError::TooManyRequests)?;
     let response = client
         .download(mount.grant_id, path, inline, headers)
         .await
@@ -169,8 +250,12 @@ pub async fn download(
             builder = builder.header(name, value);
         }
     }
+    let stream = response.bytes_stream().map(move |item| {
+        let _permit = &permit;
+        item
+    });
     builder
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::from_stream(stream))
         .map_err(|error| AppError::internal(anyhow::anyhow!(error)))
 }
 
@@ -347,6 +432,7 @@ pub async fn create_upload(
         remote_upload_id: Some(peer_id),
         if_match: None,
         if_none_match: None,
+        token_id: None,
     };
     state
         .db
@@ -440,6 +526,51 @@ pub async fn complete_upload(
     Ok(Json(value))
 }
 
+pub async fn upload_status(
+    state: &Arc<AppState>,
+    user_id: i64,
+    upload: &crate::db::UploadSession,
+) -> Result<Json<Value>, AppError> {
+    let peer_id = upload
+        .remote_upload_id
+        .as_deref()
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("upload has no peer session")))?;
+    let (client, _mount) = client_for_root(state, user_id, upload.root_id).await?;
+    let value = client
+        .upload_status(peer_id)
+        .await
+        .map_err(|error| error.into_app())?;
+    let received_chunks: Vec<i64> = value
+        .get("received_chunks")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    let chunks = (upload.total_size + upload.chunk_size - 1) / upload.chunk_size;
+    let mut bitmap = vec![0_u8; ((chunks + 7) / 8) as usize];
+    let mut received = 0_i64;
+    for index in &received_chunks {
+        if *index >= 0 && *index < chunks {
+            bitmap[(index / 8) as usize] |= 1_u8 << (index % 8);
+            received += upload
+                .chunk_size
+                .min(upload.total_size - index * upload.chunk_size);
+        }
+    }
+    state
+        .db
+        .update_upload_progress(&upload.id, user_id, received, bitmap)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({
+        "upload_id": upload.id,
+        "total_size": upload.total_size,
+        "chunk_size": upload.chunk_size,
+        "received": received,
+        "received_chunks": received_chunks,
+        "expires_at": upload.expires_at,
+    })))
+}
+
 pub async fn cancel_upload(
     state: &Arc<AppState>,
     user_id: i64,
@@ -525,7 +656,14 @@ pub async fn thumb(
 ) -> Result<Response, AppError> {
     let (client, mount) = client_for_root(state, user_id, root.id).await?;
     let response = client
-        .thumb(mount.grant_id, path, width, edge, fit)
+        .thumb(
+            mount.grant_id,
+            path,
+            width,
+            edge,
+            fit,
+            state.settings().settings.federation.thumb_timeout_seconds,
+        )
         .await
         .map_err(|error| error.into_app())?;
     let status =
@@ -555,7 +693,12 @@ pub async fn search(
 ) -> Result<Json<Value>, AppError> {
     let (client, mount) = client_for_root(state, user_id, root.id).await?;
     let value = client
-        .search(mount.grant_id, query, limit)
+        .search(
+            mount.grant_id,
+            query,
+            limit,
+            state.settings().settings.federation.search_timeout_seconds,
+        )
         .await
         .map_err(|error| error.into_app())?;
     let mut entries = Vec::new();
@@ -768,6 +911,11 @@ pub async fn zip_files(
     use tokio_util::io::{ReaderStream, SyncIoBridge};
 
     let (client, mount) = client_for_root(state, user_id, root.id).await?;
+    let limit = state.settings().settings.federation.stream_concurrency;
+    let semaphore = state.federation_stream_semaphore(mount.id, limit);
+    let _stream_permit = semaphore
+        .try_acquire_owned()
+        .map_err(|_| AppError::TooManyRequests)?;
     let settings = state.settings();
     let max_bytes = settings.settings.downloads.zip_max_bytes;
     let max_files = settings.settings.downloads.zip_max_files;

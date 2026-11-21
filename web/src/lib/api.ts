@@ -71,6 +71,7 @@ export interface RemoteMount {
   state: 'online' | 'offline' | 'token_invalid' | 'grant_revoked' | 'unsupported';
   last_ok_at: number | null;
   last_error: string | null;
+  last_error_code?: string | null;
   created_at: number;
 }
 
@@ -152,6 +153,7 @@ export interface ListResponse {
   focus_index?: number;
   focus_offset?: number;
   total?: number;
+  stale?: boolean;
 }
 
 export interface UploadCreated {
@@ -539,6 +541,12 @@ export const api = {
     );
   },
 
+  remoteActivity(): Promise<{
+    activity: Array<{ op: string; path: string | null; status: number; bytes: number; created_at: number }>;
+  }> {
+    return request('/remote/activity');
+  },
+
   remoteGrants(): Promise<{ grants: RemoteGrantInfo[] }> {
     return request('/remote/grants');
   },
@@ -600,6 +608,13 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ root, path, paths }) },
       csrf,
     );
+  },
+
+  remoteRenameMount(id: number, alias: string, csrf: string): Promise<{ id: number; alias: string }> {
+    return request(`/remote/mounts/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ alias }),
+    }, csrf);
   },
 
   remoteMounts(): Promise<{ mounts: RemoteMount[] }> {
@@ -956,14 +971,15 @@ export const api = {
     csrf: string,
     encoding?: string,
     bom?: boolean,
+    force = false,
   ): Promise<{ etag: string; size: number }> {
     const query = new URLSearchParams({ root: String(root), path });
     return request<{ etag: string; size: number }>(
       `/file?${query.toString()}`,
       {
         method: 'PUT',
-        headers: { 'If-Match': etag },
-        body: JSON.stringify({ content, encoding, bom }),
+        headers: force ? {} : { 'If-Match': etag },
+        body: JSON.stringify({ content, encoding, bom, force }),
       },
       csrf,
     );

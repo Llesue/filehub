@@ -23,8 +23,8 @@ components:
     IdempotencyKey:
       name: Idempotency-Key
       in: header
-      required: false
-      schema: { type: string, maxLength: 200 }
+      required: true
+      schema: { type: string, maxLength: 128 }
       description: |
         写操作去重键。相同键的重复请求返回第一次的响应；操作仍在执行时
         返回 409。键在操作失败后自动释放，可以重试。
@@ -271,6 +271,13 @@ paths:
         - { name: grant, in: query, required: true, schema: { type: integer } }
         - { name: q, in: query, required: true, schema: { type: string } }
         - { name: limit, in: query, schema: { type: integer, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, enum: [image, video, audio, text, pdf, dir, file] } }
+        - { name: min_size, in: query, schema: { type: integer, format: int64 } }
+        - { name: max_size, in: query, schema: { type: integer, format: int64 } }
+        - { name: modified_after, in: query, schema: { type: integer, format: int64 } }
+        - { name: modified_before, in: query, schema: { type: integer, format: int64 } }
+        - { name: is_dir, in: query, schema: { type: boolean } }
       responses:
         "200":
           description: OK
@@ -281,6 +288,8 @@ paths:
   /mkdir:
     post:
       summary: 新建目录
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -297,6 +306,8 @@ paths:
   /touch:
     post:
       summary: 新建空文件
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -313,6 +324,8 @@ paths:
   /rename:
     post:
       summary: 重命名
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -330,6 +343,8 @@ paths:
   /copy:
     post:
       summary: 复制（同 grant 内批量）
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -351,6 +366,8 @@ paths:
   /move:
     post:
       summary: 移动（同 grant 内批量）
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -372,6 +389,8 @@ paths:
   /delete:
     post:
       summary: 删除（批量）
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -391,6 +410,8 @@ paths:
   /uploads:
     post:
       summary: 创建上传会话
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:

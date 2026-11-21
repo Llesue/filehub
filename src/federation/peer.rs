@@ -44,11 +44,19 @@ struct PeerAuth {
 }
 
 impl PeerAuth {
-    fn grant(&self, id: i64) -> Result<&FederationGrant, AppError> {
-        self.grants
-            .iter()
-            .find(|grant| grant.id == id)
-            .ok_or(AppError::Forbidden)
+    async fn grant(&self, state: &Arc<AppState>, id: i64) -> Result<&FederationGrant, AppError> {
+        if let Some(grant) = self.grants.iter().find(|grant| grant.id == id) {
+            return Ok(grant);
+        }
+        if state
+            .db
+            .federation_grant_revoked(id, self.token.user_id)
+            .await
+            .map_err(AppError::internal)?
+        {
+            return Err(AppError::GrantRevoked);
+        }
+        Err(AppError::Forbidden)
     }
 }
 
@@ -94,19 +102,25 @@ async fn authenticate(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Peer
 
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
-fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, AppError> {
-    let Some(value) = headers.get(IDEMPOTENCY_HEADER) else {
-        return Ok(None);
-    };
+fn idempotency_key(headers: &HeaderMap) -> Result<String, AppError> {
+    let value = headers
+        .get(IDEMPOTENCY_HEADER)
+        .ok_or_else(|| AppError::bad_request("Idempotency-Key is required"))?;
     let raw = value
         .to_str()
         .map_err(|_| AppError::bad_request("invalid Idempotency-Key"))?;
-    if raw.is_empty() || raw.len() > 200 {
+    if raw.is_empty() || raw.len() > 128 {
         return Err(AppError::bad_request(
-            "Idempotency-Key must contain 1-200 bytes",
+            "Idempotency-Key must contain 1-128 bytes",
         ));
     }
-    Ok(Some(raw.to_owned()))
+    Ok(raw.to_owned())
+}
+
+fn request_hash<T: serde::Serialize>(value: &T) -> Result<String, AppError> {
+    let encoded =
+        serde_json::to_string(value).map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
+    Ok(auth::sha256_hex(&encoded))
 }
 
 /// Run a write operation at most once per (token, key). The key is reserved
@@ -119,18 +133,17 @@ async fn idempotent<F, Fut>(
     headers: &HeaderMap,
     method: &str,
     path: Option<&str>,
+    body_hash: &str,
     operation: F,
 ) -> Result<Response, AppError>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<Response, AppError>>,
 {
-    let Some(key) = idempotency_key(headers)? else {
-        return operation().await;
-    };
+    let key = idempotency_key(headers)?;
     let started = match state
         .db
-        .federation_idempotency_begin(token_id, &key, method, path, unix_now())
+        .federation_idempotency_begin(token_id, &key, method, path, body_hash, unix_now())
         .await
         .map_err(AppError::internal)?
     {
@@ -138,6 +151,11 @@ where
         crate::db::IdempotencyStart::InProgress => {
             return Err(AppError::Conflict(
                 "an identical idempotent request is still running".to_owned(),
+            ));
+        }
+        crate::db::IdempotencyStart::Mismatch => {
+            return Err(AppError::Conflict(
+                "Idempotency-Key was reused with a different request".to_owned(),
             ));
         }
         crate::db::IdempotencyStart::Replay { status, body } => {
@@ -162,7 +180,7 @@ where
         }
     };
     let (parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+    let bytes = axum::body::to_bytes(body, 256 * 1024)
         .await
         .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
     let text = String::from_utf8_lossy(&bytes);
@@ -260,6 +278,15 @@ pub fn router() -> axum::Router<Arc<AppState>> {
         .route("/unzip", post(unzip))
         .route("/audio-info", get(audio_info))
         .route("/thumb-warm", post(thumb_warm))
+        .layer(axum::middleware::map_response(
+            |mut response: Response| async move {
+                response.headers_mut().insert(
+                    "x-filehub-federation",
+                    header::HeaderValue::from_static("1"),
+                );
+                response
+            },
+        ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,7 +304,7 @@ pub async fn thumb(
     Query(query): Query<ThumbQuery>,
 ) -> Result<Response, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(query.grant)?;
+    let grant = auth.grant(&state, query.grant).await?;
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let fit = crate::thumbs::Fit::from_query(query.fit.as_deref());
@@ -340,7 +367,7 @@ pub async fn list(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(query.grant)?;
+    let grant = auth.grant(&state, query.grant).await?;
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let sort = query.sort.unwrap_or_else(|| "name".to_owned());
@@ -410,6 +437,13 @@ pub struct SearchQuery {
     grant: i64,
     q: String,
     limit: Option<usize>,
+    cursor: Option<String>,
+    kind: Option<String>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    modified_after: Option<i64>,
+    modified_before: Option<i64>,
+    is_dir: Option<bool>,
 }
 
 pub async fn search(
@@ -418,37 +452,63 @@ pub async fn search(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(query.grant)?;
+    if !state
+        .public_rate
+        .allow(&format!("federation:search:{}", auth.token.id), 30, 60)
+    {
+        return Err(AppError::TooManyRequests);
+    }
+    let grant = auth.grant(&state, query.grant).await?;
     let text = query.q.trim();
     if text.chars().count() < 2 {
         return Err(AppError::bad_request("search query is too short"));
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query
+        .cursor
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()?
+        .unwrap_or(0);
     let preferences = state
         .db
         .get_user_preferences(grant.user_id)
         .await
         .map_err(AppError::internal)?;
+    let (mime_prefix, is_dir) = match query.kind.as_deref() {
+        Some("image") => (Some("image/".to_owned()), None),
+        Some("video") => (Some("video/".to_owned()), None),
+        Some("audio") => (Some("audio/".to_owned()), None),
+        Some("text") => (Some("text/".to_owned()), None),
+        Some("pdf") => (Some("application/pdf".to_owned()), None),
+        Some("dir") => (None, Some(true)),
+        Some("file") => (None, Some(false)),
+        Some(other) if !other.is_empty() => {
+            return Err(AppError::bad_request("invalid search kind"));
+        }
+        _ => (None, None),
+    };
+    let is_dir = query.is_dir.or(is_dir);
     let entries = state
         .db
         .search_entries(
             text,
             &grant.real_path,
             preferences.show_hidden,
-            limit as i64,
+            offset.saturating_add(limit) as i64,
             crate::db::IndexSearchFilters {
-                min_size: None,
-                max_size: None,
-                modified_after: None,
-                modified_before: None,
-                is_dir: None,
-                mime_prefix: None,
+                min_size: query.min_size,
+                max_size: query.max_size,
+                modified_after: query.modified_after,
+                modified_before: query.modified_before,
+                is_dir,
+                mime_prefix,
             },
         )
         .await
         .map_err(AppError::internal)?;
     let base = grant.real_path.trim_end_matches(['/', '\\']);
-    let results: Vec<Value> = entries
+    let collected: Vec<Value> = entries
         .into_iter()
         .filter_map(|entry| {
             let relative = entry.real_path.strip_prefix(base)?;
@@ -464,10 +524,23 @@ pub async fn search(
             })
         })
         .collect();
+    let total = collected.len();
+    let results: Vec<Value> = collected.into_iter().skip(offset).take(limit).collect();
+    let next_cursor = if offset + results.len() < total {
+        Some(encode_cursor(offset + results.len()))
+    } else {
+        None
+    };
+    let indexed = state
+        .db
+        .index_status(&grant.real_path)
+        .await
+        .map_err(AppError::internal)?
+        .is_some_and(|(status, _, _, _, _)| status == "ready");
     Ok(Json(json!({
-        "indexed": true,
+        "indexed": indexed,
         "results": results,
-        "next_cursor": null,
+        "next_cursor": next_cursor,
     })))
 }
 
@@ -483,7 +556,7 @@ pub async fn dir_size(
     Query(query): Query<DirSizeQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(query.grant)?;
+    let grant = auth.grant(&state, query.grant).await?;
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let absolute = resolved.absolute.clone();
@@ -509,7 +582,7 @@ pub async fn stat(
     Query(query): Query<StatQuery>,
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(query.grant)?;
+    let grant = auth.grant(&state, query.grant).await?;
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let is_dir = resolved.absolute.is_dir();
@@ -562,17 +635,37 @@ pub async fn download(
     Query(query): Query<DownloadQuery>,
 ) -> Result<Response, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(query.grant)?;
+    let grant = auth.grant(&state, query.grant).await?;
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let inline = query
         .inline
         .as_deref()
         .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"));
-    crate::files::serve_file(&headers, &resolved.absolute, inline).await
+    let size = tokio::fs::metadata(&resolved.absolute)
+        .await
+        .map(|metadata| metadata.len() as i64)
+        .unwrap_or_default();
+    let started = Instant::now();
+    let response = crate::files::serve_file(&headers, &resolved.absolute, inline).await;
+    let _ = state
+        .db
+        .federation_log(
+            auth.token.user_id,
+            auth.token.id,
+            Some(grant.id),
+            "download",
+            Some(path.as_str()),
+            if response.is_ok() { 200 } else { 500 },
+            size,
+            started.elapsed().as_millis() as i64,
+            auth::client_ip(&headers).as_deref(),
+        )
+        .await;
+    response
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct MkdirRequest {
     grant: i64,
     path: String,
@@ -584,7 +677,7 @@ pub async fn mkdir(
     Json(request): Json<MkdirRequest>,
 ) -> Result<Response, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(request.grant)?.clone();
+    let grant = auth.grant(&state, request.grant).await?.clone();
     let token_id = auth.token.id;
     let user_id = auth.token.user_id;
     let idempotency_path = request.path.clone();
@@ -594,6 +687,7 @@ pub async fn mkdir(
         &headers,
         "mkdir",
         Some(&idempotency_path),
+        &request_hash(&request)?,
         || async {
             let resolved = resolve_grant(&state, &grant, &request.path, true).await?;
             let absolute = resolved.absolute.clone();
@@ -623,7 +717,7 @@ pub async fn mkdir(
     .await
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct TouchRequest {
     grant: i64,
     path: String,
@@ -635,7 +729,7 @@ pub async fn touch(
     Json(request): Json<TouchRequest>,
 ) -> Result<Response, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(request.grant)?.clone();
+    let grant = auth.grant(&state, request.grant).await?.clone();
     let token_id = auth.token.id;
     let user_id = auth.token.user_id;
     let idempotency_path = request.path.clone();
@@ -645,6 +739,7 @@ pub async fn touch(
         &headers,
         "touch",
         Some(&idempotency_path),
+        &request_hash(&request)?,
         || async {
             let resolved = resolve_grant(&state, &grant, &request.path, true).await?;
             let absolute = resolved.absolute.clone();
@@ -674,7 +769,7 @@ pub async fn touch(
     .await
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct RenameRequest {
     grant: i64,
     path: String,
@@ -688,7 +783,7 @@ pub async fn rename(
 ) -> Result<Response, AppError> {
     validate_name(&request.name)?;
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(request.grant)?.clone();
+    let grant = auth.grant(&state, request.grant).await?.clone();
     let token_id = auth.token.id;
     let user_id = auth.token.user_id;
     let idempotency_path = request.path.clone();
@@ -698,6 +793,7 @@ pub async fn rename(
         &headers,
         "rename",
         Some(&idempotency_path),
+        &request_hash(&request)?,
         || async {
             let resolved = resolve_grant(&state, &grant, &request.path, true).await?;
             let target = resolved
@@ -738,7 +834,7 @@ pub async fn rename(
     .await
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct DeleteRequest {
     grant: i64,
     paths: Vec<String>,
@@ -753,62 +849,70 @@ pub async fn delete(
         return Err(AppError::bad_request("paths must contain 1-1000 items"));
     }
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(request.grant)?.clone();
+    let grant = auth.grant(&state, request.grant).await?.clone();
     let token_id = auth.token.id;
     let user_id = auth.token.user_id;
-    idempotent(&state, token_id, &headers, "delete", None, || async {
-        let mut done = Vec::new();
-        let mut failed = Vec::new();
-        for path in request.paths.clone() {
-            match resolve_grant(&state, &grant, &path, true).await {
-                Ok(resolved) => {
-                    let absolute = resolved.absolute.clone();
-                    let relative = path.clone();
-                    let started = Instant::now();
-                    let result = tokio::task::spawn_blocking(move || {
-                        fsops::remove_path(&absolute, &relative)
-                    })
-                    .await
-                    .map_err(|error| AppError::internal(anyhow::Error::from(error)))?;
-                    log_op(
-                        &state,
-                        user_id,
-                        token_id,
-                        grant.id,
-                        "delete",
-                        Some(&path),
-                        result.is_ok(),
-                        started,
-                    )
-                    .await;
-                    match result {
-                        Ok(()) => done.push(json!({ "path": path })),
-                        Err(error) => failed.push(json!({
-                            "path": path,
-                            "code": error.code(),
-                            "message": error.to_string(),
-                        })),
+    idempotent(
+        &state,
+        token_id,
+        &headers,
+        "delete",
+        None,
+        &request_hash(&request)?,
+        || async {
+            let mut done = Vec::new();
+            let mut failed = Vec::new();
+            for path in request.paths.clone() {
+                match resolve_grant(&state, &grant, &path, true).await {
+                    Ok(resolved) => {
+                        let absolute = resolved.absolute.clone();
+                        let relative = path.clone();
+                        let started = Instant::now();
+                        let result = tokio::task::spawn_blocking(move || {
+                            fsops::remove_path(&absolute, &relative)
+                        })
+                        .await
+                        .map_err(|error| AppError::internal(anyhow::Error::from(error)))?;
+                        log_op(
+                            &state,
+                            user_id,
+                            token_id,
+                            grant.id,
+                            "delete",
+                            Some(&path),
+                            result.is_ok(),
+                            started,
+                        )
+                        .await;
+                        match result {
+                            Ok(()) => done.push(json!({ "path": path })),
+                            Err(error) => failed.push(json!({
+                                "path": path,
+                                "code": error.code(),
+                                "message": error.to_string(),
+                            })),
+                        }
                     }
+                    Err(error) => failed.push(json!({
+                        "path": path,
+                        "code": error.code(),
+                        "message": error.to_string(),
+                    })),
                 }
-                Err(error) => failed.push(json!({
-                    "path": path,
-                    "code": error.code(),
-                    "message": error.to_string(),
-                })),
             }
-        }
-        if failed.is_empty() {
-            Ok(Json(json!({ "done": done, "failed": [] })).into_response())
-        } else if done.is_empty() {
-            Err(AppError::NotFound)
-        } else {
-            Ok((
-                StatusCode::MULTI_STATUS,
-                Json(json!({ "done": done, "failed": failed })),
-            )
-                .into_response())
-        }
-    })
+            if failed.is_empty() {
+                Ok(Json(json!({ "done": done, "failed": [] })).into_response())
+            } else if done.is_empty() {
+                Err(AppError::NotFound)
+            } else {
+                Ok((
+                    StatusCode::MULTI_STATUS,
+                    Json(json!({ "done": done, "failed": failed })),
+                )
+                    .into_response())
+            }
+        },
+    )
     .await
 }
 
@@ -858,7 +962,7 @@ pub async fn thumb_warm(
     {
         return Err(AppError::TooManyRequests);
     }
-    let grant = auth.grant(request.grant)?;
+    let grant = auth.grant(&state, request.grant).await?;
     if request.paths.is_empty() || request.paths.len() > 500 {
         return Err(AppError::bad_request("paths must contain 1-500 items"));
     }
@@ -982,7 +1086,7 @@ pub async fn audio_info(
     {
         return Err(AppError::TooManyRequests);
     }
-    let grant = auth.grant(query.grant)?;
+    let grant = auth.grant(&state, query.grant).await?;
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     if !resolved.absolute.is_file() {
@@ -1031,7 +1135,7 @@ pub async fn unzip(
     {
         return Err(AppError::TooManyRequests);
     }
-    let grant = auth.grant(request.grant)?;
+    let grant = auth.grant(&state, request.grant).await?;
     let archive = resolve_grant(&state, grant, &request.path, false).await?;
     if !archive.absolute.is_file() {
         return Err(AppError::NotFound);
@@ -1126,7 +1230,7 @@ fn decode_cursor(cursor: &str) -> Result<usize, AppError> {
         .ok_or_else(|| AppError::bad_request("invalid cursor"))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct CreateUploadRequest {
     grant: i64,
     dir: Option<String>,
@@ -1151,6 +1255,9 @@ async fn peer_upload(
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
+    if upload.token_id != Some(auth.token.id) {
+        return Err(AppError::NotFound);
+    }
     let root = state
         .db
         .find_root(upload.root_id, auth.token.user_id)
@@ -1180,7 +1287,7 @@ pub async fn create_upload(
     Json(request): Json<CreateUploadRequest>,
 ) -> Result<Response, AppError> {
     let auth = authenticate(&state, &headers).await?;
-    let grant = auth.grant(request.grant)?.clone();
+    let grant = auth.grant(&state, request.grant).await?.clone();
     validate_name(&request.filename)?;
     let token_id = auth.token.id;
     let idempotency_path = request.filename.clone();
@@ -1190,6 +1297,7 @@ pub async fn create_upload(
         &headers,
         "uploads",
         Some(&idempotency_path),
+        &request_hash(&request)?,
         || async {
             if request.total_size < 0 {
                 return Err(AppError::bad_request("invalid upload size"));
@@ -1239,6 +1347,7 @@ pub async fn create_upload(
                 remote_upload_id: None,
                 if_match: request.if_match.clone(),
                 if_none_match: request.if_none_match.clone(),
+                token_id: Some(token_id),
             };
             state
                 .db
@@ -1330,10 +1439,21 @@ pub async fn upload_status(
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
     let upload = peer_upload(&state, &auth, &id).await?;
+    let chunks = (upload.total_size + upload.chunk_size - 1) / upload.chunk_size;
+    let received_chunks: Vec<u32> = (0..chunks)
+        .filter(|chunk| {
+            upload
+                .chunk_bitmap
+                .get((chunk / 8) as usize)
+                .is_some_and(|value| value & (1_u8 << (chunk % 8)) != 0)
+        })
+        .map(|chunk| chunk as u32)
+        .collect();
     Ok(Json(json!({
         "received": upload.received,
-        "total_chunks": (upload.total_size + upload.chunk_size - 1) / upload.chunk_size,
+        "total_chunks": chunks,
         "received_bytes": upload.received,
+        "received_chunks": received_chunks,
         "expires_at": upload.expires_at,
     })))
 }
@@ -1431,7 +1551,7 @@ pub async fn cancel_upload(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct TransferRequest {
     grant: i64,
     paths: Vec<String>,
@@ -1454,6 +1574,7 @@ pub async fn copy(
         &headers,
         "copy",
         Some(&idempotency_path),
+        &request_hash(&request)?,
         move || {
             let state = Arc::clone(&transfer_state);
             let headers = transfer_headers.clone();
@@ -1478,6 +1599,7 @@ pub async fn move_items(
         &headers,
         "move",
         Some(&idempotency_path),
+        &request_hash(&request)?,
         move || {
             let state = Arc::clone(&transfer_state);
             let headers = transfer_headers.clone();
@@ -1497,7 +1619,7 @@ async fn transfer(
         return Err(AppError::bad_request("paths must contain 1-1000 items"));
     }
     let auth = authenticate(state, headers).await?;
-    let grant = auth.grant(request.grant)?;
+    let grant = auth.grant(state, request.grant).await?;
     let dest = resolve_grant(state, grant, &request.dest, true).await?;
     if !dest.absolute.is_dir() {
         return Err(AppError::bad_request("destination is not a directory"));

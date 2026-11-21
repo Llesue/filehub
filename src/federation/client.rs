@@ -46,9 +46,10 @@ impl PeerClient {
         ip: IpAddr,
         port: u16,
         token: Option<&str>,
+        timeout_secs: u64,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(timeout_secs.max(1)))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent("FileHub")
             .resolve(host, SocketAddr::new(ip, port))
@@ -234,12 +235,25 @@ impl PeerClient {
         Ok((bytes.to_vec(), etag))
     }
 
-    pub async fn search(&self, grant: i64, query: &str, limit: usize) -> Result<Value, PeerError> {
-        self.json(self.auth(self.http.get(self.endpoint("/search"))).query(&[
-            ("grant", grant.to_string()),
-            ("q", query.to_owned()),
-            ("limit", limit.to_string()),
-        ]))
+    pub async fn search(
+        &self,
+        grant: i64,
+        query: &str,
+        limit: usize,
+        timeout_secs: u64,
+    ) -> Result<Value, PeerError> {
+        self.json(
+            self.auth(
+                self.http
+                    .get(self.endpoint("/search"))
+                    .timeout(Duration::from_secs(timeout_secs.max(1))),
+            )
+            .query(&[
+                ("grant", grant.to_string()),
+                ("q", query.to_owned()),
+                ("limit", limit.to_string()),
+            ]),
+        )
         .await
     }
 
@@ -304,14 +318,21 @@ impl PeerClient {
         width: u32,
         edge: u32,
         fit: &str,
+        timeout_secs: u64,
     ) -> Result<reqwest::Response, PeerError> {
-        let request = self.auth(self.http.get(self.endpoint("/thumb"))).query(&[
-            ("grant", grant.to_string()),
-            ("path", path.to_owned()),
-            ("w", width.to_string()),
-            ("edge", edge.to_string()),
-            ("fit", fit.to_owned()),
-        ]);
+        let request = self
+            .auth(
+                self.http
+                    .get(self.endpoint("/thumb"))
+                    .timeout(Duration::from_secs(timeout_secs.max(1))),
+            )
+            .query(&[
+                ("grant", grant.to_string()),
+                ("path", path.to_owned()),
+                ("w", width.to_string()),
+                ("edge", edge.to_string()),
+                ("fit", fit.to_owned()),
+            ]);
         let response = request.send().await.map_err(|error| PeerError {
             status: 0,
             code: "PEER_UNREACHABLE".to_owned(),
@@ -363,6 +384,11 @@ impl PeerClient {
             body["if_none_match"] = Value::String(value.to_owned());
         }
         self.write("POST", "/uploads", &body).await
+    }
+
+    pub async fn upload_status(&self, id: &str) -> Result<Value, PeerError> {
+        self.json(self.auth(self.http.get(self.endpoint(&format!("/uploads/{id}")))))
+            .await
     }
 
     pub async fn put_chunk(&self, id: &str, index: u32, body: Vec<u8>) -> Result<(), PeerError> {
@@ -429,12 +455,14 @@ impl PeerClient {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn write(&self, method: &str, path: &str, body: &Value) -> Result<Value, PeerError> {
+        let key = format!("fh_{}", crate::auth::random_token(16));
         let request = match method {
             "POST" => self.http.post(self.endpoint(path)),
             "PUT" => self.http.put(self.endpoint(path)),
             "DELETE" => self.http.delete(self.endpoint(path)),
             _ => self.http.post(self.endpoint(path)),
         };
-        self.json(self.auth(request).json(body)).await
+        self.json(self.auth(request).header("idempotency-key", key).json(body))
+            .await
     }
 }

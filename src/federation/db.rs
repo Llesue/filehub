@@ -366,6 +366,7 @@ pub struct FederationMount {
     pub created_at: i64,
     pub last_ok_at: Option<i64>,
     pub last_error: Option<String>,
+    pub last_error_code: Option<String>,
 }
 
 fn mount_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FederationMount> {
@@ -383,6 +384,7 @@ fn mount_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FederationMount> 
         created_at: row.get(10)?,
         last_ok_at: row.get(11)?,
         last_error: row.get(12)?,
+        last_error_code: row.get(13)?,
     })
 }
 
@@ -504,7 +506,7 @@ impl Db {
             let mut statement = connection.prepare(
                 "SELECT m.id, m.user_id, m.root_id, m.base_url, m.grant_id, m.grant_label, m.mode, \
                         m.peer_version, m.capabilities, m.token_ciphertext, m.created_at, \
-                        m.last_ok_at, m.last_error \
+                        m.last_ok_at, m.last_error, m.last_error_code \
                  FROM federation_mounts m JOIN user_roots r ON r.id = m.root_id \
                  WHERE m.user_id = ?1 AND r.kind = 'remote' ORDER BY r.sort_order, m.id",
             )?;
@@ -524,7 +526,7 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
                             peer_version, capabilities, token_ciphertext, created_at, \
-                            last_ok_at, last_error \
+                            last_ok_at, last_error, last_error_code \
                      FROM federation_mounts WHERE root_id = ?1 AND user_id = ?2",
                     params![root_id, user_id],
                     mount_from_row,
@@ -544,7 +546,7 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
                             peer_version, capabilities, token_ciphertext, created_at, \
-                            last_ok_at, last_error \
+                            last_ok_at, last_error, last_error_code \
                      FROM federation_mounts WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     mount_from_row,
@@ -615,18 +617,22 @@ impl Db {
         id: i64,
         ok: bool,
         error: Option<&str>,
+        error_code: Option<&str>,
     ) -> anyhow::Result<()> {
         let error = error.map(str::to_owned);
+        let error_code = error_code.map(str::to_owned);
         self.call(move |connection| {
             if ok {
                 connection.execute(
-                    "UPDATE federation_mounts SET last_ok_at = ?1, last_error = NULL WHERE id = ?2",
+                    "UPDATE federation_mounts SET last_ok_at = ?1, last_error = NULL, \
+                     last_error_code = NULL WHERE id = ?2",
                     params![unix_now(), id],
                 )?;
             } else {
                 connection.execute(
-                    "UPDATE federation_mounts SET last_error = ?1 WHERE id = ?2",
-                    params![error, id],
+                    "UPDATE federation_mounts SET last_error = ?1, last_error_code = ?2 \
+                     WHERE id = ?3",
+                    params![error, error_code, id],
                 )?;
             }
             Ok(())
@@ -782,6 +788,98 @@ impl Db {
                 })
             })?;
             rows.collect()
+        })
+        .await
+    }
+}
+
+impl Db {
+    pub async fn federation_grant_revoked(&self, id: i64, user_id: i64) -> anyhow::Result<bool> {
+        self.call(move |connection| {
+            let revoked = connection
+                .query_row(
+                    "SELECT revoked FROM federation_grants WHERE id = ?1 AND user_id = ?2",
+                    params![id, user_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            Ok(revoked == Some(1))
+        })
+        .await
+    }
+
+    pub async fn federation_update_mount_error_code(
+        &self,
+        id: i64,
+        code: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let code = code.map(str::to_owned);
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE federation_mounts SET last_error_code = ?1 WHERE id = ?2",
+                params![code, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_update_mount_mode(
+        &self,
+        id: i64,
+        root_id: i64,
+        mode: &str,
+        read_only: bool,
+    ) -> anyhow::Result<()> {
+        let mode = mode.to_owned();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "UPDATE federation_mounts SET mode = ?1 WHERE id = ?2",
+                params![mode, id],
+            )?;
+            transaction.execute(
+                "UPDATE user_roots SET read_only = ?1 WHERE id = ?2",
+                params![read_only as i64, root_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_update_mount_alias(
+        &self,
+        id: i64,
+        user_id: i64,
+        alias: &str,
+    ) -> anyhow::Result<bool> {
+        let alias = alias.to_owned();
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "UPDATE user_roots SET alias = ?1 \
+                 WHERE id = (SELECT root_id FROM federation_mounts WHERE id = ?2 AND user_id = ?3) \
+                 AND user_id = ?3",
+                params![alias, id, user_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn federation_prune_op_log(
+        &self,
+        retention_days: u64,
+        max_rows: u64,
+    ) -> anyhow::Result<usize> {
+        self.call(move |connection| {
+            let cutoff = unix_now().saturating_sub((retention_days as i64).saturating_mul(86_400));
+            let removed = connection.execute(
+                "DELETE FROM federation_op_log WHERE id IN (\
+                   SELECT id FROM federation_op_log WHERE created_at < ?1 LIMIT ?2)",
+                params![cutoff, max_rows as i64],
+            )?;
+            Ok(removed)
         })
         .await
     }

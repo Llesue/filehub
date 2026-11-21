@@ -145,6 +145,7 @@ pub struct AppState {
     pub updates: Arc<crate::updates::UpdateChecker>,
     pub federation_clients: Mutex<HashMap<i64, Arc<crate::federation::client::PeerClient>>>,
     pub federation_cache: FederationCache,
+    pub federation_streams: Mutex<HashMap<i64, Arc<Semaphore>>>,
 }
 
 fn path_chain(target: &Path) -> Vec<String> {
@@ -278,11 +279,20 @@ impl AppState {
             updates,
             federation_clients: Mutex::new(HashMap::new()),
             federation_cache: Mutex::new(HashMap::new()),
+            federation_streams: Mutex::new(HashMap::new()),
         });
         state.schedule_directory_size_counts_refresh();
         state.schedule_bigram_backfill();
         crate::media::warm_cache(&state).await;
         Ok(state)
+    }
+
+    pub fn federation_stream_semaphore(&self, mount_id: i64, limit: usize) -> Arc<Semaphore> {
+        let mut streams = self.federation_streams.lock();
+        streams
+            .entry(mount_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(limit.max(1))))
+            .clone()
     }
 
     pub fn settings(&self) -> Arc<Snapshot> {

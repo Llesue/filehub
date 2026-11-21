@@ -70,6 +70,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             axum::routing::delete(crate::federation::mounts::delete),
         )
         .route(
+            "/remote/mounts/{id}",
+            axum::routing::patch(crate::federation::mounts::rename),
+        )
+        .route(
             "/remote/mounts/{id}/test",
             post(crate::federation::mounts::test),
         )

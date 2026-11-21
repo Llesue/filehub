@@ -1355,6 +1355,7 @@ pub async fn create_upload(
         remote_upload_id: None,
         if_match: None,
         if_none_match: None,
+        token_id: None,
     };
 
     if let Err(err) = state.db.insert_upload(&upload).await {
@@ -1379,6 +1380,9 @@ pub async fn upload_status(
 ) -> Result<Json<Value>, AppError> {
     let current = auth::current_user(&state, &headers).await?;
     let upload = load_upload(&state, current.user.id, &id).await?;
+    if upload.remote_upload_id.is_some() {
+        return crate::federation::proxy::upload_status(&state, current.user.id, &upload).await;
+    }
     let received_chunks = received_chunks(&upload);
 
     Ok(Json(json!({
@@ -2745,17 +2749,44 @@ pub(crate) async fn submit_transfer_job(
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
     if source_root.is_remote() || dest_root.is_remote() {
-        if source_root.id != dest_root.id || !source_root.is_remote() {
-            return Err(AppError::RemoteUnsupported);
-        }
+        let same_remote_root = source_root.id == dest_root.id && source_root.is_remote();
         let kind = if payload.move_items {
             JobKind::Move
         } else {
             JobKind::Copy
         };
+        if same_remote_root {
+            let key = auth::sha256_hex(&format!(
+                "remote:{}:{}:{}:{}",
+                payload.source_root,
+                payload.dest_path.as_deref().unwrap_or_default(),
+                payload.move_items,
+                payload.paths.join("\u{1f}")
+            ));
+            let payload_value = serde_json::to_value(&payload)
+                .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+            let total = payload.paths.len();
+            let job_state = Arc::clone(state);
+            let job_payload = payload;
+            return state
+                .jobs
+                .submit(
+                    kind,
+                    key,
+                    user_id,
+                    payload_value,
+                    total,
+                    false,
+                    move |ctx| async move {
+                        execute_remote_transfer(job_state, user_id, job_payload, ctx).await
+                    },
+                )
+                .await;
+        }
         let key = auth::sha256_hex(&format!(
-            "remote:{}:{}:{}:{}",
+            "cross:{}:{}:{}:{}:{}",
             payload.source_root,
+            payload.dest_root,
             payload.dest_path.as_deref().unwrap_or_default(),
             payload.move_items,
             payload.paths.join("\u{1f}")
@@ -2775,7 +2806,7 @@ pub(crate) async fn submit_transfer_job(
                 total,
                 false,
                 move |ctx| async move {
-                    execute_remote_transfer(job_state, user_id, job_payload, ctx).await
+                    crate::federation::transfer::run(job_state, user_id, job_payload, ctx).await
                 },
             )
             .await;

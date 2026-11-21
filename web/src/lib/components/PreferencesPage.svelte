@@ -6,7 +6,6 @@
   import AvatarCropper from './AvatarCropper.svelte';
   import Icon from './Icon.svelte';
   import PasswordDialog from './PasswordDialog.svelte';
-  import RemoteMounts from './RemoteMounts.svelte';
   import RemoteSharing from './RemoteSharing.svelte';
 
   let {
@@ -120,10 +119,6 @@
       />
     </div>
   </section>
-
-  {#if user.features.federation_mount}
-    <RemoteMounts {csrf} />
-  {/if}
 
   {#if user.features.federation_share}
     <RemoteSharing {csrf} />

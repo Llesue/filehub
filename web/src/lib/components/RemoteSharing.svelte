@@ -12,7 +12,11 @@
   let { csrf }: { csrf: string } = $props();
 
   let grants = $state<RemoteGrantInfo[]>([]);
+  let revokedGrants = $state<RemoteGrantInfo[]>([]);
   let tokens = $state<RemoteTokenInfo[]>([]);
+  let activity = $state<
+    Array<{ op: string; path: string | null; status: number; bytes: number; created_at: number }>
+  >([]);
   let roots = $state<Root[]>([]);
   let rootId = $state<number | null>(null);
   let grantPath = $state('');
@@ -38,13 +42,16 @@
 
   async function load(): Promise<void> {
     try {
-      const [grantResult, tokenResult, rootResult] = await Promise.all([
+      const [grantResult, tokenResult, rootResult, activityResult] = await Promise.all([
         api.remoteGrants(),
         api.remoteTokens(),
         api.roots(),
+        api.remoteActivity(),
       ]);
       grants = grantResult.grants.filter((grant) => !grant.revoked);
+      revokedGrants = grantResult.grants.filter((grant) => grant.revoked);
       tokens = tokenResult.tokens.filter((token) => !token.revoked);
+      activity = activityResult.activity.slice(0, 10);
       roots = rootResult.roots.filter((root) => root.kind !== 'remote');
       if (rootId === null && roots[0]) rootId = roots[0].id;
     } catch (value) {
@@ -276,6 +283,35 @@
     {t($language, '新建令牌')}
   </button>
 
+  {#if revokedGrants.length > 0}
+    <details class="revoked">
+      <summary>{t($language, '已撤销的授权')} ({revokedGrants.length})</summary>
+      {#each revokedGrants as grant (grant.id)}
+        <div class="row muted">
+          <div class="meta">
+            <strong>{grant.label}</strong>
+            <span class="path" title={grant.path}>{grant.path}</span>
+          </div>
+        </div>
+      {/each}
+    </details>
+  {/if}
+
+  <h3>{t($language, '最近访问')}</h3>
+  {#if activity.length === 0}
+    <p class="hint">{t($language, '还没有其他实例访问过授权的目录。')}</p>
+  {:else}
+    <div class="activity">
+      {#each activity as entry, index (index)}
+        <div class="activity-row">
+          <code>{entry.op}</code>
+          <span class="path" title={entry.path ?? ''}>{entry.path ?? '—'}</span>
+          <span class="count">{formatDate(entry.created_at)}</span>
+        </div>
+      {/each}
+    </div>
+  {/if}
+
   {#if newToken}
     <div class="token">
       <p>{t($language, '令牌只显示这一次')}</p>
@@ -425,6 +461,47 @@
   .row-actions {
     display: flex;
     gap: 8px;
+  }
+
+  .revoked {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+
+  .revoked summary {
+    cursor: pointer;
+    color: var(--text-2);
+    font-size: 12.5px;
+  }
+
+  .row.muted {
+    opacity: 0.65;
+  }
+
+  .activity {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .activity-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12.5px;
+  }
+
+  .activity-row code {
+    min-width: 64px;
+    color: var(--text-2);
+  }
+
+  .activity-row .path {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .token-actions {

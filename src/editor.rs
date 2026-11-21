@@ -369,6 +369,10 @@ pub struct SaveRequest {
     encoding: Option<String>,
     #[serde(default)]
     bom: bool,
+    /// Explicit user confirmation to overwrite a file that changed since the
+    /// editor loaded it. Normal saves still require If-Match.
+    #[serde(default)]
+    force: bool,
 }
 
 pub async fn save(
@@ -419,14 +423,19 @@ pub async fn save(
             .stat(mount.grant_id, &query.path)
             .await
             .map_err(|error| error.into_app())?;
-        let expected = headers
-            .get(header::IF_MATCH)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(AppError::PreconditionFailed)?;
-        let current_etag = stat.get("etag").and_then(Value::as_str).unwrap_or("");
-        if expected != current_etag {
-            return Err(AppError::PreconditionFailed);
-        }
+        let expected = if request.force {
+            None
+        } else {
+            let expected = headers
+                .get(header::IF_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .ok_or(AppError::PreconditionFailed)?;
+            let current_etag = stat.get("etag").and_then(Value::as_str).unwrap_or("");
+            if expected != current_etag {
+                return Err(AppError::PreconditionFailed);
+            }
+            Some(expected.to_owned())
+        };
         let (parent, filename) = query
             .path
             .rsplit_once('/')
@@ -440,7 +449,7 @@ pub async fn save(
                 filename,
                 total,
                 chunk_size,
-                Some(expected),
+                expected.as_deref(),
                 None,
             )
             .await
@@ -472,12 +481,14 @@ pub async fn save(
     .await
     .map_err(|err| AppError::internal(anyhow::anyhow!("editor metadata task failed: {err}")))??;
 
-    let expected = headers
-        .get(header::IF_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(AppError::PreconditionFailed)?;
-    if expected != info.etag {
-        return Err(AppError::PreconditionFailed);
+    if !request.force {
+        let expected = headers
+            .get(header::IF_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(AppError::PreconditionFailed)?;
+        if expected != info.etag {
+            return Err(AppError::PreconditionFailed);
+        }
     }
     if !writability(&resolved.absolute).0 {
         return Err(AppError::PermissionDenied);

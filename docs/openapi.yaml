@@ -1524,11 +1524,27 @@ paths:
   /api/v1/remote/mounts/{id}:
     delete:
       tags: [remote]
-      summary: 删除挂载
+      summary: 删除挂载（只删除本地记录）
       parameters:
         - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
       responses:
         '204': { description: Deleted }
+    patch:
+      tags: [remote]
+      summary: 修改挂载名称
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alias]
+              properties:
+                alias: { type: string, maxLength: 64 }
+      responses:
+        '200': { description: OK }
   /api/v1/remote/mounts/{id}/test:
     post:
       tags: [remote]

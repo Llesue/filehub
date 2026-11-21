@@ -53,6 +53,7 @@ async fn client_for_mount(
         target.ip,
         target.port,
         Some(&token),
+        state.settings().settings.federation.request_timeout_seconds,
     )
     .map_err(AppError::internal)
 }
@@ -98,8 +99,15 @@ pub async fn probe(
         return Err(AppError::TooManyRequests);
     }
     let target = target_for(&state, &request.url).await?;
-    let client = PeerClient::new(&request.url, &target.host, target.ip, target.port, None)
-        .map_err(AppError::internal)?;
+    let client = PeerClient::new(
+        &request.url,
+        &target.host,
+        target.ip,
+        target.port,
+        None,
+        state.settings().settings.federation.request_timeout_seconds,
+    )
+    .map_err(AppError::internal)?;
     let info = client.info().await.map_err(|error| error.into_app())?;
     Ok(Json(json!({
         "ok": true,
@@ -135,6 +143,7 @@ pub async fn preview(
         target.ip,
         target.port,
         Some(&request.token),
+        state.settings().settings.federation.request_timeout_seconds,
     )
     .map_err(AppError::internal)?;
     let grants = client.grants().await.map_err(|error| error.into_app())?;
@@ -176,6 +185,7 @@ pub async fn create(
         target.ip,
         target.port,
         Some(&request.token),
+        state.settings().settings.federation.request_timeout_seconds,
     )
     .map_err(AppError::internal)?;
     let info = client.info().await.map_err(|error| error.into_app())?;
@@ -316,10 +326,13 @@ pub async fn list(
             .find_root(mount.root_id, current.user.id)
             .await
             .map_err(AppError::internal)?;
-        let state_name = if mount.last_error.is_some() {
-            "offline"
-        } else {
-            "online"
+        let state_name = match mount.last_error_code.as_deref() {
+            Some("TOKEN_REVOKED" | "TOKEN_EXPIRED") => "token_invalid",
+            Some("GRANT_REVOKED") => "grant_revoked",
+            Some("REMOTE_ROOT_UNSUPPORTED") => "unsupported",
+            Some(_) => "offline",
+            None if mount.last_error.is_some() => "offline",
+            None => "online",
         };
         items.push(json!({
             "id": mount.id,
@@ -334,6 +347,7 @@ pub async fn list(
             "state": state_name,
             "last_ok_at": mount.last_ok_at,
             "last_error": mount.last_error,
+            "last_error_code": mount.last_error_code,
             "created_at": mount.created_at,
         }));
     }
@@ -362,6 +376,11 @@ pub async fn delete(
         return Err(AppError::NotFound);
     }
     state.federation_clients.lock().remove(&mount.root_id);
+    state.federation_streams.lock().remove(&mount.id);
+    state
+        .federation_cache
+        .lock()
+        .retain(|key, _| key.0 != mount.root_id);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -385,7 +404,7 @@ pub async fn test(
         Ok(info) => {
             state
                 .db
-                .federation_update_mount_state(id, true, None)
+                .federation_update_mount_state(id, true, None, None)
                 .await
                 .map_err(AppError::internal)?;
             Ok(Json(json!({
@@ -397,7 +416,7 @@ pub async fn test(
         Err(error) => {
             state
                 .db
-                .federation_update_mount_state(id, false, Some(&error.message))
+                .federation_update_mount_state(id, false, Some(&error.message), Some(&error.code))
                 .await
                 .map_err(AppError::internal)?;
             Ok(Json(json!({
@@ -436,6 +455,7 @@ pub async fn reauth(
         target.ip,
         target.port,
         Some(&request.token),
+        state.settings().settings.federation.request_timeout_seconds,
     )
     .map_err(AppError::internal)?;
     client.grants().await.map_err(|error| error.into_app())?;
@@ -518,4 +538,33 @@ pub async fn thumb_warm(
     let width = request.width.unwrap_or(256).clamp(16, 1024);
     crate::federation::proxy::thumb_warm(&state, current.user.id, &root, &request.paths, width)
         .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameMountRequest {
+    alias: String,
+}
+
+pub async fn rename(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<RenameMountRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    require_outbound(&state, &current.user)?;
+    let alias = request.alias.trim();
+    if alias.is_empty() || alias.chars().count() > 64 {
+        return Err(AppError::bad_request("alias must contain 1-64 characters"));
+    }
+    let changed = state
+        .db
+        .federation_update_mount_alias(id, current.user.id, alias)
+        .await
+        .map_err(AppError::internal)?;
+    if !changed {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(json!({ "id": id, "alias": alias })))
 }

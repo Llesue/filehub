@@ -71,6 +71,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         32,
         include_str!("../migrations/0032_federation_v1_complete.sql"),
     ),
+    (
+        33,
+        include_str!("../migrations/0033_federation_hardening.sql"),
+    ),
 ];
 
 pub fn unix_now() -> i64 {
@@ -194,6 +198,7 @@ pub struct UploadSession {
     pub remote_upload_id: Option<String>,
     pub if_match: Option<String>,
     pub if_none_match: Option<String>,
+    pub token_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1110,6 +1115,7 @@ impl Db {
     }
 
     pub async fn prune_audit(&self, retention_days: u64, max_rows: u64) -> anyhow::Result<usize> {
+        let _ = self.federation_prune_op_log(retention_days, max_rows).await;
         self.call(move |connection| {
             let mut removed = 0;
             if retention_days > 0 {
@@ -1321,8 +1327,8 @@ impl Db {
                 "INSERT INTO upload_sessions \
                  (id, user_id, root_id, dir_path, filename, total_size, chunk_size, received, \
                   chunk_bitmap, temp_path, sha256, expires_at, created_at, updated_at, remote_upload_id, \
-                  if_match, if_none_match) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12, ?13, ?14, ?15)",
+                  if_match, if_none_match, token_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     upload.id,
                     upload.user_id,
@@ -1338,7 +1344,8 @@ impl Db {
                     upload.created_at,
                     upload.remote_upload_id,
                     upload.if_match,
-                    upload.if_none_match
+                    upload.if_none_match,
+                    upload.token_id
                 ],
             )?;
             Ok(())
@@ -1357,7 +1364,7 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, dir_path, filename, total_size, chunk_size, \
                      received, chunk_bitmap, temp_path, expires_at, created_at, updated_at, \
-                     remote_upload_id, if_match, if_none_match \
+                     remote_upload_id, if_match, if_none_match, token_id \
                      FROM upload_sessions WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     |row| {
@@ -1378,6 +1385,7 @@ impl Db {
                             remote_upload_id: row.get(13)?,
                             if_match: row.get(14)?,
                             if_none_match: row.get(15)?,
+                            token_id: row.get(16)?,
                         })
                     },
                 )
@@ -4114,6 +4122,7 @@ pub enum IdempotencyStart {
     New,
     InProgress,
     Replay { status: u16, body: String },
+    Mismatch,
 }
 
 impl Db {
@@ -4123,11 +4132,13 @@ impl Db {
         key: &str,
         method: &str,
         path: Option<&str>,
+        body_hash: &str,
         now: i64,
     ) -> anyhow::Result<IdempotencyStart> {
         let key = key.to_owned();
         let method = method.to_owned();
         let path = path.map(str::to_owned);
+        let body_hash = body_hash.to_owned();
         self.call(move |connection| {
             let transaction = connection.transaction()?;
             transaction.execute(
@@ -4141,16 +4152,16 @@ impl Db {
             )?;
             let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO federation_idempotency \
-                 (token_id, key, method, path, status, body, state, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, 0, '', 'pending', ?5)",
-                params![token_id, key, method, path, now],
+                 (token_id, key, method, path, status, body, state, created_at, body_hash) \
+                 VALUES (?1, ?2, ?3, ?4, 0, '', 'pending', ?5, ?6)",
+                params![token_id, key, method, path, now, body_hash],
             )?;
             if inserted == 1 {
                 transaction.commit()?;
                 return Ok(IdempotencyStart::New);
             }
-            let (state, status, body) = transaction.query_row(
-                "SELECT state, status, body FROM federation_idempotency \
+            let (state, status, body, stored_hash) = transaction.query_row(
+                "SELECT state, status, body, body_hash FROM federation_idempotency \
                  WHERE token_id = ?1 AND key = ?2",
                 params![token_id, key],
                 |row| {
@@ -4158,11 +4169,15 @@ impl Db {
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )?;
             transaction.commit()?;
             if state == "done" {
+                if stored_hash != body_hash {
+                    return Ok(IdempotencyStart::Mismatch);
+                }
                 Ok(IdempotencyStart::Replay {
                     status: status as u16,
                     body,

@@ -143,6 +143,7 @@ fn upload(
         remote_upload_id: None,
         if_match: None,
         if_none_match: None,
+        token_id: None,
     }
 }
 

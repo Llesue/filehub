@@ -239,6 +239,27 @@ async fn peer(
     request.send().await.unwrap()
 }
 
+async fn wait_job(app: &Instance, id: &str) -> Value {
+    for _ in 0..100 {
+        let response = send(
+            &app.router,
+            Method::GET,
+            &format!("/api/v1/jobs/{id}"),
+            Some(&app.cookie),
+            None,
+        )
+        .await;
+        let body = json_body(response).await;
+        match body["status"].as_str() {
+            Some("completed") => return body,
+            Some("failed") => panic!("job failed: {body}"),
+            Some("cancelled") => panic!("job cancelled: {body}"),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    panic!("job did not finish");
+}
+
 async fn peer_json(response: reqwest::Response) -> Value {
     let status = response.status();
     let bytes = response.bytes().await.unwrap();
@@ -424,6 +445,73 @@ async fn federation_contract_round_trip() {
             .exists()
     );
 
+    std::fs::write(
+        mount_instance._dir.path().join("users/admin/local-up.txt"),
+        b"local body",
+    )
+    .unwrap();
+    let cross = send_json(
+        &mount_instance.router,
+        Method::POST,
+        "/api/v1/fs/transfer-jobs",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({
+            "source_root": mount_instance.root_id,
+            "paths": ["local-up.txt"],
+            "dest_root": remote_root,
+            "dest_path": "",
+            "move_items": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        cross.status(),
+        StatusCode::OK,
+        "cross transfer submit failed"
+    );
+    let cross = json_body(cross).await;
+    let job_id = cross["job_id"].as_str().unwrap();
+    wait_job(&mount_instance, job_id).await;
+    let remote_copy = peer_instance
+        ._dir
+        .path()
+        .join("users/admin/shared/local-up.txt");
+    assert_eq!(std::fs::read(&remote_copy).unwrap(), b"local body");
+
+    let remote_source = peer_instance
+        ._dir
+        .path()
+        .join("users/admin/shared/from-peer.txt");
+    std::fs::write(&remote_source, b"peer body").unwrap();
+    let back = send_json(
+        &mount_instance.router,
+        Method::POST,
+        "/api/v1/fs/transfer-jobs",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({
+            "source_root": remote_root,
+            "paths": ["from-peer.txt"],
+            "dest_root": mount_instance.root_id,
+            "dest_path": "",
+            "move_items": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        back.status(),
+        StatusCode::OK,
+        "remote to local submit failed"
+    );
+    let back = json_body(back).await;
+    let job_id = back["job_id"].as_str().unwrap();
+    wait_job(&mount_instance, job_id).await;
+    assert_eq!(
+        std::fs::read(mount_instance._dir.path().join("users/admin/from-peer.txt")).unwrap(),
+        b"peer body"
+    );
+
     let activity = send(
         &peer_instance.router,
         Method::GET,
@@ -521,13 +609,43 @@ async fn federation_security_and_idempotency() {
     assert_eq!(replay.status(), StatusCode::CREATED);
     assert_eq!(replay.text().await.unwrap(), first);
 
+    let mismatch = peer(
+        &client,
+        &peer_instance.base,
+        Method::POST,
+        "/mkdir",
+        Some(&raw),
+        Some("key-1"),
+        Some(json!({"grant": grant_id, "path": "idem-other"})),
+    )
+    .await;
+    assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+
+    let header = peer(
+        &client,
+        &peer_instance.base,
+        Method::GET,
+        "/info",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        header
+            .headers()
+            .get("x-filehub-federation")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+
     let traversal = peer(
         &client,
         &peer_instance.base,
         Method::POST,
         "/mkdir",
         Some(&raw),
-        None,
+        Some("key-traversal"),
         Some(json!({"grant": grant_id, "path": "../escape"})),
     )
     .await;
@@ -539,7 +657,7 @@ async fn federation_security_and_idempotency() {
         Method::POST,
         "/uploads",
         Some(&raw),
-        None,
+        Some("key-upload"),
         Some(json!({
             "grant": grant_id,
             "dir": "",
