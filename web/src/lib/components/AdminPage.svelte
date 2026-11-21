@@ -210,7 +210,7 @@
 
   async function toggleFeature(
     user: User,
-    key: 'terminal' | 'zip' | 'unzip',
+    key: 'terminal' | 'zip' | 'unzip' | 'federation_mount' | 'federation_share',
     value: boolean,
   ): Promise<void> {
     const original = { ...user.features };
@@ -831,6 +831,15 @@
   ]);
 
   const FEATURE_KEYS = ['thumbnails.enabled', 'editor.enabled', 'terminal_enabled'];
+  const FEDERATION_KEYS = [
+    'federation.enabled_outbound',
+    'federation.enabled_inbound',
+    'federation.allow_plaintext_lan',
+    'federation.allow_loopback',
+    'federation.max_mounts_per_user',
+    'federation.max_grants_per_user',
+    'federation.stream_concurrency',
+  ];
   const DOWNLOAD_KEYS = [
     'downloads.zip_max_bytes',
     'downloads.zip_max_files',
@@ -1272,6 +1281,24 @@
               />
               {t($language, '允许解压')}
             </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={user.features.federation_mount ?? false}
+                onchange={(event) =>
+                  void toggleFeature(user, 'federation_mount', event.currentTarget.checked)}
+              />
+              {t($language, '允许挂载远程')}
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={user.features.federation_share ?? false}
+                onchange={(event) =>
+                  void toggleFeature(user, 'federation_share', event.currentTarget.checked)}
+              />
+              {t($language, '允许对外授权')}
+            </label>
           </div>
           <div class="user-meta">
             <span>{t($language, '创建')} {formatDate(user.created_at)}</span>
@@ -1402,6 +1429,64 @@
               type="checkbox"
               checked={Boolean(setting('terminal_enabled'))}
               onchange={(event) => queueSetting('terminal_enabled', event.currentTarget.checked)}
+            /></label
+          >
+        </div>
+      </div>
+
+
+      <div class="settings-group">
+        {@render groupHeading('联邦', FEDERATION_KEYS)}
+        <p class="settings-hint">
+          {t($language, '控制远程目录挂载与对外授权。默认关闭，按用户另行开启。')}
+        </p>
+        <div class="setting-grid">
+          <label class="setting-row"
+            ><span
+              >{t($language, '允许挂载远程目录')}{@render saveState(
+                'federation.enabled_outbound',
+              )}</span
+            ><input
+              type="checkbox"
+              checked={Boolean(setting('federation.enabled_outbound'))}
+              onchange={(event) =>
+                queueSetting('federation.enabled_outbound', event.currentTarget.checked)}
+            /></label
+          >
+          <label class="setting-row"
+            ><span
+              >{t($language, '允许对外授权目录')}{@render saveState(
+                'federation.enabled_inbound',
+              )}</span
+            ><input
+              type="checkbox"
+              checked={Boolean(setting('federation.enabled_inbound'))}
+              onchange={(event) =>
+                queueSetting('federation.enabled_inbound', event.currentTarget.checked)}
+            /></label
+          >
+          <label class="setting-row"
+            ><span
+              >{t($language, '允许明文 HTTP（仅私有网段）')}{@render saveState(
+                'federation.allow_plaintext_lan',
+              )}</span
+            ><input
+              type="checkbox"
+              checked={Boolean(setting('federation.allow_plaintext_lan'))}
+              onchange={(event) =>
+                queueSetting('federation.allow_plaintext_lan', event.currentTarget.checked)}
+            /></label
+          >
+          <label class="setting-row"
+            ><span
+              >{t($language, '允许连接 127.0.0.1（调试）')}{@render saveState(
+                'federation.allow_loopback',
+              )}</span
+            ><input
+              type="checkbox"
+              checked={Boolean(setting('federation.allow_loopback'))}
+              onchange={(event) =>
+                queueSetting('federation.allow_loopback', event.currentTarget.checked)}
             /></label
           >
         </div>

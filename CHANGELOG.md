@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.0 - 2026-11-21
+
+### Added
+
+- Remote directory mounts between FileHub instances, with token-scoped read-only or read-write grants.
+- Browse, download, upload, create, rename and delete files on mounted directories.
+- Remote thumbnails and directory sizes are proxied, with local metadata and thumbnail caches.
+- Sidebar GitHub link and an optional update check against GitHub Releases.
+- Per-user switches for remote mounts and outgoing shares.
+
+### Changed
+
+- Virtual remote roots are skipped by usage scans and the search index.
+- Text files in read-only mounts open in a read-only editor.
+
+### Security
+
+- Hashed federation tokens, grant-bound path resolution, SSRF address classification and pinned DNS.
+
 ## v0.1.12 - 2026-11-20
 
 ### Fixed

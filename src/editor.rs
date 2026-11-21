@@ -193,6 +193,42 @@ pub async fn probe(
     if !settings.settings.editor.enabled || !preferences.editor_enabled {
         return Err(AppError::NotFound);
     }
+    let root = state
+        .db
+        .find_root(query.root, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, current.user.id, root.id).await?;
+        let stat = client
+            .stat(mount.grant_id, &query.path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let size = stat.get("size").and_then(Value::as_u64).unwrap_or(0);
+        if size > settings.settings.editor.max_file_bytes {
+            return Ok(Json(json!({
+                "is_text": false,
+                "reason": "too_large",
+                "size": size,
+            })));
+        }
+        let (bytes, _) = client
+            .read_bytes(
+                mount.grant_id,
+                &query.path,
+                settings.settings.editor.max_file_bytes,
+            )
+            .await
+            .map_err(|error| error.into_app())?;
+        let (is_text, reason) = classify_text(&bytes);
+        return Ok(Json(json!({
+            "is_text": is_text,
+            "reason": reason,
+            "size": size,
+        })));
+    }
     let resolved = authz::resolve(&state, current.user.id, query.root, &query.path, false).await?;
     let info = tokio::task::spawn_blocking({
         let path = resolved.absolute.clone();
@@ -232,6 +268,56 @@ pub async fn read(
         .map_err(AppError::internal)?;
     if !settings.settings.editor.enabled || !preferences.editor_enabled {
         return Err(AppError::NotFound);
+    }
+    let root = state
+        .db
+        .find_root(query.root, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, current.user.id, root.id).await?;
+        let stat = client
+            .stat(mount.grant_id, &query.path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let size = stat.get("size").and_then(Value::as_u64).unwrap_or(0);
+        if size > settings.settings.editor.max_file_bytes {
+            return Err(AppError::too_large("file exceeds the editor size limit"));
+        }
+        let (bytes, etag) = client
+            .read_bytes(
+                mount.grant_id,
+                &query.path,
+                settings.settings.editor.max_file_bytes,
+            )
+            .await
+            .map_err(|error| error.into_app())?;
+        let decoded = if let Some(label) = query.encoding.as_deref() {
+            let encoding = parse_encoding(label)
+                .ok_or_else(|| AppError::bad_request("unknown or unsupported encoding"))?;
+            decode_with(&bytes, encoding)
+        } else {
+            decode_text(&bytes)
+                .ok_or_else(|| AppError::UnsupportedMedia("file is not text".to_owned()))?
+        };
+        if looks_binary(&decoded.text) {
+            return Err(AppError::UnsupportedMedia("file is not text".to_owned()));
+        }
+        let line_ending = detect_line_ending(&decoded.text);
+        return Ok(Json(json!({
+            "content": decoded.text,
+            "etag": etag,
+            "size": size,
+            "modified": stat.get("modified").cloned().unwrap_or(Value::Null),
+            "line_ending": line_ending,
+            "writable": mount.mode == "rw",
+            "read_only_reason": if mount.mode == "rw" { Value::Null } else { json!("directory") },
+            "encoding": decoded.encoding.name().to_ascii_lowercase(),
+            "bom": decoded.bom,
+            "lossy": decoded.lossy,
+        })));
     }
     let resolved = authz::resolve(&state, current.user.id, query.root, &query.path, false).await?;
     let info = tokio::task::spawn_blocking({
@@ -317,6 +403,59 @@ pub async fn save(
         return Err(AppError::too_large("content exceeds the editor size limit"));
     }
 
+    let root = state
+        .db
+        .find_root(query.root, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, current.user.id, root.id).await?;
+        if mount.mode != "rw" {
+            return Err(AppError::Forbidden);
+        }
+        let stat = client
+            .stat(mount.grant_id, &query.path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let expected = headers
+            .get(header::IF_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(AppError::PreconditionFailed)?;
+        let current_etag = stat.get("etag").and_then(Value::as_str).unwrap_or("");
+        if expected != current_etag {
+            return Err(AppError::PreconditionFailed);
+        }
+        let (parent, filename) = query
+            .path
+            .rsplit_once('/')
+            .unwrap_or(("", query.path.as_str()));
+        let total = bytes.len() as i64;
+        let chunk_size = total.max(1);
+        let created = client
+            .create_upload(mount.grant_id, parent, filename, total, chunk_size)
+            .await
+            .map_err(|error| error.into_app())?;
+        let peer_id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
+            AppError::internal(anyhow::anyhow!("peer did not return an upload id"))
+        })?;
+        if total > 0 {
+            client
+                .put_chunk(peer_id, 0, bytes)
+                .await
+                .map_err(|error| error.into_app())?;
+        }
+        let completed = client
+            .complete_upload(peer_id)
+            .await
+            .map_err(|error| error.into_app())?;
+        crate::federation::proxy::invalidate_root(&state, root.id);
+        return Ok(Json(json!({
+            "etag": completed.get("etag").cloned().unwrap_or(Value::Null),
+            "size": completed.get("size").cloned().unwrap_or(Value::Null),
+        })));
+    }
     let resolved = authz::resolve(&state, current.user.id, query.root, &query.path, true).await?;
     let info = tokio::task::spawn_blocking({
         let path = resolved.absolute.clone();

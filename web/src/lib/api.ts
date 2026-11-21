@@ -38,6 +38,27 @@ export interface RemoteGrant {
   mode: 'ro' | 'rw';
 }
 
+export interface RemoteGrantInfo {
+  id: number;
+  label: string;
+  path: string;
+  mode: 'ro' | 'rw';
+  revoked: boolean;
+  token_count: number;
+  created_at: number;
+}
+
+export interface RemoteTokenInfo {
+  id: number;
+  name: string;
+  prefix: string;
+  created_at: number;
+  expires_at: number | null;
+  revoked: boolean;
+  last_used_at: number | null;
+  grant_ids: number[];
+}
+
 export interface RemoteMount {
   id: number;
   root_id: number;
@@ -517,6 +538,49 @@ export const api = {
     );
   },
 
+  remoteGrants(): Promise<{ grants: RemoteGrantInfo[] }> {
+    return request('/remote/grants');
+  },
+
+  remoteCreateGrant(
+    root: number,
+    path: string,
+    label: string,
+    mode: 'ro' | 'rw',
+    csrf: string,
+  ): Promise<{ id: number }> {
+    return request(
+      '/remote/grants',
+      { method: 'POST', body: JSON.stringify({ root, path, label, mode }) },
+      csrf,
+    );
+  },
+
+  remoteRevokeGrant(id: number, csrf: string): Promise<void> {
+    return request(`/remote/grants/${id}`, { method: 'DELETE' }, csrf);
+  },
+
+  remoteTokens(): Promise<{ tokens: RemoteTokenInfo[] }> {
+    return request('/remote/tokens');
+  },
+
+  remoteCreateToken(
+    name: string,
+    grantIds: number[],
+    expiresAt: number | null,
+    csrf: string,
+  ): Promise<{ id: number; token: string; prefix: string }> {
+    return request(
+      '/remote/tokens',
+      { method: 'POST', body: JSON.stringify({ name, grant_ids: grantIds, expires_at: expiresAt }) },
+      csrf,
+    );
+  },
+
+  remoteRevokeToken(id: number, csrf: string): Promise<void> {
+    return request(`/remote/tokens/${id}`, { method: 'DELETE' }, csrf);
+  },
+
   remoteMounts(): Promise<{ mounts: RemoteMount[] }> {
     return request('/remote/mounts');
   },
@@ -540,6 +604,14 @@ export const api = {
 
   remoteDeleteMount(id: number, csrf: string): Promise<void> {
     return request(`/remote/mounts/${id}`, { method: 'DELETE' }, csrf);
+  },
+
+  remoteReauthMount(id: number, token: string, csrf: string): Promise<{ ok: boolean }> {
+    return request(
+      `/remote/mounts/${id}/reauth`,
+      { method: 'POST', body: JSON.stringify({ token }) },
+      csrf,
+    );
   },
 
   remoteTestMount(

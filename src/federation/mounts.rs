@@ -178,6 +178,14 @@ pub async fn create(
     )
     .map_err(AppError::internal)?;
     let info = client.info().await.map_err(|error| error.into_app())?;
+    let own_instance = state
+        .db
+        .federation_instance_id()
+        .await
+        .map_err(AppError::internal)?;
+    if info.get("instance_id").and_then(Value::as_str) == Some(own_instance.as_str()) {
+        return Err(AppError::bad_request("cannot mount this instance"));
+    }
     let grants = client.grants().await.map_err(|error| error.into_app())?;
     let grant = grants
         .get("grants")
@@ -282,6 +290,8 @@ pub async fn list(
             "grant_id": mount.grant_id,
             "grant_label": mount.grant_label,
             "mode": mount.mode,
+            "capabilities": serde_json::from_str::<Value>(&mount.capabilities)
+                .unwrap_or_else(|_| json!([])),
             "state": state_name,
             "last_ok_at": mount.last_ok_at,
             "last_error": mount.last_error,
@@ -401,4 +411,29 @@ pub async fn reauth(
         .map_err(AppError::internal)?;
     state.federation_clients.lock().remove(&mount.root_id);
     Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn activity(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let rows = state
+        .db
+        .federation_activity(current.user.id, 50)
+        .await
+        .map_err(AppError::internal)?;
+    let activity: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "op": row.op,
+                "path": row.path,
+                "status": row.status,
+                "bytes": row.bytes,
+                "created_at": row.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "activity": activity })))
 }

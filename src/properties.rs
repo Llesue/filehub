@@ -31,6 +31,30 @@ pub async fn properties(
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
+    if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, current.user.id, root.id).await?;
+        let stat = client
+            .stat(mount.grant_id, &query.path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let name = query
+            .path
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(query.path.as_str());
+        return Ok(Json(json!({
+            "name": name,
+            "path": query.path,
+            "is_dir": stat.get("is_dir").cloned().unwrap_or(json!(false)),
+            "is_symlink": false,
+            "mime_type": stat.get("mime_type").cloned().unwrap_or(json!("")),
+            "size": stat.get("size").cloned().unwrap_or(json!(0)),
+            "created": serde_json::Value::Null,
+            "modified": stat.get("modified").cloned().unwrap_or(json!(0)),
+            "accessed": serde_json::Value::Null,
+        })));
+    }
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
     // Inspect the path as requested so a symlink is reported as a link, not
     // as its canonical target (authz has already validated the target).

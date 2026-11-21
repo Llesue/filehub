@@ -20,6 +20,7 @@
   import PreviewModal from './lib/components/PreviewModal.svelte';
   import PropertiesDialog from './lib/components/PropertiesDialog.svelte';
   import PreferencesPage from './lib/components/PreferencesPage.svelte';
+  import RemoteMountWizard from './lib/components/RemoteMountWizard.svelte';
   import ShareDialog from './lib/components/ShareDialog.svelte';
   import TerminalPanel from './lib/components/TerminalPanel.svelte';
   import CodeEditor from './lib/components/CodeEditor.svelte';
@@ -87,6 +88,7 @@
   let initialized = $state(false);
   let user = $state<User | null>(null);
   let versionInfo = $state<VersionInfo | null>(null);
+  let remoteWizardOpen = $state(false);
   let preferences = $state<UserPreferences | null>(null);
   let systemFeatures = $state<SystemFeatures>({ thumbnails: true, editor: true, terminal: true });
   let capabilities = $state<Capabilities>({ terminal: true, zip: true, unzip: true });
@@ -163,6 +165,7 @@
   let searchInput = $state<HTMLInputElement | null>(null);
   let searchFiltersOpen = $state(false);
   let searchKind = $state('');
+  let searchScope = $state('');
   let searchMinMb = $state('');
   let searchMaxMb = $state('');
   let searchModified = $state('');
@@ -1580,7 +1583,9 @@
       showNotice(
         error.code === 'PERMISSION_DENIED'
           ? t($language, '服务进程没有访问权限（文件系统权限不足）')
-          : t($language, '当前目录只读'),
+          : error.code === 'REMOTE_ROOT_UNSUPPORTED'
+            ? t($language, '该操作暂不支持远程目录')
+            : t($language, '当前目录只读'),
         'error',
         t($language, '操作被拒绝'),
       );
@@ -1893,13 +1898,17 @@
     searchLoadingMore = false;
 
     try {
-      const result = await api.searchAll(
-        query,
-        100,
-        null,
-        controller.signal,
-        searchFilterParams(),
-      );
+      const scope = searchScope ? Number(searchScope) : null;
+      const result =
+        scope === null
+          ? await api.searchAll(
+              query,
+              100,
+              null,
+              controller.signal,
+              searchFilterParams(),
+            )
+          : await api.search(scope, query, 100, controller.signal);
       if (
         token !== searchToken ||
         controller.signal.aborted ||
@@ -1908,7 +1917,10 @@
         return;
       }
       searchResults = mapSearchEntries(result.entries);
-      searchNextCursor = result.next_cursor;
+      searchNextCursor =
+        'next_cursor' in result && typeof result.next_cursor === 'string'
+          ? result.next_cursor
+          : null;
       searchActive = true;
       searchLoading = false;
     } catch (error) {
@@ -1931,13 +1943,17 @@
     searchMoreAbort = controller;
     searchLoadingMore = true;
     try {
-      const result = await api.searchAll(
-        query,
-        100,
-        cursor,
-        controller.signal,
-        searchFilterParams(),
-      );
+      const scope = searchScope ? Number(searchScope) : null;
+      const result =
+        scope === null
+          ? await api.searchAll(
+              query,
+              100,
+              cursor,
+              controller.signal,
+              searchFilterParams(),
+            )
+          : await api.search(scope, query, 100, controller.signal);
       if (token !== searchToken || searchQuery.trim() !== query) return;
       const seen = new SvelteSet(searchResults.map(searchEntryKey));
       const appended = mapSearchEntries(result.entries).filter((entry) => {
@@ -1947,7 +1963,10 @@
         return true;
       });
       searchResults = [...searchResults, ...appended];
-      searchNextCursor = result.next_cursor;
+      searchNextCursor =
+        'next_cursor' in result && typeof result.next_cursor === 'string'
+          ? result.next_cursor
+          : null;
     } catch (error) {
       if (!isAbortError(error)) handleFilesError(error);
     } finally {
@@ -3877,6 +3896,17 @@
           {#if roots.length === 0}
             <span class="nav-empty">{t($language, '暂无目录')}</span>
           {/if}
+          {#if user?.features.federation_mount}
+            <button
+              type="button"
+              class="nav-item"
+              title={t($language, '连接远程目录')}
+              onclick={() => (remoteWizardOpen = true)}
+            >
+              <Icon name="link" size={18} />
+              <span class="nav-label">{t($language, '连接远程目录')}</span>
+            </button>
+          {/if}
           <div class="nav-sep"></div>
           {#if terminalAvailable}
             <button
@@ -3982,6 +4012,18 @@
       {/if}
 
       <div class="main">
+        {#if appView === 'files' && activeRoot?.kind === 'remote'}
+          <div class="remote-banner">
+            <Icon name="link" size={14} />
+            <span>{t($language, '远程目录')} · {activeRoot.alias}</span>
+            {#if currentReadOnly}
+              <span class="readonly-tag">{t($language, '只读')}</span>
+            {/if}
+            <button type="button" class="text-button" onclick={() => (appView = 'settings')}>
+              {t($language, '连接设置')}
+            </button>
+          </div>
+        {/if}
         {#if appView === 'files'}
           <div class="pathbar">
             {#if !searchActive}
@@ -4218,6 +4260,19 @@
                 </div>
                 {#if searchFiltersOpen}
                   <div class="search-filters">
+                    <label>
+                      <span>{t($language, '范围')}</span>
+                      <select bind:value={searchScope} onchange={applySearchFilters}>
+                        <option value="">{t($language, '全部（仅本地）')}</option>
+                        {#each roots as root (root.id)}
+                          <option value={String(root.id)}>
+                            {rootLabel(root.alias)}{root.kind === 'remote'
+                              ? ` · ${t($language, '远程')}`
+                              : ''}
+                          </option>
+                        {/each}
+                      </select>
+                    </label>
                     <label>
                       <span>{t($language, '类型')}</span>
                       <select bind:value={searchKind} onchange={applySearchFilters}>
@@ -5306,6 +5361,13 @@
   {/if}
 
   {#if preview && activeRootId !== null}
+    <RemoteMountWizard
+      open={remoteWizardOpen}
+      {csrf}
+      onClose={() => (remoteWizardOpen = false)}
+      onMounted={() => void refreshRoots()}
+    />
+
     <PreviewModal
       root={activeRootId}
       {currentPath}
@@ -5881,6 +5943,21 @@
     width: 0;
     height: 100%;
     background: var(--accent);
+  }
+
+  .remote-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    font-size: 12px;
+    color: var(--text-2);
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .remote-banner .text-button {
+    margin-left: auto;
   }
 
   .app-version {

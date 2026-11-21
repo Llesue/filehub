@@ -140,6 +140,7 @@ fn upload(
         expires_at,
         created_at: now - 60,
         updated_at: now - 60,
+        remote_upload_id: None,
     }
 }
 

@@ -195,6 +195,183 @@ impl PeerClient {
         })
     }
 
+    pub async fn read_bytes(
+        &self,
+        grant: i64,
+        path: &str,
+        max: u64,
+    ) -> Result<(Vec<u8>, String), PeerError> {
+        let response = self.download(grant, path, true, &HeaderMap::new()).await?;
+        if response.content_length().is_some_and(|length| length > max) {
+            return Err(PeerError {
+                status: 413,
+                code: "TOO_LARGE".to_owned(),
+                message: "file exceeds the editor size limit".to_owned(),
+            });
+        }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = response.bytes().await.map_err(|error| PeerError {
+            status: 0,
+            code: "PEER_ERROR".to_owned(),
+            message: error.to_string(),
+        })?;
+        if bytes.len() as u64 > max {
+            return Err(PeerError {
+                status: 413,
+                code: "TOO_LARGE".to_owned(),
+                message: "file exceeds the editor size limit".to_owned(),
+            });
+        }
+        Ok((bytes.to_vec(), etag))
+    }
+
+    pub async fn search(&self, grant: i64, query: &str, limit: usize) -> Result<Value, PeerError> {
+        self.json(self.auth(self.http.get(self.endpoint("/search"))).query(&[
+            ("grant", grant.to_string()),
+            ("q", query.to_owned()),
+            ("limit", limit.to_string()),
+        ]))
+        .await
+    }
+
+    pub async fn dir_size(&self, grant: i64, path: &str) -> Result<Value, PeerError> {
+        self.json(
+            self.auth(self.http.get(self.endpoint("/dir-size")))
+                .query(&[("grant", grant.to_string()), ("path", path.to_owned())]),
+        )
+        .await
+    }
+
+    pub async fn thumb(
+        &self,
+        grant: i64,
+        path: &str,
+        width: u32,
+        edge: u32,
+        fit: &str,
+    ) -> Result<reqwest::Response, PeerError> {
+        let request = self.auth(self.http.get(self.endpoint("/thumb"))).query(&[
+            ("grant", grant.to_string()),
+            ("path", path.to_owned()),
+            ("w", width.to_string()),
+            ("edge", edge.to_string()),
+            ("fit", fit.to_owned()),
+        ]);
+        let response = request.send().await.map_err(|error| PeerError {
+            status: 0,
+            code: "PEER_UNREACHABLE".to_owned(),
+            message: error.to_string(),
+        })?;
+        if response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(response);
+        }
+        let status = response.status();
+        let body = response.bytes().await.unwrap_or_default();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        Err(PeerError {
+            status: status.as_u16(),
+            code: body
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("PEER_ERROR")
+                .to_owned(),
+            message: body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("peer thumbnail failed")
+                .to_owned(),
+        })
+    }
+
+    pub async fn create_upload(
+        &self,
+        grant: i64,
+        dir: &str,
+        filename: &str,
+        total_size: i64,
+        chunk_size: i64,
+    ) -> Result<Value, PeerError> {
+        self.write(
+            "POST",
+            "/uploads",
+            &serde_json::json!({
+                "grant": grant,
+                "dir": dir,
+                "filename": filename,
+                "total_size": total_size,
+                "chunk_size": chunk_size,
+            }),
+        )
+        .await
+    }
+
+    pub async fn put_chunk(&self, id: &str, index: u32, body: Vec<u8>) -> Result<(), PeerError> {
+        let request = self
+            .auth(
+                self.http
+                    .put(self.endpoint(&format!("/uploads/{id}/chunks/{index}"))),
+            )
+            .body(body);
+        let response = request.send().await.map_err(|error| PeerError {
+            status: 0,
+            code: "PEER_UNREACHABLE".to_owned(),
+            message: error.to_string(),
+        })?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response.bytes().await.unwrap_or_default();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        Err(PeerError {
+            status: status.as_u16(),
+            code: body
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("PEER_ERROR")
+                .to_owned(),
+            message: body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("peer chunk upload failed")
+                .to_owned(),
+        })
+    }
+
+    pub async fn complete_upload(&self, id: &str) -> Result<Value, PeerError> {
+        self.write(
+            "POST",
+            &format!("/uploads/{id}/complete"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn cancel_upload(&self, id: &str) -> Result<(), PeerError> {
+        let response = self
+            .auth(self.http.delete(self.endpoint(&format!("/uploads/{id}"))))
+            .send()
+            .await
+            .map_err(|error| PeerError {
+                status: 0,
+                code: "PEER_UNREACHABLE".to_owned(),
+                message: error.to_string(),
+            })?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(PeerError {
+            status: response.status().as_u16(),
+            code: "PEER_ERROR".to_owned(),
+            message: "peer cancel upload failed".to_owned(),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn write(&self, method: &str, path: &str, body: &Value) -> Result<Value, PeerError> {
         let request = match method {

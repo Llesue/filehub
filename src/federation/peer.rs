@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::body::Bytes;
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -19,7 +20,8 @@ use crate::state::AppState;
 
 pub const REPOSITORY: &str = "https://github.com/Llesue/filehub";
 pub const CAPABILITIES: &[&str] = &[
-    "list", "stat", "download", "mkdir", "touch", "rename", "delete",
+    "list", "stat", "download", "thumb", "dir-size", "mkdir", "touch", "rename", "delete",
+    "uploads",
 ];
 
 struct PeerAuth {
@@ -110,7 +112,17 @@ async fn resolve_grant(
     pathresolver::resolve(synthetic, path, require_write).await
 }
 
-pub async fn info(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+pub async fn info(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let ip = auth::client_ip(&headers).unwrap_or_else(|| "unknown".to_owned());
+    if !state
+        .public_rate
+        .allow(&format!("federation-info:{ip}"), 30, 60)
+    {
+        return Err(AppError::TooManyRequests);
+    }
     let instance_id = state
         .db
         .federation_instance_id()
@@ -130,17 +142,69 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Result<Json<Value>, App
 }
 
 pub fn router() -> axum::Router<Arc<AppState>> {
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     axum::Router::new()
         .route("/info", get(info))
         .route("/grants", get(grants))
         .route("/list", get(list))
         .route("/stat", get(stat))
         .route("/download", get(download))
+        .route("/thumb", get(thumb))
+        .route("/dir-size", get(dir_size))
+        .route("/search", get(search))
+        .route("/uploads", post(create_upload))
+        .route("/uploads/{id}", get(upload_status).delete(cancel_upload))
+        .route("/uploads/{id}/chunks/{index}", put(upload_chunk))
+        .route("/uploads/{id}/complete", post(complete_upload))
         .route("/mkdir", post(mkdir))
         .route("/touch", post(touch))
         .route("/rename", post(rename))
+        .route("/copy", post(copy))
+        .route("/move", post(move_items))
         .route("/delete", post(delete))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ThumbQuery {
+    grant: i64,
+    path: Option<String>,
+    w: Option<u32>,
+    edge: Option<u32>,
+    fit: Option<String>,
+}
+
+pub async fn thumb(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ThumbQuery>,
+) -> Result<Response, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let grant = auth.grant(query.grant)?;
+    let path = query.path.unwrap_or_default();
+    let resolved = resolve_grant(&state, grant, &path, false).await?;
+    let fit = crate::thumbs::Fit::from_query(query.fit.as_deref());
+    let preview_edge = state.settings().settings.thumbnails.preview_edge;
+    let edge = query
+        .edge
+        .unwrap_or_else(|| query.w.unwrap_or(256))
+        .clamp(16, preview_edge);
+    crate::thumbs::thumbnail_response(
+        &state,
+        resolved.absolute.clone(),
+        edge,
+        edge,
+        fit,
+        grant.user_id,
+        &headers,
+        Some(crate::thumbs::ThumbScope {
+            root_id: Some(grant.root_id),
+            share_id: None,
+            item_id: None,
+            path: resolved.relative.clone(),
+        }),
+        true,
+    )
+    .await
 }
 
 pub async fn grants(
@@ -244,6 +308,98 @@ pub async fn list(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    grant: i64,
+    q: String,
+    limit: Option<usize>,
+}
+
+pub async fn search(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let grant = auth.grant(query.grant)?;
+    let text = query.q.trim();
+    if text.chars().count() < 2 {
+        return Err(AppError::bad_request("search query is too short"));
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let preferences = state
+        .db
+        .get_user_preferences(grant.user_id)
+        .await
+        .map_err(AppError::internal)?;
+    let entries = state
+        .db
+        .search_entries(
+            text,
+            &grant.real_path,
+            preferences.show_hidden,
+            limit as i64,
+            crate::db::IndexSearchFilters {
+                min_size: None,
+                max_size: None,
+                modified_after: None,
+                modified_before: None,
+                is_dir: None,
+                mime_prefix: None,
+            },
+        )
+        .await
+        .map_err(AppError::internal)?;
+    let base = grant.real_path.trim_end_matches(['/', '\\']);
+    let results: Vec<Value> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let relative = entry.real_path.strip_prefix(base)?;
+            let path = relative.trim_start_matches(['/', '\\']).replace('\\', "/");
+            (!path.is_empty()).then(|| {
+                json!({
+                    "path": path,
+                    "name": entry.name,
+                    "is_dir": entry.is_dir,
+                    "size": entry.size,
+                    "modified": entry.mtime,
+                })
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "indexed": true,
+        "results": results,
+        "next_cursor": null,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DirSizeQuery {
+    grant: i64,
+    path: Option<String>,
+}
+
+pub async fn dir_size(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DirSizeQuery>,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let grant = auth.grant(query.grant)?;
+    let path = query.path.unwrap_or_default();
+    let resolved = resolve_grant(&state, grant, &path, false).await?;
+    let absolute = resolved.absolute.clone();
+    let (bytes, files) = tokio::task::spawn_blocking(move || fsops::path_usage(&absolute))
+        .await
+        .map_err(|error| AppError::internal(anyhow::Error::from(error)))??;
+    Ok(Json(json!({
+        "bytes": bytes,
+        "files": files,
+        "truncated": false,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct StatQuery {
     grant: i64,
     path: Option<String>,
@@ -259,6 +415,25 @@ pub async fn stat(
     let path = query.path.unwrap_or_default();
     let resolved = resolve_grant(&state, grant, &path, false).await?;
     let is_dir = resolved.absolute.is_dir();
+    if is_dir {
+        let metadata = tokio::fs::metadata(&resolved.absolute)
+            .await
+            .map_err(fsops::io_error)?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+        return Ok(Json(json!({
+            "path": path,
+            "is_dir": true,
+            "size": 0,
+            "modified": modified,
+            "etag": "",
+            "read_only": grant.mode != "rw",
+        })));
+    }
     let absolute = resolved.absolute.clone();
     let info = tokio::task::spawn_blocking(move || fsops::file_info(&absolute))
         .await
@@ -269,6 +444,9 @@ pub async fn stat(
         "size": info.size,
         "modified": info.modified,
         "etag": info.etag,
+        "mime_type": mime_guess::from_path(&resolved.absolute)
+            .first_or_octet_stream()
+            .to_string(),
         "read_only": grant.mode != "rw",
     })))
 }
@@ -541,4 +719,387 @@ fn decode_cursor(cursor: &str) -> Result<usize, AppError> {
         .and_then(Value::as_u64)
         .map(|offset| offset as usize)
         .ok_or_else(|| AppError::bad_request("invalid cursor"))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateUploadRequest {
+    grant: i64,
+    dir: Option<String>,
+    filename: String,
+    total_size: i64,
+    chunk_size: Option<i64>,
+}
+
+async fn peer_upload(
+    state: &Arc<AppState>,
+    auth: &PeerAuth,
+    id: &str,
+) -> Result<crate::db::UploadSession, AppError> {
+    let upload = state
+        .db
+        .find_upload(id, auth.token.user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let root = state
+        .db
+        .find_root(upload.root_id, auth.token.user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let relative = if upload.dir_path.is_empty() {
+        upload.filename.clone()
+    } else {
+        format!("{}/{}", upload.dir_path, upload.filename)
+    };
+    let absolute = std::path::Path::new(&root.real_path).join(&relative);
+    let allowed = auth.grants.iter().any(|grant| {
+        grant.root_id == upload.root_id
+            && grant.mode == "rw"
+            && crate::platform::path_within(&absolute, std::path::Path::new(&grant.real_path))
+    });
+    if !allowed {
+        return Err(AppError::NotFound);
+    }
+    Ok(upload)
+}
+
+pub async fn create_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateUploadRequest>,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let grant = auth.grant(request.grant)?;
+    validate_name(&request.filename)?;
+    if request.total_size < 0 {
+        return Err(AppError::bad_request("invalid upload size"));
+    }
+    let chunk_size = request.chunk_size.unwrap_or(4 * 1024 * 1024);
+    if !(1..=64 * 1024 * 1024).contains(&chunk_size) {
+        return Err(AppError::bad_request("invalid chunk size"));
+    }
+    let chunks = (request.total_size + chunk_size - 1) / chunk_size;
+    if chunks > 100_000 {
+        return Err(AppError::bad_request("too many upload chunks"));
+    }
+    let dir = request.dir.unwrap_or_default();
+    let resolved = resolve_grant(&state, grant, &dir, true).await?;
+    if !resolved.absolute.is_dir() {
+        return Err(AppError::bad_request("upload target is not a directory"));
+    }
+    let root = state
+        .db
+        .find_root(grant.root_id, grant.user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::GrantRevoked)?;
+    let dir_relative = resolved
+        .absolute
+        .strip_prefix(std::path::Path::new(&root.real_path))
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let upload_id = format!("up_{}", auth::random_token(16));
+    let temp = fsops::create_upload_temp(&resolved.absolute, &upload_id)?;
+    let now = unix_now();
+    let ttl = state.settings().settings.uploads.session_ttl_hours as i64;
+    let upload = crate::db::UploadSession {
+        id: upload_id.clone(),
+        user_id: grant.user_id,
+        root_id: grant.root_id,
+        dir_path: dir_relative,
+        filename: request.filename.clone(),
+        total_size: request.total_size,
+        chunk_size,
+        received: 0,
+        chunk_bitmap: vec![0; ((chunks + 7) / 8) as usize],
+        temp_path: temp.to_string_lossy().to_string(),
+        expires_at: now + ttl.saturating_mul(3600),
+        created_at: now,
+        updated_at: now,
+        remote_upload_id: None,
+    };
+    state
+        .db
+        .insert_upload(&upload)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({
+        "id": upload_id,
+        "chunk_size": chunk_size,
+        "total_size": request.total_size,
+    })))
+}
+
+pub async fn upload_chunk(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath((id, index)): AxumPath<(String, u32)>,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let mut upload = peer_upload(&state, &auth, &id).await?;
+    let index = index as i64;
+    let chunks = (upload.total_size + upload.chunk_size - 1) / upload.chunk_size;
+    if index < 0 || index >= chunks {
+        return Err(AppError::bad_request("chunk index out of range"));
+    }
+    let expected = if index == chunks - 1 {
+        upload.total_size - index * upload.chunk_size
+    } else {
+        upload.chunk_size
+    };
+    if body.len() as i64 != expected {
+        return Err(AppError::bad_request("unexpected chunk size"));
+    }
+    let byte_index = (index / 8) as usize;
+    let bit = 1_u8 << (index % 8);
+    if upload
+        .chunk_bitmap
+        .get(byte_index)
+        .is_some_and(|value| value & bit != 0)
+    {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let temp = std::path::PathBuf::from(&upload.temp_path);
+    let data = body.to_vec();
+    let offset = (index * upload.chunk_size) as u64;
+    tokio::task::spawn_blocking(move || fsops::write_upload_chunk(&temp, offset, &data))
+        .await
+        .map_err(|error| AppError::internal(anyhow::Error::from(error)))??;
+    if let Some(value) = upload.chunk_bitmap.get_mut(byte_index) {
+        *value |= bit;
+    }
+    let received = (0..chunks)
+        .filter(|chunk| {
+            upload
+                .chunk_bitmap
+                .get((chunk / 8) as usize)
+                .is_some_and(|value| value & (1_u8 << (chunk % 8)) != 0)
+        })
+        .map(|chunk| {
+            if chunk == chunks - 1 {
+                upload.total_size - chunk * upload.chunk_size
+            } else {
+                upload.chunk_size
+            }
+        })
+        .sum::<i64>();
+    state
+        .db
+        .update_upload_progress(
+            &upload.id,
+            upload.user_id,
+            received,
+            upload.chunk_bitmap.clone(),
+        )
+        .await
+        .map_err(AppError::internal)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+pub async fn upload_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let upload = peer_upload(&state, &auth, &id).await?;
+    Ok(Json(json!({
+        "received": upload.received,
+        "total_chunks": (upload.total_size + upload.chunk_size - 1) / upload.chunk_size,
+        "received_bytes": upload.received,
+        "expires_at": upload.expires_at,
+    })))
+}
+
+pub async fn complete_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let upload = peer_upload(&state, &auth, &id).await?;
+    let chunks = (upload.total_size + upload.chunk_size - 1) / upload.chunk_size;
+    let received = (0..chunks)
+        .filter(|chunk| {
+            upload
+                .chunk_bitmap
+                .get((chunk / 8) as usize)
+                .is_some_and(|value| value & (1_u8 << (chunk % 8)) != 0)
+        })
+        .count() as i64;
+    if received != chunks {
+        return Err(AppError::bad_request("upload is incomplete"));
+    }
+    let root = state
+        .db
+        .find_root(upload.root_id, upload.user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let relative = if upload.dir_path.is_empty() {
+        upload.filename.clone()
+    } else {
+        format!("{}/{}", upload.dir_path, upload.filename)
+    };
+    let target = std::path::Path::new(&root.real_path).join(&relative);
+    if target.exists() {
+        let _ = fsops::remove_path(&target, &relative);
+    }
+    let temp = std::path::PathBuf::from(&upload.temp_path);
+    tokio::task::spawn_blocking(move || fsops::finalize_upload(&temp, &target))
+        .await
+        .map_err(|error| AppError::internal(anyhow::Error::from(error)))??;
+    let info = tokio::task::spawn_blocking({
+        let target = std::path::Path::new(&root.real_path).join(&relative);
+        move || fsops::file_info(&target)
+    })
+    .await
+    .map_err(|error| AppError::internal(anyhow::Error::from(error)))??;
+    state
+        .db
+        .delete_upload(&upload.id, upload.user_id)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({
+        "path": relative,
+        "etag": info.etag,
+        "size": info.size,
+    })))
+}
+
+pub async fn cancel_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let upload = peer_upload(&state, &auth, &id).await?;
+    fsops::delete_temp(std::path::Path::new(&upload.temp_path));
+    state
+        .db
+        .delete_upload(&upload.id, upload.user_id)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransferRequest {
+    grant: i64,
+    paths: Vec<String>,
+    dest: String,
+    overwrite: Option<bool>,
+}
+
+pub async fn copy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<TransferRequest>,
+) -> Result<Response, AppError> {
+    transfer(&state, &headers, request, false).await
+}
+
+pub async fn move_items(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<TransferRequest>,
+) -> Result<Response, AppError> {
+    transfer(&state, &headers, request, true).await
+}
+
+async fn transfer(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    request: TransferRequest,
+    move_items: bool,
+) -> Result<Response, AppError> {
+    if request.paths.is_empty() || request.paths.len() > 1000 {
+        return Err(AppError::bad_request("paths must contain 1-1000 items"));
+    }
+    let auth = authenticate(state, headers).await?;
+    let grant = auth.grant(request.grant)?;
+    let dest = resolve_grant(state, grant, &request.dest, true).await?;
+    if !dest.absolute.is_dir() {
+        return Err(AppError::bad_request("destination is not a directory"));
+    }
+    let overwrite = request.overwrite.unwrap_or(false);
+    let mut done = Vec::new();
+    let mut failed = Vec::new();
+    for path in request.paths {
+        let source = match resolve_grant(state, grant, &path, move_items).await {
+            Ok(source) => source,
+            Err(error) => {
+                failed.push(json!({
+                    "path": path,
+                    "code": error.code(),
+                    "message": error.to_string(),
+                }));
+                continue;
+            }
+        };
+        let Some(name) = source.absolute.file_name().map(|name| name.to_owned()) else {
+            failed.push(json!({
+                "path": path,
+                "code": "BAD_REQUEST",
+                "message": "source has no file name",
+            }));
+            continue;
+        };
+        let target = dest.absolute.join(&name);
+        if target == source.absolute {
+            done.push(json!({ "path": path, "skipped": true }));
+            continue;
+        }
+        if target.exists() {
+            if !overwrite {
+                failed.push(json!({
+                    "path": path,
+                    "code": "CONFLICT",
+                    "message": "target already exists",
+                }));
+                continue;
+            }
+            let relative = target.to_string_lossy().to_string();
+            if let Err(error) = fsops::remove_path(&target, &relative) {
+                failed.push(json!({
+                    "path": path,
+                    "code": error.code(),
+                    "message": error.to_string(),
+                }));
+                continue;
+            }
+        }
+        let source_path = source.absolute.clone();
+        let target_path = target.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if move_items {
+                fsops::move_path(&source_path, &target_path)
+            } else {
+                fsops::copy_path(&source_path, &target_path)
+            }
+        })
+        .await
+        .map_err(|error| AppError::internal(anyhow::Error::from(error)))?;
+        match result {
+            Ok(()) => done.push(json!({ "path": path })),
+            Err(error) => failed.push(json!({
+                "path": path,
+                "code": error.code(),
+                "message": error.to_string(),
+            })),
+        }
+    }
+    if failed.is_empty() {
+        Ok(Json(json!({ "done": done, "failed": [] })).into_response())
+    } else if done.is_empty() {
+        Err(AppError::Conflict("transfer failed".to_owned()))
+    } else {
+        Ok((
+            StatusCode::MULTI_STATUS,
+            Json(json!({ "done": done, "failed": failed })),
+        )
+            .into_response())
+    }
 }

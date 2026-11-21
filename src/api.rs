@@ -51,6 +51,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/remote/tokens/{id}/rotate",
             post(crate::federation::admin::rotate_token),
         )
+        .route("/remote/activity", get(crate::federation::mounts::activity))
         .route("/remote/probe", post(crate::federation::mounts::probe))
         .route(
             "/remote/grants/preview",
@@ -802,6 +803,8 @@ struct UpdateUserRequest {
     feature_terminal: Option<bool>,
     feature_zip: Option<bool>,
     feature_unzip: Option<bool>,
+    feature_federation_mount: Option<bool>,
+    feature_federation_share: Option<bool>,
 }
 
 async fn update_user(
@@ -874,7 +877,9 @@ async fn update_user(
 
     let features_changed = request.feature_terminal.is_some()
         || request.feature_zip.is_some()
-        || request.feature_unzip.is_some();
+        || request.feature_unzip.is_some()
+        || request.feature_federation_mount.is_some()
+        || request.feature_federation_share.is_some();
     if features_changed {
         state
             .db
@@ -883,6 +888,8 @@ async fn update_user(
                 request.feature_terminal,
                 request.feature_zip,
                 request.feature_unzip,
+                request.feature_federation_mount,
+                request.feature_federation_share,
             )
             .await
             .map_err(AppError::internal)?;

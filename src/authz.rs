@@ -26,7 +26,7 @@ pub async fn resolve(
         .cloned()
         .ok_or(AppError::NotFound)?;
     if root.is_remote() {
-        return Err(AppError::Forbidden);
+        return Err(AppError::RemoteUnsupported);
     }
     let links = state
         .db
@@ -61,7 +61,7 @@ pub async fn resolve_many(
         .cloned()
         .ok_or(AppError::NotFound)?;
     if root.is_remote() {
-        return Err(AppError::Forbidden);
+        return Err(AppError::RemoteUnsupported);
     }
     let links = state
         .db

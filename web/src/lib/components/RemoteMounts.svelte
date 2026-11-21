@@ -13,6 +13,8 @@
   let alias = $state('');
   let busy = $state(false);
   let error = $state('');
+  let reconnectId = $state<number | null>(null);
+  let reconnectToken = $state('');
 
   onMount(() => {
     void load();
@@ -77,6 +79,22 @@
     error = '';
     try {
       await api.remoteDeleteMount(id, csrf);
+      await load();
+    } catch (value) {
+      error = message(value);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function reconnect(id: number): Promise<void> {
+    if (!reconnectToken.trim()) return;
+    busy = true;
+    error = '';
+    try {
+      await api.remoteReauthMount(id, reconnectToken.trim(), csrf);
+      reconnectId = null;
+      reconnectToken = '';
       await load();
     } catch (value) {
       error = message(value);
@@ -169,6 +187,16 @@
             </button>
             <button
               type="button"
+              disabled={busy}
+              onclick={() => {
+                reconnectId = reconnectId === item.id ? null : item.id;
+                reconnectToken = '';
+              }}
+            >
+              {t($language, '重新连接')}
+            </button>
+            <button
+              type="button"
               class="danger"
               disabled={busy}
               onclick={() => void remove(item.id)}
@@ -177,6 +205,23 @@
             </button>
           </div>
         </div>
+        {#if reconnectId === item.id}
+          <div class="reconnect">
+            <input
+              type="password"
+              bind:value={reconnectToken}
+              placeholder="fhfed_..."
+              autocomplete="off"
+            />
+            <button
+              type="button"
+              disabled={busy || !reconnectToken.trim()}
+              onclick={() => void reconnect(item.id)}
+            >
+              {t($language, '保存令牌')}
+            </button>
+          </div>
+        {/if}
       {/each}
     </div>
   {/if}
@@ -328,5 +373,18 @@
 
   .danger {
     color: var(--danger);
+  }
+
+  .reconnect {
+    display: flex;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+  }
+
+  .reconnect input {
+    flex: 1;
   }
 </style>

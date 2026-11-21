@@ -51,6 +51,8 @@ pub enum AppError {
     TokenExpired,
     #[error("federation grant revoked")]
     GrantRevoked,
+    #[error("operation is not supported for remote directories")]
+    RemoteUnsupported,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -102,6 +104,7 @@ impl AppError {
             Self::TokenRevoked => "TOKEN_REVOKED",
             Self::TokenExpired => "TOKEN_EXPIRED",
             Self::GrantRevoked => "GRANT_REVOKED",
+            Self::RemoteUnsupported => "REMOTE_ROOT_UNSUPPORTED",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
     }
@@ -204,6 +207,11 @@ impl IntoResponse for AppError {
                 StatusCode::GONE,
                 "GRANT_REVOKED",
                 "Grant has been revoked".to_owned(),
+            ),
+            Self::RemoteUnsupported => (
+                StatusCode::FORBIDDEN,
+                "REMOTE_ROOT_UNSUPPORTED",
+                "This operation is not supported for remote directories".to_owned(),
             ),
             Self::Internal(err) => {
                 tracing::error!(error = %err, "internal server error");

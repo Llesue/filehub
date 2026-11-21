@@ -177,6 +177,16 @@ pub async fn search(
     if query_text.is_empty() {
         return Err(AppError::bad_request("search query is empty"));
     }
+    if root.is_remote() {
+        return crate::federation::proxy::search(
+            &state,
+            current.user.id,
+            &root,
+            query_text,
+            query.limit.unwrap_or(100).clamp(1, 200) as usize,
+        )
+        .await;
+    }
 
     if let (Some(min), Some(max)) = (query.min_size, query.max_size)
         && min > max

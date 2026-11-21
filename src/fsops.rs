@@ -569,6 +569,9 @@ pub fn disk_usage(roots: &[Root]) -> Result<Vec<DiskUsage>, AppError> {
     let mut disks = Vec::new();
 
     for root in roots {
+        if root.is_remote() {
+            continue;
+        }
         let mount = mount_point(Path::new(&root.real_path))?;
         if !mounts.insert(mount.clone()) {
             continue;
@@ -672,6 +675,9 @@ pub fn directory_usage(roots: &[Root]) -> Result<u64, AppError> {
     let mut total = 0_u64;
 
     for root in roots {
+        if root.is_remote() {
+            continue;
+        }
         walk_usage(Path::new(&root.real_path), &mut seen, &mut total)?;
     }
 

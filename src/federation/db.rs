@@ -628,3 +628,144 @@ impl Db {
         .await
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct FederationSearchHit {
+    pub name: String,
+    pub real_path: String,
+    pub is_dir: bool,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+impl Db {
+    pub async fn federation_search(
+        &self,
+        base: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<FederationSearchHit>> {
+        let base = base.trim_end_matches('/').to_owned();
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT name, real_path, is_dir, size, mtime FROM index_entries \
+                 WHERE name LIKE ?1 ESCAPE '\\' \
+                   AND (real_path = ?2 OR real_path LIKE ?2 || '/%') \
+                 ORDER BY name COLLATE NOCASE LIMIT ?3 OFFSET ?4",
+            )?;
+            let rows = statement.query_map(
+                params![pattern, base, limit as i64, offset as i64],
+                |row| {
+                    Ok(FederationSearchHit {
+                        name: row.get(0)?,
+                        real_path: row.get(1)?,
+                        is_dir: row.get::<_, i64>(2)? != 0,
+                        size: row.get(3)?,
+                        mtime: row.get(4)?,
+                    })
+                },
+            )?;
+            rows.collect()
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn grants_and_tokens_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("federation.db"), 2).unwrap();
+        db.call(|connection| {
+            connection.execute(
+                "INSERT INTO users (username, password_hash, role, home_dir, created_at, updated_at) \
+                 VALUES ('u', 'x', 'admin', '/tmp', 0, 0)",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO user_roots \
+                 (user_id, real_path, alias, read_only, sort_order, created_at, kind) \
+                 VALUES (1, '/tmp', 'root', 0, 0, 0, 'local')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let grant = db
+            .federation_create_grant(1, 1, "/tmp", "Test", "rw")
+            .await
+            .unwrap();
+        let token = db
+            .federation_create_token(1, "t", "hash", "fhfed_abc", None, &[grant])
+            .await
+            .unwrap();
+        let found = db
+            .federation_find_token("hash")
+            .await
+            .unwrap()
+            .expect("token exists");
+        assert_eq!(found.id, token);
+        assert_eq!(found.user_id, 1);
+        let grants = db.federation_token_grants(token).await.unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].id, grant);
+        assert_eq!(grants[0].mode, "rw");
+
+        assert!(db.federation_revoke_grant(grant, 1).await.unwrap());
+        assert!(db.federation_token_grants(token).await.unwrap().is_empty());
+        assert!(db.federation_revoke_token(token, 1).await.unwrap());
+        assert!(
+            db.federation_find_token("hash")
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FederationActivity {
+    pub op: String,
+    pub path: Option<String>,
+    pub status: i64,
+    pub bytes: i64,
+    pub created_at: i64,
+}
+
+impl Db {
+    pub async fn federation_activity(
+        &self,
+        user_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<FederationActivity>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT op, path, status, bytes, created_at FROM federation_op_log \
+                 WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![user_id, limit as i64], |row| {
+                Ok(FederationActivity {
+                    op: row.get(0)?,
+                    path: row.get(1)?,
+                    status: row.get(2)?,
+                    bytes: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+}

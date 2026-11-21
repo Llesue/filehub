@@ -1,0 +1,451 @@
+openapi: 3.1.0
+info:
+  title: FileHub Federation API
+  version: "1"
+  description: |
+    FileHub 实例之间的目录挂载协议。v1 冻结：只允许追加字段、能力和错误码。
+    路径中的 `path` 相对 grant 根，空字符串表示 grant 根。
+
+servers:
+  - url: /api/federation/v1
+
+security:
+  - bearer: []
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: fhfed_<token>
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - BAD_REQUEST
+                - INVALID_PATH
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - CONFLICT
+                - PRECONDITION_FAILED
+                - QUOTA_EXCEEDED
+                - ENTRY_LIMIT_EXCEEDED
+                - TOO_LARGE
+                - RATE_LIMITED
+                - UNSUPPORTED_MEDIA
+                - TOKEN_REVOKED
+                - TOKEN_EXPIRED
+                - GRANT_REVOKED
+                - INTERNAL_ERROR
+            message:
+              type: string
+
+    Info:
+      type: object
+      properties:
+        product: { type: string, const: filehub }
+        api: { type: string, const: federation }
+        version: { type: integer, const: 1 }
+        server_version: { type: string }
+        instance_id: { type: string }
+        capabilities:
+          type: array
+          items: { type: string }
+        chunk_size_max: { type: integer }
+        path_max: { type: integer }
+
+    Grant:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        label: { type: string }
+        mode: { type: string, enum: [ro, rw] }
+
+    Entry:
+      type: object
+      properties:
+        name: { type: string }
+        is_dir: { type: boolean }
+        size: { type: integer, format: int64 }
+        modified: { type: integer, format: int64 }
+        mime_type: { type: string }
+        has_preview: { type: boolean }
+
+    ListPage:
+      type: object
+      properties:
+        path: { type: string }
+        read_only: { type: boolean }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/Entry" }
+        next_cursor:
+          type: [string, "null"]
+
+    Stat:
+      type: object
+      properties:
+        path: { type: string }
+        is_dir: { type: boolean }
+        size: { type: integer, format: int64 }
+        modified: { type: integer, format: int64 }
+        etag: { type: string }
+        mime_type: { type: string }
+        read_only: { type: boolean }
+
+    BatchResult:
+      type: object
+      properties:
+        done:
+          type: array
+          items: { type: object }
+        failed:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              code: { type: string }
+              message: { type: string }
+
+    SearchResult:
+      type: object
+      properties:
+        indexed: { type: boolean }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              name: { type: string }
+              is_dir: { type: boolean }
+              size: { type: integer, format: int64 }
+              modified: { type: integer, format: int64 }
+        next_cursor:
+          type: [string, "null"]
+
+    UploadCreated:
+      type: object
+      properties:
+        id: { type: string }
+        chunk_size: { type: integer }
+        total_size: { type: integer, format: int64 }
+
+    UploadStatus:
+      type: object
+      properties:
+        received: { type: integer, format: int64 }
+        total_chunks: { type: integer }
+        received_bytes: { type: integer, format: int64 }
+        expires_at: { type: integer, format: int64 }
+
+paths:
+  /info:
+    get:
+      summary: 服务与能力信息（无需认证）
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Info" }
+
+  /grants:
+    get:
+      summary: 当前令牌可见的授权目录
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Grant" }
+
+  /list:
+    get:
+      summary: 目录列表
+      parameters:
+        - { name: grant, in: query, required: true, schema: { type: integer } }
+        - { name: path, in: query, schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 2000 } }
+        - { name: sort, in: query, schema: { type: string, enum: [name, modified, size] } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ListPage" }
+
+  /stat:
+    get:
+      summary: 单路径元信息
+      parameters:
+        - { name: grant, in: query, required: true, schema: { type: integer } }
+        - { name: path, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Stat" }
+
+  /download:
+    get:
+      summary: 下载文件，支持 Range
+      parameters:
+        - { name: grant, in: query, required: true, schema: { type: integer } }
+        - { name: path, in: query, schema: { type: string } }
+        - { name: inline, in: query, schema: { type: string, enum: ["0", "1"] } }
+      responses:
+        "200": { description: 完整文件 }
+        "206": { description: 部分内容 }
+        "304": { description: ETag 命中 }
+        "416": { description: Range 不可满足 }
+
+  /thumb:
+    get:
+      summary: 缩略图（同步生成）
+      parameters:
+        - { name: grant, in: query, required: true, schema: { type: integer } }
+        - { name: path, in: query, schema: { type: string } }
+        - { name: w, in: query, schema: { type: integer } }
+        - { name: edge, in: query, schema: { type: integer } }
+        - { name: fit, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: JPEG
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+
+  /dir-size:
+    get:
+      summary: 目录大小
+      parameters:
+        - { name: grant, in: query, required: true, schema: { type: integer } }
+        - { name: path, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bytes: { type: integer, format: int64 }
+                  files: { type: integer, format: int64 }
+                  truncated: { type: boolean }
+
+  /search:
+    get:
+      summary: 文件名搜索（授权侧索引）
+      parameters:
+        - { name: grant, in: query, required: true, schema: { type: integer } }
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 200 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResult" }
+
+  /mkdir:
+    post:
+      summary: 新建目录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, path]
+              properties:
+                grant: { type: integer }
+                path: { type: string }
+      responses:
+        "201": { description: 已创建 }
+
+  /touch:
+    post:
+      summary: 新建空文件
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, path]
+              properties:
+                grant: { type: integer }
+                path: { type: string }
+      responses:
+        "201": { description: 已创建 }
+
+  /rename:
+    post:
+      summary: 重命名
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, path, name]
+              properties:
+                grant: { type: integer }
+                path: { type: string }
+                name: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /copy:
+    post:
+      summary: 复制（同 grant 内批量）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, paths, dest]
+              properties:
+                grant: { type: integer }
+                paths:
+                  type: array
+                  items: { type: string }
+                dest: { type: string }
+                overwrite: { type: boolean }
+      responses:
+        "200": { description: 全部成功 }
+        "207": { description: 部分成功 }
+
+  /move:
+    post:
+      summary: 移动（同 grant 内批量）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, paths, dest]
+              properties:
+                grant: { type: integer }
+                paths:
+                  type: array
+                  items: { type: string }
+                dest: { type: string }
+                overwrite: { type: boolean }
+      responses:
+        "200": { description: 全部成功 }
+        "207": { description: 部分成功 }
+
+  /delete:
+    post:
+      summary: 删除（批量）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, paths]
+              properties:
+                grant: { type: integer }
+                paths:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200": { description: 全部成功 }
+        "207": { description: 部分成功 }
+
+  /uploads:
+    post:
+      summary: 创建上传会话
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, filename, total_size]
+              properties:
+                grant: { type: integer }
+                dir: { type: string }
+                filename: { type: string }
+                total_size: { type: integer, format: int64 }
+                chunk_size: { type: integer }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadCreated" }
+
+  /uploads/{id}:
+    get:
+      summary: 上传状态
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadStatus" }
+    delete:
+      summary: 取消上传
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: 已取消 }
+
+  /uploads/{id}/chunks/{index}:
+    put:
+      summary: 写入分片
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: index, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "204": { description: OK }
+
+  /uploads/{id}/complete:
+    post:
+      summary: 完成上传
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path: { type: string }
+                  etag: { type: string }
+                  size: { type: integer, format: int64 }

@@ -703,6 +703,10 @@ pub async fn zip(
     if request.paths.is_empty() || request.paths.len() > 1000 {
         return Err(AppError::bad_request("select between 1 and 1000 paths"));
     }
+    if root.is_remote() {
+        return crate::federation::proxy::zip_files(&state, current.user.id, &root, request.paths)
+            .await;
+    }
 
     let selected =
         authz::resolve_many(&state, current.user.id, root.id, request.paths, false).await?;
@@ -1241,6 +1245,28 @@ pub async fn create_upload(
     let current = auth::current_user(&state, &headers).await?;
     let root = load_root(&state, current.user.id, request.root).await?;
     let path = request.path.unwrap_or_default();
+    if root.is_remote() {
+        let filename = validate_filename(&request.filename)?;
+        let size = validate_upload_size(&state, request.total_size)?;
+        let chunk_size = request
+            .chunk_size
+            .unwrap_or_else(|| state.settings().settings.uploads.chunk_size as i64);
+        if !(1..=64 * 1024 * 1024).contains(&chunk_size) {
+            return Err(AppError::bad_request(
+                "chunk_size must be between 1 and 64 MiB",
+            ));
+        }
+        return crate::federation::proxy::create_upload(
+            &state,
+            current.user.id,
+            &root,
+            &path,
+            &filename,
+            size,
+            chunk_size,
+        )
+        .await;
+    }
     let resolved = authz::resolve(&state, current.user.id, root.id, &path, true).await?;
     let filename = validate_filename(&request.filename)
         .inspect_err(|error| warn_upload(current.user.id, &request.filename, "filename", error))?;
@@ -1324,6 +1350,7 @@ pub async fn create_upload(
         expires_at: now + ttl.saturating_mul(3600),
         created_at: now,
         updated_at: now,
+        remote_upload_id: None,
     };
 
     if let Err(err) = state.db.insert_upload(&upload).await {
@@ -1373,6 +1400,10 @@ pub async fn cancel_upload(
         .await
         .map_err(AppError::internal)?
     {
+        if upload.remote_upload_id.is_some() {
+            crate::federation::proxy::cancel_upload(&state, current.user.id, &upload).await?;
+            return Ok(StatusCode::NO_CONTENT);
+        }
         fsops::delete_temp(std::path::Path::new(&upload.temp_path));
         state
             .db
@@ -1416,6 +1447,17 @@ pub async fn upload_chunk(
         .chunk_bitmap
         .get(byte_index)
         .is_some_and(|value| value & bit != 0);
+
+    if upload.remote_upload_id.is_some() && !already_received {
+        return crate::federation::proxy::upload_chunk(
+            &state,
+            current.user.id,
+            &upload,
+            index as u32,
+            &body,
+        )
+        .await;
+    }
 
     if !already_received {
         let temp_path = PathBuf::from(&upload.temp_path);
@@ -1469,6 +1511,9 @@ pub async fn complete_upload(
     }
 
     let root = load_root(&state, current.user.id, upload.root_id).await?;
+    if root.is_remote() {
+        return crate::federation::proxy::complete_upload(&state, current.user.id, &upload).await;
+    }
     let target_relative = if upload.dir_path.is_empty() {
         upload.filename.clone()
     } else {
@@ -1594,6 +1639,58 @@ pub async fn delete_preview(
 
     let root = load_root(&state, current.user.id, request.root).await?;
     let requested_paths = request.paths;
+    if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, current.user.id, root.id).await?;
+        let mut items = Vec::with_capacity(requested_paths.len());
+        for path in &requested_paths {
+            if path.is_empty() {
+                return Err(AppError::invalid_path(
+                    "the root directory cannot be deleted",
+                ));
+            }
+            let stat = client
+                .stat(mount.grant_id, path)
+                .await
+                .map_err(|error| error.into_app())?;
+            items.push(DeleteItem {
+                relative: path.clone(),
+                is_dir: stat.get("is_dir").and_then(Value::as_bool).unwrap_or(false),
+                size: stat.get("size").and_then(Value::as_u64).unwrap_or(0),
+            });
+        }
+        let requires_code = delete_requires_code(
+            &items
+                .iter()
+                .map(|item| (item.is_dir, item.size))
+                .collect::<Vec<_>>(),
+        );
+        let token = auth::random_token(24);
+        let expires_at = unix_now() + 300;
+        let random = auth::sha256_hex(&auth::random_token(8));
+        let confirm_code = format!(
+            "{:04}",
+            u32::from_str_radix(&random[..8], 16).unwrap_or_default() % 10_000
+        );
+        state.delete_tokens.lock().insert(
+            token.clone(),
+            DeletePreview {
+                user_id: current.user.id,
+                root_id: root.id,
+                items: items.clone(),
+                expires_at,
+                confirm_code: confirm_code.clone(),
+                requires_code,
+            },
+        );
+        return Ok(Json(json!({
+            "token": token,
+            "expires_at": expires_at,
+            "items": items,
+            "confirm_code": confirm_code,
+            "requires_code": requires_code,
+        })));
+    }
     let resolved_paths = authz::resolve_many(
         &state,
         current.user.id,
@@ -1705,6 +1802,29 @@ pub async fn delete_confirm(
         .iter()
         .map(|item| item.relative.clone())
         .collect();
+    if root.is_remote() {
+        let value =
+            crate::federation::proxy::delete_many(&state, current.user.id, &root, &paths).await?;
+        let failed = value
+            .get("failed")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        audit(
+            &state,
+            current.user.id,
+            "delete",
+            preview.items.first().map(|item| item.relative.as_str()),
+            &headers,
+        )
+        .await;
+        if failed > 0 {
+            return Err(AppError::internal(anyhow::anyhow!(
+                "some remote items could not be deleted"
+            )));
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let phase = Instant::now();
     let resolved_paths = authz::resolve_many(&state, current.user.id, root.id, paths, true).await?;
     resolve_ns += phase.elapsed().as_nanos();
@@ -1999,6 +2119,28 @@ pub async fn dir_size(
 ) -> Result<Json<Value>, AppError> {
     let current = auth::current_user(&state, &headers).await?;
     let root = load_root(&state, current.user.id, query.root).await?;
+    if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, current.user.id, root.id).await?;
+        let value = client
+            .dir_size(mount.grant_id, &query.path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let bytes = value.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+        let truncated = value
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return Ok(Json(json!({
+            "status": "ready",
+            "size": bytes,
+            "indexed": false,
+            "partial": truncated,
+            "stale": false,
+            "refreshing": false,
+            "error": null,
+        })));
+    }
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
     let real_path = resolved.absolute.to_string_lossy().to_string();
     let path = resolved.absolute.clone();
@@ -2313,6 +2455,16 @@ pub async fn mkdir(
     let current = auth::current_user(&state, &headers).await?;
     let root = load_root(&state, current.user.id, request.root).await?;
     let name = validate_filename(&request.name)?;
+    if root.is_remote() {
+        return crate::federation::proxy::mkdir(
+            &state,
+            current.user.id,
+            &root,
+            &request.path,
+            &name,
+        )
+        .await;
+    }
     let target = join_relative(&request.path, &name);
     let resolved = authz::resolve(&state, current.user.id, root.id, &target, true).await?;
     crate::usage::ensure_entry_capacity(&state, &current.user, 1).await?;
@@ -2362,6 +2514,16 @@ pub async fn touch(
     let current = auth::current_user(&state, &headers).await?;
     let root = load_root(&state, current.user.id, request.root).await?;
     let name = validate_filename(&request.name)?;
+    if root.is_remote() {
+        return crate::federation::proxy::touch(
+            &state,
+            current.user.id,
+            &root,
+            &request.path,
+            &name,
+        )
+        .await;
+    }
     let target = join_relative(&request.path, &name);
     let resolved = authz::resolve(&state, current.user.id, root.id, &target, true).await?;
     crate::usage::ensure_entry_capacity(&state, &current.user, 1).await?;
@@ -2409,6 +2571,16 @@ pub async fn rename(
         ));
     }
     let new_name = validate_filename(&request.new_name)?;
+    if root.is_remote() {
+        return crate::federation::proxy::rename(
+            &state,
+            current.user.id,
+            &root,
+            &request.path,
+            &new_name,
+        )
+        .await;
+    }
     let source = authz::resolve(&state, current.user.id, root.id, &request.path, true).await?;
     let (parent, _) = request.path.rsplit_once('/').unwrap_or(("", &request.path));
     let target_path = join_relative(parent, &new_name);
@@ -2556,6 +2728,54 @@ pub(crate) async fn submit_transfer_job(
     if payload.paths.is_empty() || payload.paths.len() > 1000 {
         return Err(AppError::bad_request("paths must contain 1-1000 items"));
     }
+    let source_root = state
+        .db
+        .find_root(payload.source_root, user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let dest_root = state
+        .db
+        .find_root(payload.dest_root, user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    if source_root.is_remote() || dest_root.is_remote() {
+        if source_root.id != dest_root.id || !source_root.is_remote() {
+            return Err(AppError::RemoteUnsupported);
+        }
+        let kind = if payload.move_items {
+            JobKind::Move
+        } else {
+            JobKind::Copy
+        };
+        let key = auth::sha256_hex(&format!(
+            "remote:{}:{}:{}:{}",
+            payload.source_root,
+            payload.dest_path.as_deref().unwrap_or_default(),
+            payload.move_items,
+            payload.paths.join("\u{1f}")
+        ));
+        let payload_value = serde_json::to_value(&payload)
+            .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
+        let total = payload.paths.len();
+        let job_state = Arc::clone(state);
+        let job_payload = payload;
+        return state
+            .jobs
+            .submit(
+                kind,
+                key,
+                user_id,
+                payload_value,
+                total,
+                false,
+                move |ctx| async move {
+                    execute_remote_transfer(job_state, user_id, job_payload, ctx).await
+                },
+            )
+            .await;
+    }
     let kind = if payload.move_items {
         JobKind::Move
     } else {
@@ -2588,6 +2808,34 @@ pub(crate) async fn submit_transfer_job(
             },
         )
         .await
+}
+
+async fn execute_remote_transfer(
+    state: Arc<AppState>,
+    user_id: i64,
+    payload: TransferJobPayload,
+    ctx: JobContext,
+) -> Result<JobOutcome, AppError> {
+    let (client, mount) =
+        crate::federation::mounts::client_for_root(&state, user_id, payload.source_root).await?;
+    let dest = payload.dest_path.clone().unwrap_or_default();
+    let body = json!({
+        "grant": mount.grant_id,
+        "paths": payload.paths,
+        "dest": dest,
+        "overwrite": false,
+    });
+    let value = client
+        .write(
+            "POST",
+            if payload.move_items { "/move" } else { "/copy" },
+            &body,
+        )
+        .await
+        .map_err(|error| error.into_app())?;
+    ctx.report(1, 1, 0, 0);
+    crate::federation::proxy::invalidate_root(&state, payload.source_root);
+    Ok(JobOutcome::done(value, 1, 1))
 }
 
 async fn execute_transfer_job(
@@ -2950,7 +3198,22 @@ pub async fn dir_version(
     Query(query): Query<DirVersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     let current = auth::current_user(&state, &headers).await?;
-    let resolved = authz::resolve(&state, current.user.id, query.root, &query.path, false).await?;
+    let root = load_root(&state, current.user.id, query.root).await?;
+    if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, current.user.id, root.id).await?;
+        let stat = client
+            .stat(mount.grant_id, &query.path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let mtime = stat
+            .get("modified")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .saturating_mul(1000);
+        return Ok(Json(json!({ "mtime": mtime })));
+    }
+    let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
     let metadata = tokio::fs::metadata(&resolved.absolute)
         .await
         .map_err(fsops::io_error)?;

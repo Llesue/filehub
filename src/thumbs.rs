@@ -79,6 +79,22 @@ pub async fn thumb(
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
+    if root.is_remote() {
+        let edge = query
+            .edge
+            .unwrap_or_else(|| query.w.unwrap_or(256))
+            .clamp(16, settings_edge(&state));
+        return crate::federation::proxy::thumb(
+            &state,
+            current.user.id,
+            &root,
+            &query.path,
+            query.w.unwrap_or(256),
+            edge,
+            Fit::from_query(query.fit.as_deref()).as_str(),
+        )
+        .await;
+    }
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
     let source = resolved.absolute.clone();
     let fit = Fit::from_query(query.fit.as_deref());
@@ -1113,6 +1129,29 @@ pub async fn image_info(
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
+    if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, current.user.id, root.id).await?;
+        let stat = client
+            .stat(mount.grant_id, &query.path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let size = stat
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let settings = state.settings();
+        let previewable = stat.get("is_dir").and_then(serde_json::Value::as_bool) != Some(true)
+            && size <= settings.settings.thumbnails.max_source_bytes;
+        return Ok(axum::Json(json!({
+            "width": null,
+            "height": null,
+            "pixels": null,
+            "limit": null,
+            "previewable": previewable,
+            "reason": if previewable { serde_json::Value::Null } else { json!("max_source") },
+        })));
+    }
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
     let metadata = tokio::fs::metadata(&resolved.absolute)
         .await

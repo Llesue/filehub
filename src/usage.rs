@@ -211,7 +211,9 @@ async fn compute_snapshot(state: &Arc<AppState>, user: &User) -> Result<UsageSna
     let home = PathBuf::from(user.home_dir.clone());
     let roots_for_task: Vec<_> = roots
         .into_iter()
-        .filter(|root| !crate::platform::paths_equal(Path::new(&root.real_path), &home))
+        .filter(|root| {
+            !root.is_remote() && !crate::platform::paths_equal(Path::new(&root.real_path), &home)
+        })
         .collect();
     let home_for_task = home.clone();
     let (used_bytes, entry_count, disks) = tokio::task::spawn_blocking(move || {

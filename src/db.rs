@@ -187,6 +187,7 @@ pub struct UploadSession {
     pub expires_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub remote_upload_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -650,6 +651,8 @@ impl Db {
         terminal: Option<bool>,
         zip: Option<bool>,
         unzip: Option<bool>,
+        federation_mount: Option<bool>,
+        federation_share: Option<bool>,
     ) -> anyhow::Result<bool> {
         self.call(move |connection| {
             let now = unix_now();
@@ -658,12 +661,16 @@ impl Db {
                  feature_terminal = COALESCE(?1, feature_terminal), \
                  feature_zip = COALESCE(?2, feature_zip), \
                  feature_unzip = COALESCE(?3, feature_unzip), \
-                 updated_at = ?4 \
-                 WHERE id = ?5 AND deleted_at IS NULL",
+                 feature_federation_mount = COALESCE(?4, feature_federation_mount), \
+                 feature_federation_share = COALESCE(?5, feature_federation_share), \
+                 updated_at = ?6 \
+                 WHERE id = ?7 AND deleted_at IS NULL",
                 params![
                     terminal.map(i64::from),
                     zip.map(i64::from),
                     unzip.map(i64::from),
+                    federation_mount.map(i64::from),
+                    federation_share.map(i64::from),
                     now,
                     id
                 ],
@@ -1307,8 +1314,8 @@ impl Db {
             connection.execute(
                 "INSERT INTO upload_sessions \
                  (id, user_id, root_id, dir_path, filename, total_size, chunk_size, received, \
-                  chunk_bitmap, temp_path, sha256, expires_at, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12)",
+                  chunk_bitmap, temp_path, sha256, expires_at, created_at, updated_at, remote_upload_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12, ?13)",
                 params![
                     upload.id,
                     upload.user_id,
@@ -1321,7 +1328,8 @@ impl Db {
                     upload.chunk_bitmap,
                     upload.temp_path,
                     upload.expires_at,
-                    upload.created_at
+                    upload.created_at,
+                    upload.remote_upload_id
                 ],
             )?;
             Ok(())
@@ -1339,7 +1347,8 @@ impl Db {
             connection
                 .query_row(
                     "SELECT id, user_id, root_id, dir_path, filename, total_size, chunk_size, \
-                     received, chunk_bitmap, temp_path, expires_at, created_at, updated_at \
+                     received, chunk_bitmap, temp_path, expires_at, created_at, updated_at, \
+                     remote_upload_id \
                      FROM upload_sessions WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     |row| {
@@ -1357,6 +1366,7 @@ impl Db {
                             expires_at: row.get(10)?,
                             created_at: row.get(11)?,
                             updated_at: row.get(12)?,
+                            remote_upload_id: row.get(13)?,
                         })
                     },
                 )
