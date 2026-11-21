@@ -16,7 +16,7 @@
     onMounted: (rootId: number | null) => void;
   } = $props();
 
-  let view = $state<'list' | 'wizard'>('list');
+  let view = $state<'list' | 'wizard' | 'grants'>('list');
   let mounts = $state<RemoteMount[]>([]);
   let busy = $state(false);
   let error = $state('');
@@ -26,6 +26,19 @@
   let renameId = $state<number | null>(null);
   let renameAlias = $state('');
   let latency = $state<Record<number, number>>({});
+  let grantsMount = $state<RemoteMount | null>(null);
+  let availableGrants = $state<
+    Array<{
+      id: number;
+      label: string;
+      mode: 'ro' | 'rw';
+      mounted: boolean;
+      mount_id: number | null;
+      current: boolean;
+    }>
+  >([]);
+  let grantsBusy = $state(false);
+  let grantsError = $state('');
 
   $effect(() => {
     if (open) {
@@ -140,6 +153,38 @@
     return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
   }
 
+  async function openMountGrants(mount: RemoteMount): Promise<void> {
+    grantsMount = mount;
+    view = 'grants';
+    grantsError = '';
+    grantsBusy = true;
+    try {
+      const result = await api.remoteMountGrants(mount.id);
+      availableGrants = result.grants;
+    } catch (value) {
+      grantsError = message(value);
+      availableGrants = [];
+    } finally {
+      grantsBusy = false;
+    }
+  }
+
+  async function attachGrant(grantId: number): Promise<void> {
+    if (!grantsMount) return;
+    grantsBusy = true;
+    grantsError = '';
+    try {
+      const result = await api.remoteAttachGrant(grantsMount.id, grantId, csrf);
+      onMounted(result.root_id);
+      await openMountGrants(grantsMount);
+      await load();
+    } catch (value) {
+      grantsError = message(value);
+    } finally {
+      grantsBusy = false;
+    }
+  }
+
   function stateLabel(state: RemoteMount['state']): string {
     switch (state) {
       case 'online':
@@ -175,6 +220,68 @@
         void load();
       }}
     />
+  {:else if view === 'grants'}
+    <div
+      class="backdrop"
+      role="presentation"
+      onclick={(event) => {
+        if (event.target === event.currentTarget) view = 'list';
+      }}
+    >
+      <div class="dialog grants-dialog" role="dialog" aria-modal="true" aria-label={t($language, '令牌目录')}>
+        <header>
+          <button type="button" class="back" onclick={() => (view = 'list')}>
+            ← {t($language, '返回')}
+          </button>
+          <h2>{t($language, '令牌目录')}</h2>
+          <button type="button" class="icon" aria-label={t($language, '关闭')} onclick={close}>
+            <Icon name="close" size={16} />
+          </button>
+        </header>
+        <p class="hint">{grantsMount?.base_url}</p>
+        {#if grantsError}
+          <p class="error">{grantsError}</p>
+        {/if}
+        {#if grantsBusy}
+          <p class="hint">{t($language, '加载中…')}</p>
+        {:else if availableGrants.length === 0}
+          <p class="hint">{t($language, '这个令牌没有可用的目录。')}</p>
+        {:else}
+          <div class="list">
+            {#each availableGrants as grant (grant.id)}
+              <div class="grant-row">
+                <div class="grant-info">
+                  <strong>{grant.label}</strong>
+                  <span class="badge" class:rw={grant.mode === 'rw'}>
+                    {grant.mode === 'rw' ? t($language, '读写') : t($language, '只读')}
+                  </span>
+                  {#if grant.current}
+                    <span class="badge current">{t($language, '当前')}</span>
+                  {:else if grant.mounted}
+                    <span class="badge">{t($language, '已挂载')}</span>
+                  {/if}
+                </div>
+                {#if !grant.mounted}
+                  <button
+                    type="button"
+                    class="primary"
+                    disabled={grantsBusy}
+                    onclick={() => void attachGrant(grant.id)}
+                  >
+                    {t($language, '挂载')}
+                  </button>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+        <footer>
+          <button type="button" onclick={() => (view = 'list')}>
+            {t($language, '返回')}
+          </button>
+        </footer>
+      </div>
+    </div>
   {:else}
     <div
       class="backdrop"
@@ -205,7 +312,12 @@
               <div class="row">
                 <div class="meta">
                   <strong>{item.alias}</strong>
-                  <span class="url">{item.base_url}</span>
+                  <button
+                    type="button"
+                    class="url"
+                    title={item.base_url}
+                    onclick={() => void openMountGrants(item)}
+                  >{item.base_url}</button>
                   <em class:rw={item.mode === 'rw'}>
                     {item.mode === 'rw' ? t($language, '读写') : t($language, '只读')}
                   </em>
@@ -399,10 +511,16 @@
   .meta .url {
     overflow: hidden;
     max-width: 280px;
-    color: var(--text-2);
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent-text);
+    font: inherit;
     font-size: 12px;
+    text-decoration: underline;
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: pointer;
   }
 
   .meta em {
@@ -427,6 +545,52 @@
   .latency {
     font-size: 11.5px;
     color: var(--text-2);
+  }
+
+  .grants-dialog {
+    width: min(560px, calc(100vw - 32px));
+  }
+
+  .grant-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+
+  .grant-info {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .badge {
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-2);
+    font-size: 11px;
+  }
+
+  .badge.rw {
+    color: var(--success, #2e7d32);
+  }
+
+  .badge.current {
+    border-color: var(--accent);
+    color: var(--accent-text);
+  }
+
+  .back {
+    border: none;
+    background: transparent;
+    color: var(--text-2);
+    cursor: pointer;
+    font-size: 12.5px;
   }
 
   .latency.good {

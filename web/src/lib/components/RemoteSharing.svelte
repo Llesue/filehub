@@ -826,6 +826,11 @@
     gap: 6px;
   }
 
+  .panel-list button {
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+
   .panel-actions {
     display: flex;
     justify-content: flex-end;

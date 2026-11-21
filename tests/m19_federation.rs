@@ -299,7 +299,9 @@ async fn federation_contract_round_trip() {
     )
     .await;
     assert_eq!(token.status(), StatusCode::OK);
-    let token = json_body(token).await["token"].as_str().unwrap().to_owned();
+    let token = json_body(token).await;
+    let token_id = token["id"].as_i64().unwrap();
+    let token = token["token"].as_str().unwrap().to_owned();
 
     let mount = send_json(
         &mount_instance.router,
@@ -318,6 +320,74 @@ async fn federation_contract_round_trip() {
     assert_eq!(mount.status(), StatusCode::OK, "mount failed");
     let mount = json_body(mount).await;
     let remote_root = mount["root_id"].as_i64().unwrap();
+
+    std::fs::create_dir_all(peer_instance._dir.path().join("users/admin/shared/sub")).unwrap();
+    std::fs::write(
+        peer_instance
+            ._dir
+            .path()
+            .join("users/admin/shared/sub/attached.txt"),
+        b"attached",
+    )
+    .unwrap();
+    let second = send_json(
+        &peer_instance.router,
+        Method::POST,
+        "/api/v1/remote/grants",
+        Some(&peer_instance.cookie),
+        Some(&peer_instance.csrf),
+        json!({"root": peer_instance.root_id, "path": "shared/sub", "label": "Sub", "mode": "rw"}),
+    )
+    .await;
+    let second_id = json_body(second).await["id"].as_i64().unwrap();
+    let update = send_json(
+        &peer_instance.router,
+        Method::PATCH,
+        &format!("/api/v1/remote/tokens/{token_id}"),
+        Some(&peer_instance.cookie),
+        Some(&peer_instance.csrf),
+        json!({"grant_ids": [grant_id, second_id]}),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+    let available = send(
+        &mount_instance.router,
+        Method::GET,
+        "/api/v1/remote/mounts/1/grants",
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    let available = json_body(available).await;
+    assert_eq!(available["grants"].as_array().unwrap().len(), 2);
+    let attach = send_json(
+        &mount_instance.router,
+        Method::POST,
+        &format!("/api/v1/remote/mounts/1/grants/{second_id}"),
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({}),
+    )
+    .await;
+    assert_eq!(attach.status(), StatusCode::OK);
+    let attach = json_body(attach).await;
+    let attached_root = attach["root_id"].as_i64().unwrap();
+    let attached_list = send(
+        &mount_instance.router,
+        Method::GET,
+        &format!("/api/v1/list?root={attached_root}&path="),
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    let attached_list = json_body(attached_list).await;
+    assert!(
+        attached_list["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"].as_str() == Some("attached.txt"))
+    );
 
     let peer_list = send(
         &peer_instance.router,

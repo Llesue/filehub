@@ -162,32 +162,36 @@ pub struct CreateMountRequest {
     alias: Option<String>,
 }
 
-pub async fn create(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(request): Json<CreateMountRequest>,
-) -> Result<Json<Value>, AppError> {
-    let current = auth::current_user(&state, &headers).await?;
-    auth::require_csrf(&current, &headers)?;
-    require_outbound(&state, &current.user)?;
+async fn ensure_mount_limit(state: &Arc<AppState>, user_id: i64) -> Result<(), AppError> {
     let limit = state.settings().settings.federation.max_mounts_per_user as i64;
     if state
         .db
-        .federation_count_mounts(current.user.id)
+        .federation_count_mounts(user_id)
         .await
         .map_err(AppError::internal)?
         >= limit
     {
         return Err(AppError::TooManyRequests);
     }
-    let url = ssrf::normalize_url(&request.url);
-    let target = target_for(&state, &url).await?;
+    Ok(())
+}
+
+async fn mount_inner(
+    state: &Arc<AppState>,
+    user: &User,
+    url: &str,
+    token: &str,
+    grant_id: i64,
+    alias: Option<String>,
+) -> Result<(i64, i64, String, String), AppError> {
+    let url = ssrf::normalize_url(url);
+    let target = target_for(state, &url).await?;
     let client = PeerClient::new(
         &url,
         &target.host,
         target.ip,
         target.port,
-        Some(&request.token),
+        Some(token),
         state.settings().settings.federation.request_timeout_seconds,
     )
     .map_err(AppError::internal)?;
@@ -207,7 +211,7 @@ pub async fn create(
         .and_then(|items| {
             items
                 .iter()
-                .find(|item| item.get("id").and_then(Value::as_i64) == Some(request.grant_id))
+                .find(|item| item.get("id").and_then(Value::as_i64) == Some(grant_id))
         })
         .ok_or(AppError::NotFound)?;
     let label = grant
@@ -223,22 +227,22 @@ pub async fn create(
     let key = crypto::mount_key(&state.db)
         .await
         .map_err(AppError::internal)?;
-    let ciphertext = crypto::encrypt(&key, &request.token).map_err(AppError::internal)?;
-    let alias = request.alias.unwrap_or_else(|| label.clone());
+    let ciphertext = crypto::encrypt(&key, token).map_err(AppError::internal)?;
+    let alias = alias.unwrap_or_else(|| label.clone());
     let sentinel = format!("/__filehub_remote__/{}", auth::random_token(12));
     let root_id = state
         .db
-        .federation_add_remote_root(current.user.id, &alias, &sentinel, mode != "rw")
+        .federation_add_remote_root(user.id, &alias, &sentinel, mode != "rw")
         .await
         .map_err(AppError::internal)?;
     let created = async {
         let mount_id = state
             .db
             .federation_create_mount(
-                current.user.id,
+                user.id,
                 root_id,
                 &url,
-                request.grant_id,
+                grant_id,
                 &label,
                 &mode,
                 info.get("server_version")
@@ -261,16 +265,148 @@ pub async fn create(
     let mount_id = match created {
         Ok(id) => id,
         Err(error) => {
-            let _ = state.db.delete_root(root_id, current.user.id).await;
+            let _ = state.db.delete_root(root_id, user.id).await;
             return Err(error);
         }
     };
+    state
+        .db
+        .federation_update_mount_capabilities(
+            mount_id,
+            user.id,
+            &serde_json::to_string(info.get("capabilities").unwrap_or(&json!([])))
+                .unwrap_or_else(|_| "[]".to_owned()),
+        )
+        .await
+        .ok();
+    Ok((mount_id, root_id, alias, mode))
+}
+
+pub async fn create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateMountRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    require_outbound(&state, &current.user)?;
+    ensure_mount_limit(&state, current.user.id).await?;
+    let (mount_id, root_id, alias, mode) = mount_inner(
+        &state,
+        &current.user,
+        &request.url,
+        &request.token,
+        request.grant_id,
+        request.alias,
+    )
+    .await?;
     Ok(Json(json!({
         "id": mount_id,
         "root_id": root_id,
         "alias": alias,
         "mode": mode,
         "grant_id": request.grant_id,
+    })))
+}
+
+pub async fn mount_grants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    require_outbound(&state, &current.user)?;
+    let mount = state
+        .db
+        .federation_mount(id, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let client = client_for_mount(&state, &mount).await?;
+    let value = client.grants().await.map_err(|error| error.into_app())?;
+    let mounts = state
+        .db
+        .federation_list_mounts(current.user.id)
+        .await
+        .map_err(AppError::internal)?;
+    let items: Vec<Value> = value
+        .get("grants")
+        .and_then(Value::as_array)
+        .map(|grants| {
+            grants
+                .iter()
+                .filter_map(|grant| {
+                    let grant_id = grant.get("id").and_then(Value::as_i64)?;
+                    let existing = mounts
+                        .iter()
+                        .find(|m| m.base_url == mount.base_url && m.grant_id == grant_id);
+                    Some(json!({
+                        "id": grant_id,
+                        "label": grant.get("label").cloned().unwrap_or(Value::Null),
+                        "mode": grant.get("mode").cloned().unwrap_or(Value::Null),
+                        "mounted": existing.is_some(),
+                        "mount_id": existing.map(|m| m.id),
+                        "current": grant_id == mount.grant_id,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "mount_id": mount.id,
+        "base_url": mount.base_url,
+        "grants": items,
+    })))
+}
+
+pub async fn attach_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, grant_id)): Path<(i64, i64)>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    require_outbound(&state, &current.user)?;
+    ensure_mount_limit(&state, current.user.id).await?;
+    let source = state
+        .db
+        .federation_mount(id, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let mounts = state
+        .db
+        .federation_list_mounts(current.user.id)
+        .await
+        .map_err(AppError::internal)?;
+    if mounts
+        .iter()
+        .any(|m| m.base_url == source.base_url && m.grant_id == grant_id)
+    {
+        return Err(AppError::Conflict(
+            "this grant is already mounted".to_owned(),
+        ));
+    }
+    let key = crypto::mount_key(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let token = crypto::decrypt(&key, &source.token_ciphertext)
+        .map_err(|_| AppError::RemoteTokenInvalid)?;
+    let (mount_id, root_id, alias, mode) = mount_inner(
+        &state,
+        &current.user,
+        &source.base_url,
+        &token,
+        grant_id,
+        None,
+    )
+    .await?;
+    Ok(Json(json!({
+        "id": mount_id,
+        "root_id": root_id,
+        "alias": alias,
+        "mode": mode,
+        "grant_id": grant_id,
     })))
 }
 

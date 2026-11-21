@@ -166,6 +166,11 @@
     cursor: pointer;
   }
 
+  .upload-retry {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
   .upload-actions button:hover,
   .upload-retry:hover {
     color: var(--text);
@@ -189,13 +194,21 @@
     display: grid;
     min-height: 44px;
     align-items: center;
-    grid-template-columns: minmax(0, 1fr) minmax(64px, 1.1fr) 4.4em 48px;
+    grid-template-columns: minmax(0, 1fr) minmax(64px, 1.1fr) 4.4em 72px;
     gap: 8px;
     border-top: 1px solid var(--border);
   }
 
   .upload-row:first-child {
     border-top: 0;
+  }
+
+  .upload-row-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
+    min-width: 0;
   }
 
   .upload-name {

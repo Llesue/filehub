@@ -719,11 +719,13 @@
     };
     window.addEventListener('pagehide', onPageHide);
     window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('paste', handleClipboardPaste);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('resize', updateVirtualRange);
       window.removeEventListener('pagehide', onPageHide);
       window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('paste', handleClipboardPaste);
       window.clearInterval(autoSaveTimer);
       window.clearInterval(clockTimer);
       window.clearInterval(presencePruneTimer);
@@ -1672,6 +1674,59 @@
     virtualEnd = Math.min(entries.length, endRow * metrics.columns);
     virtualPadTop = startRow * metrics.rowHeight;
     virtualPadBottom = Math.max(0, (totalRows - endRow) * metrics.rowHeight);
+  }
+
+  function clipboardStamp(now: Date): string {
+    const pad = (value: number) => String(value).padStart(2, '0');
+    return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(
+      now.getHours(),
+    )}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  }
+
+  function handleClipboardPaste(event: ClipboardEvent): void {
+    if (appView !== 'files' || activeRootId === null) return;
+    if (currentReadOnly || !remoteCan('uploads')) return;
+    if (isTypingTarget(event.target)) return;
+    const data = event.clipboardData;
+    if (!data) return;
+    const items = Array.from(data.items);
+    const image = items.find(
+      (item) => item.kind === 'file' && item.type.startsWith('image/'),
+    );
+    const text = items.find(
+      (item) => item.kind === 'string' && item.type === 'text/plain',
+    );
+    const stamp = clipboardStamp(new Date());
+    if (image) {
+      const blob = image.getAsFile();
+      if (!blob) return;
+      const extensions: Record<string, string> = {
+        'image/png': 'png',
+        'image/jpeg': 'jpg',
+        'image/gif': 'gif',
+        'image/webp': 'webp',
+      };
+      const extension = extensions[blob.type] ?? 'png';
+      const file = new File(
+        [blob],
+        `filehub_clipboard_${stamp}.${extension}`,
+        { type: blob.type },
+      );
+      event.preventDefault();
+      uploadManager.enqueue([{ file }], activeRootId, currentPath);
+      return;
+    }
+    if (text) {
+      const value = data.getData('text/plain');
+      if (!value) return;
+      const file = new File(
+        [value],
+        `filehub_clipboard_${stamp}.txt`,
+        { type: 'text/plain' },
+      );
+      event.preventDefault();
+      uploadManager.enqueue([{ file }], activeRootId, currentPath);
+    }
   }
 
   function isAbortError(error: unknown): boolean {

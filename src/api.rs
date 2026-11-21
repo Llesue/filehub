@@ -82,6 +82,14 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/remote/mounts/{id}/reauth",
             post(crate::federation::mounts::reauth),
         )
+        .route(
+            "/remote/mounts/{id}/grants",
+            get(crate::federation::mounts::mount_grants),
+        )
+        .route(
+            "/remote/mounts/{id}/grants/{grant_id}",
+            post(crate::federation::mounts::attach_grant),
+        )
         .route("/me/password", post(change_password))
         .route("/events", get(events_stream))
         .route(

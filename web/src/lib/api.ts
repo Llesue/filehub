@@ -634,6 +634,33 @@ export const api = {
     }, csrf);
   },
 
+  remoteMountGrants(id: number): Promise<{
+    mount_id: number;
+    base_url: string;
+    grants: Array<{
+      id: number;
+      label: string;
+      mode: 'ro' | 'rw';
+      mounted: boolean;
+      mount_id: number | null;
+      current: boolean;
+    }>;
+  }> {
+    return request(`/remote/mounts/${id}/grants`);
+  },
+
+  remoteAttachGrant(
+    id: number,
+    grantId: number,
+    csrf: string,
+  ): Promise<{ id: number; root_id: number; alias: string; mode: 'ro' | 'rw'; grant_id: number }> {
+    return request(
+      `/remote/mounts/${id}/grants/${grantId}`,
+      { method: 'POST' },
+      csrf,
+    );
+  },
+
   remoteMounts(): Promise<{ mounts: RemoteMount[] }> {
     return request('/remote/mounts');
   },
