@@ -464,6 +464,7 @@ pub async fn list(
             json!({
                 "name": entry.name,
                 "is_dir": entry.is_dir,
+                "is_symlink": entry.is_symlink,
                 "size": entry.size,
                 "modified": entry.modified,
                 "mime_type": entry.mime_type,
