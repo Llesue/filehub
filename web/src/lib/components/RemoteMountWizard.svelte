@@ -91,8 +91,12 @@
     }
   }
 
-  async function checkAddress(): Promise<void> {
-    await probeAddress(true);
+  async function nextStep(): Promise<void> {
+    if (!probe) {
+      await probeAddress(false);
+      if (!probe) return;
+    }
+    await checkToken();
   }
 
   async function checkToken(): Promise<void> {
@@ -176,6 +180,7 @@
             placeholder="https://nas.example.com"
             autocomplete="off"
             oninput={(event) => {
+              probe = null;
               const value = event.currentTarget.value;
               if (value.includes('fhfed_')) {
                 parseInvite(value);
@@ -186,23 +191,6 @@
             }}
           />
         </label>
-        {#if probe}
-          <div class="probe">
-            <strong>FileHub {probe.server_version}</strong>
-            <span>{probe.resolved_ips.join(', ')} · {probe.address_class}</span>
-            {#if probe.plaintext}
-              <em>{t($language, '明文 HTTP，同网段可能窃取令牌')}</em>
-            {/if}
-          </div>
-        {/if}
-        <p class="hint">{t($language, '先校验地址，未保存的令牌不会发送。')}</p>
-        <p class="hint">{t($language, '也可以直接粘贴对方给的邀请信息。')}</p>
-        <footer>
-          <button type="button" disabled={busy || !url.trim()} onclick={() => void checkAddress()}>
-            {probe ? t($language, '下一步') : t($language, '检测地址')}
-          </button>
-        </footer>
-      {:else if step === 2}
         {#if probe}
           <div class="probe">
             <strong>FileHub {probe.server_version}</strong>
@@ -232,11 +220,14 @@
             </button>
           </div>
         </label>
+        <p class="hint">{t($language, '先校验地址，未保存的令牌不会发送。')}</p>
+        <p class="hint">{t($language, '也可以直接粘贴对方给的邀请信息。')}</p>
         <footer>
-          <button type="button" class="ghost" onclick={() => (step = 1)}>
-            {t($language, '上一步')}
-          </button>
-          <button type="button" disabled={busy || !token.trim()} onclick={() => void checkToken()}>
+          <button
+            type="button"
+            disabled={busy || !url.trim() || !token.trim()}
+            onclick={() => void nextStep()}
+          >
             {t($language, '下一步')}
           </button>
         </footer>
@@ -263,7 +254,7 @@
           <input bind:value={alias} />
         </label>
         <footer>
-          <button type="button" class="ghost" onclick={() => (step = 2)}>
+          <button type="button" class="ghost" onclick={() => (step = 1)}>
             {t($language, '上一步')}
           </button>
           <button

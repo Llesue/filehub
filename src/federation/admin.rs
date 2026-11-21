@@ -247,6 +247,34 @@ pub async fn list_tokens(
     Ok(Json(json!({ "tokens": items })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateTokenRequest {
+    grant_ids: Vec<i64>,
+}
+
+pub async fn update_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<UpdateTokenRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    require_share(&state, &current.user)?;
+    if request.grant_ids.is_empty() || request.grant_ids.len() > 100 {
+        return Err(AppError::bad_request("select 1-100 grants"));
+    }
+    let changed = state
+        .db
+        .federation_update_token_grants(id, current.user.id, &request.grant_ids)
+        .await
+        .map_err(AppError::internal)?;
+    if !changed {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(json!({ "id": id, "grant_ids": request.grant_ids })))
+}
+
 pub async fn revoke_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

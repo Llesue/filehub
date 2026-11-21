@@ -583,6 +583,52 @@ async fn federation_security_and_idempotency() {
     let raw = created["token"].as_str().unwrap().to_owned();
     let created_id = created["id"].as_i64().unwrap();
 
+    let me = send(
+        &peer_instance.router,
+        Method::GET,
+        "/api/v1/me",
+        Some(&peer_instance.cookie),
+        None,
+    )
+    .await;
+    let me = json_body(me).await;
+    assert_eq!(me["remote"]["mount"].as_bool(), Some(true));
+    assert_eq!(me["remote"]["share"].as_bool(), Some(true));
+
+    std::fs::create_dir_all(peer_instance._dir.path().join("users/admin/shared/sub")).unwrap();
+    let second = send_json(
+        &peer_instance.router,
+        Method::POST,
+        "/api/v1/remote/grants",
+        Some(&peer_instance.cookie),
+        Some(&peer_instance.csrf),
+        json!({"root": peer_instance.root_id, "path": "shared/sub", "label": "Shared 2", "mode": "rw"}),
+    )
+    .await;
+    let second_id = json_body(second).await["id"].as_i64().unwrap();
+    let update = send_json(
+        &peer_instance.router,
+        Method::PATCH,
+        &format!("/api/v1/remote/tokens/{created_id}"),
+        Some(&peer_instance.cookie),
+        Some(&peer_instance.csrf),
+        json!({"grant_ids": [second_id]}),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+    let grants = peer(
+        &client,
+        &peer_instance.base,
+        Method::GET,
+        "/grants",
+        Some(&raw),
+        None,
+        None,
+    )
+    .await;
+    let grants = peer_json(grants).await;
+    assert_eq!(grants["grants"][0]["id"].as_i64(), Some(second_id));
+
     let mkdir = peer(
         &client,
         &peer_instance.base,
@@ -590,11 +636,12 @@ async fn federation_security_and_idempotency() {
         "/mkdir",
         Some(&raw),
         Some("key-1"),
-        Some(json!({"grant": grant_id, "path": "idem"})),
+        Some(json!({"grant": second_id, "path": "idem"})),
     )
     .await;
-    assert_eq!(mkdir.status(), StatusCode::CREATED);
+    let mkdir_status = mkdir.status();
     let first = mkdir.text().await.unwrap();
+    assert_eq!(mkdir_status, StatusCode::CREATED, "{first}");
 
     let replay = peer(
         &client,
@@ -603,7 +650,7 @@ async fn federation_security_and_idempotency() {
         "/mkdir",
         Some(&raw),
         Some("key-1"),
-        Some(json!({"grant": grant_id, "path": "idem"})),
+        Some(json!({"grant": second_id, "path": "idem"})),
     )
     .await;
     assert_eq!(replay.status(), StatusCode::CREATED);
@@ -616,7 +663,7 @@ async fn federation_security_and_idempotency() {
         "/mkdir",
         Some(&raw),
         Some("key-1"),
-        Some(json!({"grant": grant_id, "path": "idem-other"})),
+        Some(json!({"grant": second_id, "path": "idem-other"})),
     )
     .await;
     assert_eq!(mismatch.status(), StatusCode::CONFLICT);
@@ -646,7 +693,7 @@ async fn federation_security_and_idempotency() {
         "/mkdir",
         Some(&raw),
         Some("key-traversal"),
-        Some(json!({"grant": grant_id, "path": "../escape"})),
+        Some(json!({"grant": second_id, "path": "../escape"})),
     )
     .await;
     assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
@@ -659,7 +706,7 @@ async fn federation_security_and_idempotency() {
         Some(&raw),
         Some("key-upload"),
         Some(json!({
-            "grant": grant_id,
+            "grant": second_id,
             "dir": "",
             "filename": "guarded.txt",
             "total_size": 3,

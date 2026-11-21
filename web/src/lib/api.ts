@@ -97,6 +97,7 @@ export interface User {
 
 export interface AuthResponse {
   user: User;
+  remote?: { mount: boolean; share: boolean };
   csrf_token: string;
   auth: 'session' | 'token';
 }
@@ -589,6 +590,17 @@ export const api = {
 
   remoteRevokeToken(id: number, csrf: string): Promise<void> {
     return request(`/remote/tokens/${id}`, { method: 'DELETE' }, csrf);
+  },
+
+  remoteUpdateTokenGrants(
+    id: number,
+    grantIds: number[],
+    csrf: string,
+  ): Promise<{ id: number; grant_ids: number[] }> {
+    return request(`/remote/tokens/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ grant_ids: grantIds }),
+    }, csrf);
   },
 
   remoteRotateToken(

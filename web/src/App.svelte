@@ -90,6 +90,13 @@
   let user = $state<User | null>(null);
   let versionInfo = $state<VersionInfo | null>(null);
   let mountDialogOpen = $state(false);
+  let userRemote = $state<{ mount: boolean; share: boolean } | null>(null);
+  const canMountRemote = $derived(
+    userRemote?.mount ?? user?.features.federation_mount ?? false,
+  );
+  const canShareRemote = $derived(
+    userRemote?.share ?? user?.features.federation_share ?? false,
+  );
   let preferences = $state<UserPreferences | null>(null);
   let systemFeatures = $state<SystemFeatures>({ thumbnails: true, editor: true, terminal: true });
   let capabilities = $state<Capabilities>({ terminal: true, zip: true, unzip: true });
@@ -462,7 +469,7 @@
   const localRoots = $derived(roots.filter((root) => root.kind !== 'remote'));
   const remoteRoots = $derived(roots.filter((root) => root.kind === 'remote'));
   let remoteCaps = $state<Record<number, string[]>>({});
-  let remoteStates = $state<Record<number, RemoteMount['state']>>({});
+  let remoteMounts = $state<Record<number, RemoteMount>>({});
   let currentStale = $state(false);
   const activeRemoteCaps = $derived(
     activeRoot?.kind === 'remote' ? (remoteCaps[activeRoot.id] ?? []) : null,
@@ -472,9 +479,17 @@
   }
 
   function remoteStateBadge(rootId: number): string | null {
-    const state = remoteStates[rootId];
-    if (!state || state === 'online') return null;
-    return remoteStateLabel(state);
+    const mount = remoteMounts[rootId];
+    if (!mount || mount.state === 'online') return null;
+    return remoteStateLabel(mount.state);
+  }
+
+  function remoteTitle(rootId: number, fallback: string): string {
+    const mount = remoteMounts[rootId];
+    if (!mount) return fallback;
+    const mode = mount.mode === 'rw' ? t($language, '读写') : t($language, '只读');
+    const state = remoteStateLabel(mount.state);
+    return `${mount.alias} · ${mount.base_url} · ${mount.grant_label} · ${mode} · ${state}`;
   }
 
   function remoteStateLabel(state: RemoteMount['state']): string {
@@ -770,6 +785,7 @@
       try {
         const auth = await api.me();
         user = auth.user;
+        userRemote = auth.remote ?? null;
         csrf = auth.csrf_token;
         ensureNotificationOwner(auth.user.id);
         connectEvents(auth.user.id);
@@ -801,6 +817,7 @@
 
   function handleAuth(auth: AuthResponse): void {
     user = auth.user;
+    userRemote = auth.remote ?? null;
     csrf = auth.csrf_token;
     ensureNotificationOwner(auth.user.id);
     connectEvents(auth.user.id);
@@ -1133,13 +1150,13 @@
     try {
       const result = await api.remoteMounts();
       const next: Record<number, string[]> = {};
-      const states: Record<number, RemoteMount['state']> = {};
+      const mounts: Record<number, RemoteMount> = {};
       for (const mount of result.mounts) {
         next[mount.root_id] = mount.capabilities;
-        states[mount.root_id] = mount.state;
+        mounts[mount.root_id] = mount;
       }
       remoteCaps = next;
-      remoteStates = states;
+      remoteMounts = mounts;
     } catch (error) {
       console.debug('remote mount capabilities unavailable', error);
     }
@@ -4019,7 +4036,7 @@
                 type="button"
                 class:active={appView === 'files' && root.id === activeRootId}
                 class="nav-item"
-                title={rootLabel(root.alias)}
+                title={remoteTitle(root.id, rootLabel(root.alias))}
                 onclick={() => {
                   appView = 'files';
                   activeRootId = root.id;
@@ -4044,7 +4061,7 @@
               </button>
             {/each}
           {/if}
-          {#if user?.features.federation_mount}
+          {#if canMountRemote}
             {#if remoteRoots.length === 0}
               <div class="nav-sep"></div>
             {/if}
@@ -4163,26 +4180,14 @@
       {/if}
 
       <div class="main">
-        {#if appView === 'files' && activeRoot?.kind === 'remote'}
-          <div class="remote-banner">
-            <Icon name="link" size={14} />
-            <span>{t($language, '远程目录')} · {activeRoot.alias}</span>
-            {#if currentReadOnly}
-              <span class="readonly-tag">{t($language, '只读')}</span>
-            {/if}
-            {#if currentStale}
-              <span class="stale-tag">{t($language, '数据可能已过期')}</span>
-            {/if}
-            <button type="button" class="text-button" onclick={() => (mountDialogOpen = true)}>
-              {t($language, '挂载设置')}
-            </button>
-          </div>
-        {/if}
         {#if appView === 'files'}
           <div class="pathbar">
             {#if !searchActive}
               <div class="path-static">
                 <Icon name="folder" size={15} />
+                {#if currentStale}
+                  <span class="stale-dot" title={t($language, '数据可能已过期')}></span>
+                {/if}
                 {#if currentReadOnly}
                   <span
                     class="readonly-tag"
@@ -4369,6 +4374,7 @@
                     {preferences}
                     {capabilities}
                     system={systemFeatures}
+                    canShareRemote={canShareRemote}
                     onPreferences={applyPreferences}
                   />
                 {/if}
@@ -6061,12 +6067,11 @@
     background: var(--danger);
   }
 
-  .stale-tag {
-    padding: 1px 6px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    color: var(--text-2);
-    font-size: 11px;
+  .stale-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--warning, #d9a441);
   }
 
   .nav-add:hover:not(:disabled) {
@@ -6142,21 +6147,6 @@
     width: 0;
     height: 100%;
     background: var(--accent);
-  }
-
-  .remote-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 16px;
-    font-size: 12px;
-    color: var(--text-2);
-    background: var(--surface-2);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .remote-banner .text-button {
-    margin-left: auto;
   }
 
   .app-version {

@@ -45,7 +45,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route(
             "/remote/tokens/{id}",
-            axum::routing::delete(crate::federation::admin::revoke_token),
+            axum::routing::delete(crate::federation::admin::revoke_token)
+                .patch(crate::federation::admin::update_token),
         )
         .route(
             "/remote/tokens/{id}/rotate",
@@ -556,6 +557,7 @@ async fn me(
 
     Ok(Json(json!({
         "user": user_json(&current.user),
+        "remote": remote_capabilities(&state, &current.user),
         "csrf_token": current.csrf_token,
         "auth": auth_kind,
     })))
@@ -1452,6 +1454,7 @@ async fn session_response(
 
     let mut response = Json(json!({
         "user": user_json(user),
+        "remote": remote_capabilities(state, user),
         "csrf_token": csrf_token,
         "auth": "session",
     }))
@@ -1471,6 +1474,14 @@ fn settings_json(state: &Arc<AppState>) -> Value {
         "sources": snapshot.sources,
         "restart_required": snapshot.restart_required,
         "platform": std::env::consts::OS,
+    })
+}
+
+fn remote_capabilities(state: &Arc<AppState>, user: &User) -> Value {
+    let settings = state.settings();
+    json!({
+        "mount": settings.settings.federation.enabled_outbound && user.feature_federation_mount,
+        "share": settings.settings.federation.enabled_inbound && user.feature_federation_share,
     })
 }
 

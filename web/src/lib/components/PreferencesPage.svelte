@@ -14,6 +14,7 @@
     preferences,
     capabilities,
     system,
+    canShareRemote,
     onPreferences,
   }: {
     user: User;
@@ -21,10 +22,12 @@
     preferences: UserPreferences;
     capabilities: Capabilities;
     system: { thumbnails: boolean; editor: boolean; terminal: boolean };
+    canShareRemote: boolean;
     onPreferences: (preferences: UserPreferences) => void;
   } = $props();
 
   let passwordOpen = $state(false);
+  let sharingOpen = $state(false);
   let avatarInput = $state<HTMLInputElement | null>(null);
   let avatarCropSrc = $state('');
   let saving = $state(false);
@@ -120,8 +123,15 @@
     </div>
   </section>
 
-  {#if user.features.federation_share}
-    <RemoteSharing {csrf} />
+  {#if canShareRemote}
+    <section class="pref-card">
+      <h2>{t($language, '远程共享')}</h2>
+      <p class="hint">{t($language, '把本地目录授权给其他 FileHub 实例。')}</p>
+      <button type="button" class="pref-action" onclick={() => (sharingOpen = true)}>
+        {t($language, '管理远程共享')}
+      </button>
+    </section>
+    <RemoteSharing {csrf} open={sharingOpen} onClose={() => (sharingOpen = false)} />
   {/if}
 
   <section class="pref-card">
@@ -333,6 +343,16 @@
   .hidden-input {
     display: none;
   }
+  .pref-action {
+    align-self: flex-start;
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+    color: var(--text);
+    cursor: pointer;
+  }
+
   .pref-row {
     display: flex;
     min-height: 36px;

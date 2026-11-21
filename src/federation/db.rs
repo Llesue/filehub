@@ -884,3 +884,52 @@ impl Db {
         .await
     }
 }
+
+impl Db {
+    pub async fn federation_update_token_grants(
+        &self,
+        id: i64,
+        user_id: i64,
+        grant_ids: &[i64],
+    ) -> anyhow::Result<bool> {
+        let grant_ids = grant_ids.to_vec();
+        self.call(move |connection| {
+            let owned: Option<i64> = connection
+                .query_row(
+                    "SELECT id FROM federation_tokens \
+                     WHERE id = ?1 AND user_id = ?2 AND revoked = 0",
+                    params![id, user_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if owned.is_none() {
+                return Ok(false);
+            }
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM federation_token_grants WHERE token_id = ?1",
+                params![id],
+            )?;
+            for grant_id in grant_ids {
+                let valid: Option<i64> = transaction
+                    .query_row(
+                        "SELECT id FROM federation_grants \
+                         WHERE id = ?1 AND user_id = ?2 AND revoked = 0",
+                        params![grant_id, user_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if valid.is_some() {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO federation_token_grants (token_id, grant_id) \
+                         VALUES (?1, ?2)",
+                        params![id, grant_id],
+                    )?;
+                }
+            }
+            transaction.commit()?;
+            Ok(true)
+        })
+        .await
+    }
+}

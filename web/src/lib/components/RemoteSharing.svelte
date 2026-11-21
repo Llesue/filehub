@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import Icon from './Icon.svelte';
   import {
     api,
     ApiError,
@@ -9,11 +9,19 @@
   } from '../api';
   import { language, t } from '../i18n';
 
-  let { csrf }: { csrf: string } = $props();
+  let {
+    csrf,
+    open,
+    onClose,
+  }: { csrf: string; open: boolean; onClose: () => void } = $props();
 
   let grants = $state<RemoteGrantInfo[]>([]);
   let revokedGrants = $state<RemoteGrantInfo[]>([]);
   let tokens = $state<RemoteTokenInfo[]>([]);
+  let revokedTokens = $state<RemoteTokenInfo[]>([]);
+  let newGrantOpen = $state(false);
+  let newTokenOpen = $state(false);
+  let rotated = $state(false);
   let activity = $state<
     Array<{ op: string; path: string | null; status: number; bytes: number; created_at: number }>
   >([]);
@@ -31,11 +39,12 @@
   let browsePath = $state('');
   let browseDirs = $state<string[]>([]);
   let browseBusy = $state(false);
+  let addingToToken = $state<number | null>(null);
   let busy = $state(false);
   let error = $state('');
 
-  onMount(() => {
-    void load();
+  $effect(() => {
+    if (open) void load();
   });
 
   function message(value: unknown): string {
@@ -55,6 +64,7 @@
       grants = grantResult.grants.filter((grant) => !grant.revoked);
       revokedGrants = grantResult.grants.filter((grant) => grant.revoked);
       tokens = tokenResult.tokens.filter((token) => !token.revoked);
+      revokedTokens = tokenResult.tokens.filter((token) => token.revoked);
       activity = activityResult.activity.slice(0, 10);
       roots = rootResult.roots.filter((root) => root.kind !== 'remote');
       if (rootId === null && roots[0]) rootId = roots[0].id;
@@ -108,6 +118,7 @@
       await api.remoteCreateGrant(rootId, grantPath.trim(), label.trim(), mode, csrf);
       grantPath = '';
       label = '';
+      newGrantOpen = false;
       await load();
     } catch (value) {
       error = message(value);
@@ -145,9 +156,11 @@
         csrf,
       );
       newToken = result.token;
+      rotated = false;
       tokenName = '';
       selectedGrants = [];
       expiresDays = 0;
+      newTokenOpen = false;
       await load();
     } catch (value) {
       error = message(value);
@@ -191,12 +204,46 @@
     }
   }
 
+  async function updateTokenGrants(id: number, grantIds: number[]): Promise<void> {
+    busy = true;
+    error = '';
+    try {
+      await api.remoteUpdateTokenGrants(id, grantIds, csrf);
+      await load();
+    } catch (value) {
+      error = message(value);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function removeTokenGrant(id: number, grantId: number): Promise<void> {
+    const token = tokens.find((item) => item.id === id);
+    if (!token) return;
+    if (token.grant_ids.length <= 1) {
+      error = t($language, '令牌至少需要一个授权目录');
+      return;
+    }
+    await updateTokenGrants(
+      id,
+      token.grant_ids.filter((item) => item !== grantId),
+    );
+  }
+
+  async function addTokenGrant(id: number, grantId: number): Promise<void> {
+    const token = tokens.find((item) => item.id === id);
+    if (!token) return;
+    await updateTokenGrants(id, [...token.grant_ids, grantId]);
+    addingToToken = null;
+  }
+
   async function rotateToken(id: number): Promise<void> {
     busy = true;
     error = '';
     try {
       const result = await api.remoteRotateToken(id, csrf);
       newToken = result.token;
+      rotated = true;
       copiedKind = null;
       await load();
     } catch (value) {
@@ -212,8 +259,21 @@
   }
 </script>
 
-<section class="pref-card">
-  <h2>{t($language, '远程授权')}</h2>
+{#if open}
+  <div
+    class="backdrop"
+    role="presentation"
+    onclick={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}
+  >
+  <div class="pref-card dialog" role="dialog" aria-modal="true" aria-label={t($language, '远程共享')}>
+  <header>
+    <h2>{t($language, '远程共享')}</h2>
+    <button type="button" class="icon" aria-label={t($language, '关闭')} onclick={onClose}>
+      <Icon name="close" size={16} />
+    </button>
+  </header>
   <p class="hint">{t($language, '允许其他 FileHub 实例挂载你授权的目录。')}</p>
 
   {#if error}
@@ -238,6 +298,11 @@
     {/each}
   </div>
 
+  <button type="button" class="add-button" onclick={() => (newGrantOpen = !newGrantOpen)}>
+    {t($language, '添加授权目录')}
+  </button>
+  <p class="hint">{t($language, '路径留空表示授权整个根目录。')}</p>
+  {#if newGrantOpen}
   <div class="form">
     <label>
       <span>{t($language, '根目录')}</span>
@@ -269,6 +334,7 @@
       {t($language, '授权')}
     </button>
   </div>
+  {/if}
 
   <h3>{t($language, '访问令牌')}</h3>
   <div class="list">
@@ -278,9 +344,43 @@
           <strong>{token.name}</strong>
           <code>{token.prefix}…</code>
           <span class="count">
-            {token.grant_ids.length} {t($language, '个目录')} ·
             {t($language, '最近使用')} {formatDate(token.last_used_at)}
           </span>
+        </div>
+        <div class="tags">
+          {#each token.grant_ids as grantId (grantId)}
+            {@const grant = grants.find((item) => item.id === grantId)}
+            {#if grant}
+              <span class="tag">
+                {grant.label}
+                <button
+                  type="button"
+                  aria-label={t($language, '移除授权目录')}
+                  disabled={busy}
+                  onclick={() => void removeTokenGrant(token.id, grantId)}
+                >×</button>
+              </span>
+            {/if}
+          {/each}
+          <button
+            type="button"
+            class="tag-add"
+            aria-label={t($language, '增加授权目录')}
+            disabled={busy}
+            onclick={() => (addingToToken = addingToToken === token.id ? null : token.id)}
+          >+</button>
+          {#if addingToToken === token.id}
+            <div class="tag-picker">
+              {#each grants.filter((item) => !token.grant_ids.includes(item.id)) as grant (grant.id)}
+                <button type="button" disabled={busy} onclick={() => void addTokenGrant(token.id, grant.id)}>
+                  {grant.label}
+                </button>
+              {/each}
+              {#if grants.every((item) => token.grant_ids.includes(item.id))}
+                <span class="hint">{t($language, '没有更多目录')}</span>
+              {/if}
+            </div>
+          {/if}
         </div>
         <div class="row-actions">
           <button type="button" disabled={busy} onclick={() => void rotateToken(token.id)}>
@@ -294,6 +394,10 @@
     {/each}
   </div>
 
+  <button type="button" class="add-button" onclick={() => (newTokenOpen = !newTokenOpen)}>
+    {t($language, '新建令牌')}
+  </button>
+  {#if newTokenOpen}
   <div class="form">
     <label>
       <span>{t($language, '名称')}</span>
@@ -326,6 +430,7 @@
   >
     {t($language, '新建令牌')}
   </button>
+  {/if}
 
   {#if browseOpen}
     <div class="browser">
@@ -352,6 +457,20 @@
         {/if}
       </div>
     </div>
+  {/if}
+
+  {#if revokedTokens.length > 0}
+    <details class="revoked">
+      <summary>{t($language, '已撤销的令牌')} ({revokedTokens.length})</summary>
+      {#each revokedTokens as token (token.id)}
+        <div class="row muted">
+          <div class="meta">
+            <strong>{token.name}</strong>
+            <code>{token.prefix}…</code>
+          </div>
+        </div>
+      {/each}
+    </details>
   {/if}
 
   {#if revokedGrants.length > 0}
@@ -383,8 +502,15 @@
     </div>
   {/if}
 
+  <footer>
+    <button type="button" onclick={onClose}>{t($language, '关闭')}</button>
+  </footer>
+
   {#if newToken}
     <div class="token">
+      {#if rotated}
+        <p class="warn">{t($language, '轮换后旧令牌立即失效，已挂载的实例需要重新连接。')}</p>
+      {/if}
       <p>{t($language, '令牌只显示这一次')}</p>
       <code>{newToken}</code>
       <div class="token-actions">
@@ -398,9 +524,21 @@
       <p class="hint">{t($language, '邀请信息包含地址和令牌，对方粘贴后可直接挂载。')}</p>
     </div>
   {/if}
-</section>
+  </div>
+  </div>
+{/if}
 
 <style>
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.35);
+  }
+
   .pref-card {
     display: flex;
     flex-direction: column;
@@ -409,6 +547,35 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--surface);
+  }
+
+  .dialog {
+    width: min(860px, calc(100vw - 32px));
+    max-height: calc(100vh - 64px);
+    overflow: auto;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  header h2 {
+    margin: 0;
+  }
+
+  .icon {
+    margin-left: auto;
+    border: none;
+    background: transparent;
+    color: var(--text-2);
+    cursor: pointer;
+  }
+
+  footer {
+    display: flex;
+    justify-content: flex-end;
   }
 
   h2 {
@@ -432,6 +599,12 @@
 
   .error {
     color: var(--danger);
+  }
+
+  .warn {
+    margin: 0;
+    color: var(--danger);
+    font-size: 12.5px;
   }
 
   .list {
@@ -532,6 +705,51 @@
   .row-actions {
     display: flex;
     gap: 8px;
+  }
+
+  .add-button {
+    align-self: flex-start;
+  }
+
+  .tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .tag {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 12px;
+  }
+
+  .tag button {
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--text-2);
+    cursor: pointer;
+  }
+
+  .tag-add {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border-radius: 50%;
+  }
+
+  .tag-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
   }
 
   .browser {

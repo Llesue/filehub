@@ -1436,7 +1436,7 @@
 
 
       <div class="settings-group">
-        {@render groupHeading('联邦', FEDERATION_KEYS)}
+        {@render groupHeading('远程访问', FEDERATION_KEYS)}
         <p class="settings-hint">
           {t($language, '控制远程目录挂载与对外授权。默认关闭，按用户另行开启。')}
         </p>
