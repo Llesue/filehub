@@ -102,6 +102,8 @@
   let systemFeatures = $state<SystemFeatures>({ thumbnails: true, editor: true, terminal: true });
   let capabilities = $state<Capabilities>({ terminal: true, zip: true, unzip: true });
   let csrf = $state('');
+  let meRefreshInFlight = false;
+  let meRefreshQueued = false;
   let loggingOut = $state(false);
   let roots = $state<Root[]>([]);
   let activeRootId = $state<number | null>(null);
@@ -679,8 +681,7 @@
     const unsubscribeEvents = realtimeEvent.subscribe((event) => {
       if (!event) return;
       if (event.type === 'roots.changed') {
-        void refreshRoots();
-        void refreshRemoteCaps();
+        scheduleRootsRefresh();
         return;
       }
       if (event.type === 'remote.unmounted') {
@@ -706,18 +707,24 @@
         handlePresenceEvent(event.data);
       }
       if (event.type === 'user.features_changed') {
+        void refreshMe();
         void loadPreferences();
       }
-      if (event.type === 'roots.changed') {
-        scheduleRootsRefresh();
+      if (event.type === 'user.updated') {
+        if (user && Number(event.data.id) === user.id) {
+          void refreshMe();
+          void loadUsage();
+        }
       }
       if (event.type === 'settings.changed') {
+        void refreshMe();
         void loadPreferences();
         void loadBranding();
       }
       if (event.type === 'resync') {
         scheduleRootsRefresh();
         void loadUsage();
+        void refreshMe();
         void loadPreferences();
         if (user) void restoreJobs(user.id);
       }
@@ -763,6 +770,9 @@
       }
     }, 30_000);
     const clockTimer = window.setInterval(() => (clock = Date.now()), 60_000);
+    const remoteStatusTimer = window.setInterval(() => {
+      if (roots.some((root) => root.kind === 'remote')) void refreshRemoteCaps();
+    }, 60_000);
     const presencePruneTimer = window.setInterval(pruneRemotePresence, 5000);
     const onPageHide = () => {
       if (presenceRoot !== null) {
@@ -786,12 +796,14 @@
       window.removeEventListener('paste', handleClipboardPaste);
       window.clearInterval(autoSaveTimer);
       window.clearInterval(clockTimer);
+      window.clearInterval(remoteStatusTimer);
       window.clearInterval(presencePruneTimer);
       stopPresenceHeartbeat();
       unsubscribeEvents();
       if (usagePollTimer) clearTimeout(usagePollTimer);
       if (bootSlowTimer) clearTimeout(bootSlowTimer);
       if (filesSlowTimer) clearTimeout(filesSlowTimer);
+      if (rootsRefreshTimer !== null) clearTimeout(rootsRefreshTimer);
     };
   });
 
@@ -908,6 +920,36 @@
     void loadPreferences();
     void loadRoots();
     void loadVersionInfo();
+  }
+
+  async function refreshMe(): Promise<void> {
+    if (meRefreshInFlight) {
+      meRefreshQueued = true;
+      return;
+    }
+    meRefreshInFlight = true;
+    try {
+      do {
+        meRefreshQueued = false;
+        try {
+          const auth = await api.me();
+          user = auth.user;
+          userRemote = auth.remote ?? null;
+          csrf = auth.csrf_token;
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 401) {
+            uploadManager.detach();
+            user = null;
+            userRemote = null;
+            csrf = '';
+            return;
+          }
+          console.warn('could not refresh session', error);
+        }
+      } while (meRefreshQueued);
+    } finally {
+      meRefreshInFlight = false;
+    }
   }
 
   async function restoreJobs(userId: number): Promise<void> {
@@ -1158,6 +1200,7 @@
       uploadManager.detach();
       jobProgressRestored = false;
       user = null;
+      userRemote = null;
       preferences = null;
       csrf = '';
       disconnectEvents();
@@ -1258,6 +1301,8 @@
       await loadList(next.id, next.id === activeRootId ? currentPath : '');
       void refreshRemoteCaps();
     } catch (error) {
+      filesLoading = false;
+      filesLoadedOnce = false;
       handleFilesError(error);
     }
   }
@@ -1832,6 +1877,7 @@
     if (error instanceof ApiError && error.status === 401) {
       uploadManager.detach();
       user = null;
+      userRemote = null;
       csrf = '';
       return;
     }

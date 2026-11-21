@@ -506,3 +506,42 @@ async fn edit_presence_is_scoped_to_the_same_user_and_file() {
     .await;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn user_updates_are_published_to_the_admin_list_and_the_affected_user() {
+    let app = setup_app().await;
+    let mut events = app.state.events.subscribe();
+    let response = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/admin/users/1",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({ "feature_terminal": true }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut admin_event = false;
+    let mut scoped_event = false;
+    for _ in 0..10 {
+        let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), events.recv()).await
+        else {
+            break;
+        };
+        if event.event != "user.updated" || event.data["id"] != 1 {
+            continue;
+        }
+        admin_event |= event.admin_only;
+        scoped_event |= event.user_id == Some(1);
+        if admin_event && scoped_event {
+            break;
+        }
+    }
+    assert!(admin_event, "administrators need a user.updated event");
+    assert!(
+        scoped_event,
+        "the affected user needs a scoped user.updated event"
+    );
+}

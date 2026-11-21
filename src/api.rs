@@ -959,6 +959,14 @@ async fn update_user(
     state
         .events
         .publish_admin("user.updated", json!({ "id": id, "action": "updated" }));
+    // The admin event keeps the user list fresh for administrators. The
+    // scoped event lets the affected user refresh their own role, quota and
+    // feature flags without waiting for a page reload.
+    state.events.publish(
+        "user.updated",
+        Some(id),
+        json!({ "id": id, "action": "updated" }),
+    );
 
     Ok(Json(json!({ "user": user_json(&user) })))
 }
@@ -1050,6 +1058,12 @@ async fn delete_user(
     state
         .events
         .publish_admin("user.updated", json!({ "id": id, "action": "deleted" }));
+    // Let the deleted account drop out of its open session immediately.
+    state.events.publish(
+        "user.updated",
+        Some(id),
+        json!({ "id": id, "action": "deleted" }),
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
