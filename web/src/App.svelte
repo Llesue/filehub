@@ -118,7 +118,8 @@
   let dirSizes = $state<Record<string, { size: number; stale: boolean } | null>>({});
   let dirSizeErrors = $state<Record<string, string | null>>({});
   let selectionAnchor = $state<string | null>(null);
-  let filesLoading = $state(false);
+  let filesLoading = $state(true);
+  let filesLoadedOnce = $state(false);
   let filesRefreshing = $state(false);
   let filesLoadingMore = $state(false);
   let listGeneration = 0;
@@ -837,6 +838,9 @@
     user = auth.user;
     userRemote = auth.remote ?? null;
     csrf = auth.csrf_token;
+    entries = [];
+    filesLoading = true;
+    filesLoadedOnce = false;
     ensureNotificationOwner(auth.user.id);
     connectEvents(auth.user.id);
     attachUploads(auth.user.id);
@@ -1145,6 +1149,8 @@
         currentReadOnly = false;
         currentReadOnlyReason = null;
         entries = [];
+        filesLoading = false;
+        filesLoadedOnce = false;
         filesError = t($language, '当前账号还没有可访问的目录');
         return;
       }
@@ -1189,9 +1195,13 @@
       if (!next) {
         activeRootId = null;
         currentPath = '';
+        viewRootId = null;
+        viewPath = '';
         currentReadOnly = false;
         currentReadOnlyReason = null;
         entries = [];
+        filesLoading = false;
+        filesLoadedOnce = false;
         filesError = t($language, '当前账号还没有可访问的目录');
         return;
       }
@@ -1256,6 +1266,7 @@
     const refreshing =
       viewRootId === rootId && viewPath === path && entries.length > 0;
     filesLoading = !refreshing;
+    if (!refreshing) filesLoadedOnce = false;
     filesRefreshing = refreshing;
     filesError = '';
     thumbFailures = {};
@@ -1302,6 +1313,7 @@
         : null;
       currentStale = result.stale === true;
       entries = result.entries;
+      filesLoadedOnce = true;
       nextCursor = result.next_cursor;
       scheduleRemoteThumbWarm(result.root, result.path, result.entries);
       loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration, true);
@@ -4840,7 +4852,7 @@
                     </button>
                   </div>
                 {/if}
-                {#if entries.length === 0}
+                {#if filesLoadedOnce && entries.length === 0}
                   <section class="empty-state" aria-labelledby="empty-title">
                     <div class="empty-icon">
                       <Icon name="folder" size={52} />

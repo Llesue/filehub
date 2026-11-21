@@ -42,6 +42,14 @@ pub async fn list(
         .max(1);
     let now = crate::db::unix_now();
     let cached = state.federation_cache.lock().get(&key).cloned();
+    // An empty cached page is worse than no cache: it flashes an empty folder
+    // until the background revalidation finishes. Always fetch empty pages.
+    let cached = cached.filter(|(_, value)| {
+        value
+            .get("entries")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+    });
     if let Some((at, value)) = cached {
         if now.saturating_sub(at) < revalidate {
             sync_mode(state, &mount, &value).await;
