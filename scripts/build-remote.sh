@@ -64,11 +64,11 @@ if [[ -z "$DEFAULT_JOBS" ]]; then
   # Hyper-V dynamic memory may report only the current balloon size; use the
   # configured maximum when it is available.
   [[ "$MAX_KB" -gt "$MEM_KB" ]] && MEM_KB="$MAX_KB"
-  # Keep roughly 1.5 GiB per rustc; the linker needs headroom too.
-  JOBS=$(( MEM_KB / 1500000 ))
+  # Keep roughly 1.25 GiB per rustc; the linker needs headroom too.
+  JOBS=$(( MEM_KB / 1250000 ))
   [[ "$JOBS" -gt "$NPROC" ]] && JOBS="$NPROC"
   [[ "$JOBS" -lt 1 ]] && JOBS=1
-  [[ "$JOBS" -gt 6 ]] && JOBS=6
+  [[ "$JOBS" -gt 8 ]] && JOBS=8
 else
   JOBS="$DEFAULT_JOBS"
 fi
