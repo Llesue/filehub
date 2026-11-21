@@ -475,7 +475,11 @@
     activeRoot?.kind === 'remote' ? (remoteCaps[activeRoot.id] ?? []) : null,
   );
   function remoteCan(capability: string): boolean {
-    return activeRemoteCaps === null || activeRemoteCaps.includes(capability);
+    return (
+      activeRemoteCaps === null ||
+      activeRemoteCaps.length === 0 ||
+      activeRemoteCaps.includes(capability)
+    );
   }
 
   function remoteStateBadge(rootId: number): string | null {
@@ -1143,6 +1147,7 @@
         return;
       }
       await loadList(next.id, '');
+      void refreshRemoteCaps();
     } catch (error) {
       handleFilesError(error);
     }

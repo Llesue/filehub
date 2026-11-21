@@ -16,9 +16,7 @@
   }: { csrf: string; open: boolean; onClose: () => void } = $props();
 
   let grants = $state<RemoteGrantInfo[]>([]);
-  let revokedGrants = $state<RemoteGrantInfo[]>([]);
   let tokens = $state<RemoteTokenInfo[]>([]);
-  let revokedTokens = $state<RemoteTokenInfo[]>([]);
   let newGrantOpen = $state(false);
   let newTokenOpen = $state(false);
   let rotated = $state(false);
@@ -62,9 +60,7 @@
         api.remoteActivity(),
       ]);
       grants = grantResult.grants.filter((grant) => !grant.revoked);
-      revokedGrants = grantResult.grants.filter((grant) => grant.revoked);
       tokens = tokenResult.tokens.filter((token) => !token.revoked);
-      revokedTokens = tokenResult.tokens.filter((token) => token.revoked);
       activity = activityResult.activity.slice(0, 10);
       roots = rootResult.roots.filter((root) => root.kind !== 'remote');
       if (rootId === null && roots[0]) rootId = roots[0].id;
@@ -287,6 +283,13 @@
     <p class="error">{error}</p>
   {/if}
 
+  <div class="section-head">
+    <h3>{t($language, '共享目录')}</h3>
+    <button type="button" class="add-button" onclick={() => (newGrantOpen = !newGrantOpen)}>
+      {t($language, '添加授权目录')}
+    </button>
+  </div>
+
   <div class="list">
     {#each grants as grant (grant.id)}
       <div class="row">
@@ -305,12 +308,9 @@
     {/each}
   </div>
 
-  <button type="button" class="add-button" onclick={() => (newGrantOpen = !newGrantOpen)}>
-    {t($language, '添加授权目录')}
-  </button>
-  <p class="hint">{t($language, '路径留空表示授权整个根目录。')}</p>
   {#if newGrantOpen}
-  <div class="form">
+  <div class="form form-card">
+    <p class="hint">{t($language, '路径留空表示授权整个根目录。')}</p>
     <label>
       <span>{t($language, '根目录')}</span>
       <select bind:value={rootId}>
@@ -343,69 +343,74 @@
   </div>
   {/if}
 
-  <h3>{t($language, '访问令牌')}</h3>
+  <div class="section-head">
+    <h3>{t($language, '访问令牌')}</h3>
+    <button type="button" class="add-button" onclick={() => (newTokenOpen = !newTokenOpen)}>
+      {t($language, '新建令牌')}
+    </button>
+  </div>
+
   <div class="list">
     {#each tokens as token (token.id)}
-      <div class="row">
-        <div class="meta">
+      <div class="token-row">
+        <div class="token-head">
           <strong>{token.name}</strong>
           <code>{token.prefix}…</code>
           <span class="count">
             {t($language, '最近使用')} {formatDate(token.last_used_at)}
           </span>
         </div>
-        <div class="tags">
-          {#each token.grant_ids as grantId (grantId)}
-            {@const grant = grants.find((item) => item.id === grantId)}
-            {#if grant}
-              <span class="tag">
-                {grant.label}
-                <button
-                  type="button"
-                  aria-label={t($language, '移除授权目录')}
-                  disabled={busy}
-                  onclick={() => void removeTokenGrant(token.id, grantId)}
-                >×</button>
-              </span>
-            {/if}
-          {/each}
-          <button
-            type="button"
-            class="tag-add"
-            aria-label={t($language, '增加授权目录')}
-            disabled={busy}
-            onclick={() => (addingToToken = addingToToken === token.id ? null : token.id)}
-          >+</button>
-          {#if addingToToken === token.id}
-            <div class="tag-picker">
-              {#each grants.filter((item) => !token.grant_ids.includes(item.id)) as grant (grant.id)}
-                <button type="button" disabled={busy} onclick={() => void addTokenGrant(token.id, grant.id)}>
+        <div class="token-body">
+          <div class="tags">
+            {#each token.grant_ids as grantId (grantId)}
+              {@const grant = grants.find((item) => item.id === grantId)}
+              {#if grant}
+                <span class="tag">
                   {grant.label}
-                </button>
-              {/each}
-              {#if grants.every((item) => token.grant_ids.includes(item.id))}
-                <span class="hint">{t($language, '没有更多目录')}</span>
+                  <button
+                    type="button"
+                    aria-label={t($language, '移除授权目录')}
+                    disabled={busy}
+                    onclick={() => void removeTokenGrant(token.id, grantId)}
+                  >×</button>
+                </span>
               {/if}
-            </div>
-          {/if}
-        </div>
-        <div class="row-actions">
-          <button type="button" disabled={busy} onclick={() => void rotateToken(token.id)}>
-            {t($language, '轮换')}
-          </button>
-          <button type="button" class="danger" disabled={busy} onclick={() => void revokeToken(token.id)}>
-            {t($language, '撤销')}
-          </button>
+            {/each}
+            <button
+              type="button"
+              class="tag-add"
+              aria-label={t($language, '增加授权目录')}
+              disabled={busy}
+              onclick={() => (addingToToken = addingToToken === token.id ? null : token.id)}
+            >+</button>
+            {#if addingToToken === token.id}
+              <div class="tag-picker">
+                {#each grants.filter((item) => !token.grant_ids.includes(item.id)) as grant (grant.id)}
+                  <button type="button" disabled={busy} onclick={() => void addTokenGrant(token.id, grant.id)}>
+                    {grant.label}
+                  </button>
+                {/each}
+                {#if grants.every((item) => token.grant_ids.includes(item.id))}
+                  <span class="hint">{t($language, '没有更多目录')}</span>
+                {/if}
+              </div>
+            {/if}
+          </div>
+          <div class="row-actions">
+            <button type="button" disabled={busy} onclick={() => void rotateToken(token.id)}>
+              {t($language, '轮换')}
+            </button>
+            <button type="button" class="danger" disabled={busy} onclick={() => void revokeToken(token.id)}>
+              {t($language, '撤销')}
+            </button>
+          </div>
         </div>
       </div>
     {/each}
   </div>
 
-  <button type="button" class="add-button" onclick={() => (newTokenOpen = !newTokenOpen)}>
-    {t($language, '新建令牌')}
-  </button>
   {#if newTokenOpen}
-  <div class="form">
+  <div class="form form-card">
     <label>
       <span>{t($language, '名称')}</span>
       <input bind:value={tokenName} />
@@ -466,48 +471,22 @@
     </div>
   {/if}
 
-  {#if revokedTokens.length > 0}
-    <details class="revoked">
-      <summary>{t($language, '已撤销的令牌')} ({revokedTokens.length})</summary>
-      {#each revokedTokens as token (token.id)}
-        <div class="row muted">
-          <div class="meta">
-            <strong>{token.name}</strong>
-            <code>{token.prefix}…</code>
+  <details class="recent">
+    <summary>{t($language, '最近访问')}</summary>
+    {#if activity.length === 0}
+      <p class="hint">{t($language, '还没有其他实例访问过授权的目录。')}</p>
+    {:else}
+      <div class="activity">
+        {#each activity as entry, index (index)}
+          <div class="activity-row">
+            <code>{entry.op}</code>
+            <span class="path" title={entry.path ?? ''}>{entry.path ?? '—'}</span>
+            <span class="count">{formatDate(entry.created_at)}</span>
           </div>
-        </div>
-      {/each}
-    </details>
-  {/if}
-
-  {#if revokedGrants.length > 0}
-    <details class="revoked">
-      <summary>{t($language, '已撤销的授权')} ({revokedGrants.length})</summary>
-      {#each revokedGrants as grant (grant.id)}
-        <div class="row muted">
-          <div class="meta">
-            <strong>{grant.label}</strong>
-            <span class="path" title={grant.path}>{grant.path}</span>
-          </div>
-        </div>
-      {/each}
-    </details>
-  {/if}
-
-  <h3>{t($language, '最近访问')}</h3>
-  {#if activity.length === 0}
-    <p class="hint">{t($language, '还没有其他实例访问过授权的目录。')}</p>
-  {:else}
-    <div class="activity">
-      {#each activity as entry, index (index)}
-        <div class="activity-row">
-          <code>{entry.op}</code>
-          <span class="path" title={entry.path ?? ''}>{entry.path ?? '—'}</span>
-          <span class="count">{formatDate(entry.created_at)}</span>
-        </div>
-      {/each}
-    </div>
-  {/if}
+        {/each}
+      </div>
+    {/if}
+  </details>
 
   <footer>
     <button type="button" onclick={onClose}>{t($language, '关闭')}</button>
@@ -714,8 +693,68 @@
     gap: 8px;
   }
 
+  .section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 6px;
+  }
+
+  .section-head h3 {
+    margin: 0;
+  }
+
   .add-button {
-    align-self: flex-start;
+    padding: 5px 10px;
+    font-size: 12.5px;
+  }
+
+  .form-card {
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+  }
+
+  .token-row {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+
+  .token-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: baseline;
+  }
+
+  .token-head .count {
+    margin-left: auto;
+  }
+
+  .token-body {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .recent {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+
+  .recent summary {
+    cursor: pointer;
+    color: var(--text-2);
+    font-size: 12.5px;
   }
 
   .tags {
@@ -787,22 +826,6 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
-  }
-
-  .revoked {
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 10px;
-  }
-
-  .revoked summary {
-    cursor: pointer;
-    color: var(--text-2);
-    font-size: 12.5px;
-  }
-
-  .row.muted {
-    opacity: 0.65;
   }
 
   .activity {
