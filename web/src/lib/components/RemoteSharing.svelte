@@ -22,7 +22,7 @@
   let selectedGrants = $state<number[]>([]);
   let expiresDays = $state(0);
   let newToken = $state('');
-  let copied = $state(false);
+  let copiedKind = $state<'token' | 'invite' | null>(null);
   let busy = $state(false);
   let error = $state('');
 
@@ -86,7 +86,7 @@
     busy = true;
     error = '';
     newToken = '';
-    copied = false;
+    copiedKind = null;
     try {
       const expiresAt =
         expiresDays > 0 ? Math.floor(Date.now() / 1000) + expiresDays * 86400 : null;
@@ -124,9 +124,37 @@
   async function copyToken(): Promise<void> {
     try {
       await navigator.clipboard.writeText(newToken);
-      copied = true;
+      copiedKind = 'token';
     } catch {
-      copied = false;
+      copiedKind = null;
+    }
+  }
+
+  function inviteText(token: string): string {
+    return `FileHub 远程目录\n地址: ${window.location.origin}\n令牌: ${token}`;
+  }
+
+  async function copyInvite(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(inviteText(newToken));
+      copiedKind = 'invite';
+    } catch {
+      copiedKind = null;
+    }
+  }
+
+  async function rotateToken(id: number): Promise<void> {
+    busy = true;
+    error = '';
+    try {
+      const result = await api.remoteRotateToken(id, csrf);
+      newToken = result.token;
+      copiedKind = null;
+      await load();
+    } catch (value) {
+      error = message(value);
+    } finally {
+      busy = false;
     }
   }
 
@@ -203,9 +231,14 @@
             {t($language, '最近使用')} {formatDate(token.last_used_at)}
           </span>
         </div>
-        <button type="button" class="danger" disabled={busy} onclick={() => void revokeToken(token.id)}>
-          {t($language, '撤销')}
-        </button>
+        <div class="row-actions">
+          <button type="button" disabled={busy} onclick={() => void rotateToken(token.id)}>
+            {t($language, '轮换')}
+          </button>
+          <button type="button" class="danger" disabled={busy} onclick={() => void revokeToken(token.id)}>
+            {t($language, '撤销')}
+          </button>
+        </div>
       </div>
     {/each}
   </div>
@@ -247,9 +280,15 @@
     <div class="token">
       <p>{t($language, '令牌只显示这一次')}</p>
       <code>{newToken}</code>
-      <button type="button" onclick={() => void copyToken()}>
-        {copied ? t($language, '已复制') : t($language, '复制')}
-      </button>
+      <div class="token-actions">
+        <button type="button" onclick={() => void copyToken()}>
+          {copiedKind === 'token' ? t($language, '已复制') : t($language, '复制令牌')}
+        </button>
+        <button type="button" onclick={() => void copyInvite()}>
+          {copiedKind === 'invite' ? t($language, '已复制') : t($language, '复制邀请信息')}
+        </button>
+      </div>
+      <p class="hint">{t($language, '邀请信息包含地址和令牌，对方粘贴后可直接挂载。')}</p>
     </div>
   {/if}
 </section>
@@ -381,6 +420,16 @@
 
   .danger {
     color: var(--danger);
+  }
+
+  .row-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .token-actions {
+    display: flex;
+    gap: 8px;
   }
 
   .grants {

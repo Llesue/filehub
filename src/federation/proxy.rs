@@ -292,6 +292,7 @@ pub async fn delete_many(
     Ok(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_upload(
     state: &Arc<AppState>,
     user_id: i64,
@@ -300,10 +301,20 @@ pub async fn create_upload(
     filename: &str,
     total_size: i64,
     chunk_size: i64,
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
 ) -> Result<Json<Value>, AppError> {
     let (client, mount) = client_for_root(state, user_id, root.id).await?;
     let value = client
-        .create_upload(mount.grant_id, dir, filename, total_size, chunk_size)
+        .create_upload(
+            mount.grant_id,
+            dir,
+            filename,
+            total_size,
+            chunk_size,
+            if_match,
+            if_none_match,
+        )
         .await
         .map_err(|error| error.into_app())?;
     let peer_id = value
@@ -334,6 +345,8 @@ pub async fn create_upload(
         created_at: now,
         updated_at: now,
         remote_upload_id: Some(peer_id),
+        if_match: None,
+        if_none_match: None,
     };
     state
         .db
@@ -445,6 +458,62 @@ pub async fn cancel_upload(
     Ok(())
 }
 
+pub async fn thumb_warm(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root: &Root,
+    paths: &[String],
+    width: u32,
+) -> Result<Json<Value>, AppError> {
+    let (client, mount) = client_for_root(state, user_id, root.id).await?;
+    let value = client
+        .thumb_warm(mount.grant_id, paths, width)
+        .await
+        .map_err(|error| error.into_app())?;
+    Ok(Json(value))
+}
+
+pub async fn audio_info(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root: &Root,
+    path: &str,
+) -> Result<Json<Value>, AppError> {
+    let (client, mount) = client_for_root(state, user_id, root.id).await?;
+    let value = client
+        .audio_info(mount.grant_id, path)
+        .await
+        .map_err(|error| error.into_app())?;
+    Ok(Json(value))
+}
+
+pub async fn unzip(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root: &Root,
+    path: &str,
+    target: Option<&str>,
+) -> Result<Json<Value>, AppError> {
+    let (client, mount) = client_for_root(state, user_id, root.id).await?;
+    let value = client
+        .unzip(mount.grant_id, path, target)
+        .await
+        .map_err(|error| error.into_app())?;
+    invalidate_root(state, root.id);
+    audit_remote(state, user_id, "unzip", Some(path), None).await;
+    let name = value
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or(path)
+        .to_owned();
+    Ok(Json(json!({
+        "job_id": null,
+        "status": "completed",
+        "name": name,
+        "entries": value.get("entries").cloned().unwrap_or(Value::Null),
+    })))
+}
+
 pub async fn thumb(
     state: &Arc<AppState>,
     user_id: i64,
@@ -512,59 +581,274 @@ pub async fn search(
     })))
 }
 
+struct RemoteZipEntry {
+    name: String,
+    remote_path: Option<String>,
+    is_dir: bool,
+}
+
+fn zip_entry_name(name: &str) -> Result<(), AppError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(AppError::invalid_path("invalid archive entry name"));
+    }
+    Ok(())
+}
+
+async fn collect_remote_zip(
+    client: &crate::federation::client::PeerClient,
+    grant: i64,
+    selected: &[String],
+    max_bytes: u64,
+    max_files: usize,
+) -> Result<(Vec<RemoteZipEntry>, u64, usize), AppError> {
+    let mut entries: Vec<RemoteZipEntry> = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut file_count = 0_usize;
+    for path in selected {
+        if path.is_empty() {
+            return Err(AppError::invalid_path("cannot archive the root directory"));
+        }
+        let stat = client
+            .stat(grant, path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let is_dir = stat.get("is_dir").and_then(Value::as_bool) == Some(true);
+        if !is_dir {
+            let size = stat.get("size").and_then(Value::as_u64).unwrap_or(0);
+            total_bytes = total_bytes.saturating_add(size);
+            if total_bytes > max_bytes {
+                return Err(AppError::too_large(
+                    "file exceeds the configured size limit",
+                ));
+            }
+            file_count += 1;
+            if file_count > max_files {
+                return Err(AppError::too_large("zip exceeds the configured file limit"));
+            }
+            let name = path.rsplit('/').next().unwrap_or(path.as_str()).to_owned();
+            entries.push(RemoteZipEntry {
+                name,
+                remote_path: Some(path.clone()),
+                is_dir: false,
+            });
+            continue;
+        }
+        let prefix = path.rsplit('/').next().unwrap_or(path.as_str()).to_owned();
+        let mut stack = vec![(path.clone(), prefix, 0_usize)];
+        while let Some((directory, prefix, depth)) = stack.pop() {
+            if depth > 64 {
+                return Err(AppError::bad_request("directory tree is too deep"));
+            }
+            if entries.len() > max_files.saturating_mul(4).saturating_add(1000) {
+                return Err(AppError::too_large("zip contains too many entries"));
+            }
+            entries.push(RemoteZipEntry {
+                name: prefix.clone(),
+                remote_path: None,
+                is_dir: true,
+            });
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = client
+                    .list(grant, &directory, cursor.as_deref(), 1000, "name", "asc")
+                    .await
+                    .map_err(|error| error.into_app())?;
+                let items = page
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for item in items {
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    zip_entry_name(&name)?;
+                    let child_prefix = format!("{prefix}/{name}");
+                    let child_path = if directory.is_empty() {
+                        name
+                    } else {
+                        format!("{directory}/{name}")
+                    };
+                    if item.get("is_dir").and_then(Value::as_bool) == Some(true) {
+                        stack.push((child_path, child_prefix, depth + 1));
+                    } else {
+                        let size = item.get("size").and_then(Value::as_u64).unwrap_or(0);
+                        total_bytes = total_bytes.saturating_add(size);
+                        if total_bytes > max_bytes {
+                            return Err(AppError::too_large(
+                                "file exceeds the configured size limit",
+                            ));
+                        }
+                        file_count += 1;
+                        if file_count > max_files {
+                            return Err(AppError::too_large(
+                                "zip exceeds the configured file limit",
+                            ));
+                        }
+                        entries.push(RemoteZipEntry {
+                            name: child_prefix,
+                            remote_path: Some(child_path),
+                            is_dir: false,
+                        });
+                    }
+                }
+                cursor = page
+                    .get("next_cursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok((entries, total_bytes, file_count))
+}
+
+pub(crate) async fn spool_download(
+    client: &crate::federation::client::PeerClient,
+    grant: i64,
+    remote: &str,
+    target: &std::path::Path,
+    max_bytes: u64,
+) -> Result<u64, AppError> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let response = client
+        .download(grant, remote, false, &HeaderMap::new())
+        .await
+        .map_err(|error| error.into_app())?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > max_bytes)
+    {
+        return Err(AppError::too_large(
+            "file exceeds the configured size limit",
+        ));
+    }
+    let mut file = tokio::fs::File::create(target)
+        .await
+        .map_err(crate::fsops::io_error)?;
+    let mut stream = response.bytes_stream();
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            AppError::internal(anyhow::anyhow!("peer download failed: {error}"))
+        })?;
+        written = written.saturating_add(chunk.len() as u64);
+        if written > max_bytes {
+            let _ = tokio::fs::remove_file(target).await;
+            return Err(AppError::too_large(
+                "file exceeds the configured size limit",
+            ));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(crate::fsops::io_error)?;
+    }
+    file.flush().await.map_err(crate::fsops::io_error)?;
+    Ok(written)
+}
+
 pub async fn zip_files(
     state: &Arc<AppState>,
     user_id: i64,
     root: &Root,
     paths: Vec<String>,
 ) -> Result<Response, AppError> {
+    use tokio_util::io::{ReaderStream, SyncIoBridge};
+
     let (client, mount) = client_for_root(state, user_id, root.id).await?;
-    let max_bytes = state.settings().settings.downloads.zip_max_bytes;
-    let mut total = 0_u64;
-    let mut buffer = std::io::Cursor::new(Vec::new());
-    {
-        use std::io::Write;
-        let mut archive = zip::ZipWriter::new(&mut buffer);
-        for path in paths {
-            let stat = client
-                .stat(mount.grant_id, &path)
-                .await
-                .map_err(|error| error.into_app())?;
-            if stat.get("is_dir").and_then(Value::as_bool) == Some(true) {
-                return Err(AppError::bad_request(
-                    "remote ZIP currently supports files only",
-                ));
-            }
-            let (bytes, _) = client
-                .read_bytes(mount.grant_id, &path, max_bytes)
-                .await
-                .map_err(|error| error.into_app())?;
-            total = total.saturating_add(bytes.len() as u64);
-            if total > max_bytes {
-                return Err(AppError::too_large("zip exceeds the configured size limit"));
-            }
-            let name = path.rsplit('/').next().unwrap_or(path.as_str());
-            archive
-                .start_file(
-                    name,
-                    zip::write::SimpleFileOptions::default()
-                        .compression_method(zip::CompressionMethod::Deflated),
-                )
-                .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
-            archive
-                .write_all(&bytes)
-                .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
-        }
-        archive
-            .finish()
-            .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
+    let settings = state.settings();
+    let max_bytes = settings.settings.downloads.zip_max_bytes;
+    let max_files = settings.settings.downloads.zip_max_files;
+    let (entries, total_bytes, file_count) =
+        collect_remote_zip(&client, mount.grant_id, &paths, max_bytes, max_files).await?;
+    if file_count == 0 {
+        return Err(AppError::bad_request("selection contains no files"));
     }
+
+    let spool = settings
+        .settings
+        .cache_dir
+        .join("zip-spool")
+        .join(crate::auth::random_token(8));
+    crate::platform::create_private_dir_all(&spool).map_err(crate::fsops::io_error)?;
+    let mut downloaded: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut directories: Vec<String> = Vec::new();
+    for entry in &entries {
+        if entry.is_dir {
+            directories.push(entry.name.clone());
+            continue;
+        }
+        let Some(remote) = entry.remote_path.as_deref() else {
+            continue;
+        };
+        let destination = spool.join(format!("{}", downloaded.len()));
+        if let Err(error) =
+            spool_download(&client, mount.grant_id, remote, &destination, max_bytes).await
+        {
+            let _ = tokio::fs::remove_dir_all(&spool).await;
+            return Err(error);
+        }
+        downloaded.push((entry.name.clone(), destination));
+    }
+
+    let permit = state
+        .zip_semaphore()
+        .try_acquire_owned()
+        .map_err(|_| AppError::TooManyRequests)?;
+    let count = downloaded.len();
+    let (reader, writer) = tokio::io::duplex(64 * 1024);
+    let spool_cleanup = spool.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut zip = zip::ZipWriter::new_stream(SyncIoBridge::new(writer));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for name in directories {
+            let _ = zip.add_directory(format!("{name}/"), options);
+        }
+        for (name, path) in downloaded {
+            if zip.start_file(name, options).is_err() {
+                continue;
+            }
+            match std::fs::File::open(&path) {
+                Ok(mut file) => {
+                    let _ = std::io::copy(&mut file, &mut zip);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "remote zip spool file disappeared");
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        let _ = zip.finish();
+        let _ = std::fs::remove_dir(&spool_cleanup);
+        tracing::debug!(
+            files = count,
+            bytes = total_bytes,
+            "remote zip stream finished"
+        );
+    });
+
     Response::builder()
+        .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/zip")
         .header(
             header::CONTENT_DISPOSITION,
             "attachment; filename*=UTF-8''filehub.zip",
         )
-        .body(Body::from(buffer.into_inner()))
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(ReaderStream::new(reader)))
         .map_err(|error| AppError::internal(anyhow::anyhow!(error)))
 }

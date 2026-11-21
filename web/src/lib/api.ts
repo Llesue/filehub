@@ -67,6 +67,7 @@ export interface RemoteMount {
   grant_id: number;
   grant_label: string;
   mode: 'ro' | 'rw';
+  capabilities: string[];
   state: 'online' | 'offline' | 'token_invalid' | 'grant_revoked' | 'unsupported';
   last_ok_at: number | null;
   last_error: string | null;
@@ -581,6 +582,26 @@ export const api = {
     return request(`/remote/tokens/${id}`, { method: 'DELETE' }, csrf);
   },
 
+  remoteRotateToken(
+    id: number,
+    csrf: string,
+  ): Promise<{ id: number; token: string; prefix: string }> {
+    return request(`/remote/tokens/${id}/rotate`, { method: 'POST' }, csrf);
+  },
+
+  remoteThumbWarm(
+    root: number,
+    path: string,
+    paths: string[],
+    csrf: string,
+  ): Promise<{ queued: number; cached: number; skipped: number; disabled: boolean }> {
+    return request(
+      '/remote/thumb-warm',
+      { method: 'POST', body: JSON.stringify({ root, path, paths }) },
+      csrf,
+    );
+  },
+
   remoteMounts(): Promise<{ mounts: RemoteMount[] }> {
     return request('/remote/mounts');
   },
@@ -1016,7 +1037,7 @@ export const api = {
     path: string,
     target: string | undefined,
     csrf: string,
-  ): Promise<{ job_id: string; status: string; name: string }> {
+  ): Promise<{ job_id: string | null; status: string; name: string }> {
     return request(
       '/archive/unzip',
       {

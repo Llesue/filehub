@@ -593,6 +593,23 @@ impl Db {
         .await
     }
 
+    pub async fn federation_update_mount_capabilities(
+        &self,
+        id: i64,
+        user_id: i64,
+        capabilities: &str,
+    ) -> anyhow::Result<bool> {
+        let capabilities = capabilities.to_owned();
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "UPDATE federation_mounts SET capabilities = ?1 WHERE id = ?2 AND user_id = ?3",
+                params![capabilities, id, user_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
     pub async fn federation_update_mount_state(
         &self,
         id: i64,

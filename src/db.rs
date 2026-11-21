@@ -67,6 +67,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (30, include_str!("../migrations/0030_session_last_seen.sql")),
     (31, include_str!("../migrations/0031_federation.sql")),
+    (
+        32,
+        include_str!("../migrations/0032_federation_v1_complete.sql"),
+    ),
 ];
 
 pub fn unix_now() -> i64 {
@@ -188,6 +192,8 @@ pub struct UploadSession {
     pub created_at: i64,
     pub updated_at: i64,
     pub remote_upload_id: Option<String>,
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1314,8 +1320,9 @@ impl Db {
             connection.execute(
                 "INSERT INTO upload_sessions \
                  (id, user_id, root_id, dir_path, filename, total_size, chunk_size, received, \
-                  chunk_bitmap, temp_path, sha256, expires_at, created_at, updated_at, remote_upload_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12, ?13)",
+                  chunk_bitmap, temp_path, sha256, expires_at, created_at, updated_at, remote_upload_id, \
+                  if_match, if_none_match) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12, ?13, ?14, ?15)",
                 params![
                     upload.id,
                     upload.user_id,
@@ -1329,7 +1336,9 @@ impl Db {
                     upload.temp_path,
                     upload.expires_at,
                     upload.created_at,
-                    upload.remote_upload_id
+                    upload.remote_upload_id,
+                    upload.if_match,
+                    upload.if_none_match
                 ],
             )?;
             Ok(())
@@ -1348,7 +1357,7 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, dir_path, filename, total_size, chunk_size, \
                      received, chunk_bitmap, temp_path, expires_at, created_at, updated_at, \
-                     remote_upload_id \
+                     remote_upload_id, if_match, if_none_match \
                      FROM upload_sessions WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     |row| {
@@ -1367,6 +1376,8 @@ impl Db {
                             created_at: row.get(11)?,
                             updated_at: row.get(12)?,
                             remote_upload_id: row.get(13)?,
+                            if_match: row.get(14)?,
+                            if_none_match: row.get(15)?,
                         })
                     },
                 )
@@ -4095,5 +4106,108 @@ mod tests {
         assert!(sizes.contains_key("/data/del2/x"));
         assert!(sizes.contains_key("/data/delx"));
         assert_eq!(db.count_indexed_dirs().await.unwrap(), 2);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum IdempotencyStart {
+    New,
+    InProgress,
+    Replay { status: u16, body: String },
+}
+
+impl Db {
+    pub async fn federation_idempotency_begin(
+        &self,
+        token_id: i64,
+        key: &str,
+        method: &str,
+        path: Option<&str>,
+        now: i64,
+    ) -> anyhow::Result<IdempotencyStart> {
+        let key = key.to_owned();
+        let method = method.to_owned();
+        let path = path.map(str::to_owned);
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM federation_idempotency WHERE created_at < ?1",
+                params![now.saturating_sub(86_400)],
+            )?;
+            transaction.execute(
+                "DELETE FROM federation_idempotency \
+                 WHERE state = 'pending' AND created_at < ?1",
+                params![now.saturating_sub(600)],
+            )?;
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO federation_idempotency \
+                 (token_id, key, method, path, status, body, state, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 0, '', 'pending', ?5)",
+                params![token_id, key, method, path, now],
+            )?;
+            if inserted == 1 {
+                transaction.commit()?;
+                return Ok(IdempotencyStart::New);
+            }
+            let (state, status, body) = transaction.query_row(
+                "SELECT state, status, body FROM federation_idempotency \
+                 WHERE token_id = ?1 AND key = ?2",
+                params![token_id, key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            transaction.commit()?;
+            if state == "done" {
+                Ok(IdempotencyStart::Replay {
+                    status: status as u16,
+                    body,
+                })
+            } else {
+                Ok(IdempotencyStart::InProgress)
+            }
+        })
+        .await
+    }
+
+    pub async fn federation_idempotency_finish(
+        &self,
+        token_id: i64,
+        key: &str,
+        status: u16,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        let key = key.to_owned();
+        let body = body.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE federation_idempotency \
+                 SET state = 'done', status = ?3, body = ?4 \
+                 WHERE token_id = ?1 AND key = ?2",
+                params![token_id, key, status as i64, body],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_idempotency_release(
+        &self,
+        token_id: i64,
+        key: &str,
+    ) -> anyhow::Result<()> {
+        let key = key.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "DELETE FROM federation_idempotency WHERE token_id = ?1 AND key = ?2",
+                params![token_id, key],
+            )?;
+            Ok(())
+        })
+        .await
     }
 }

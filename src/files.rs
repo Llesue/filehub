@@ -1264,6 +1264,8 @@ pub async fn create_upload(
             &filename,
             size,
             chunk_size,
+            None,
+            None,
         )
         .await;
     }
@@ -1351,6 +1353,8 @@ pub async fn create_upload(
         created_at: now,
         updated_at: now,
         remote_upload_id: None,
+        if_match: None,
+        if_none_match: None,
     };
 
     if let Err(err) = state.db.insert_upload(&upload).await {

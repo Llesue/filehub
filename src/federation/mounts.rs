@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use axum::Json;
@@ -260,6 +261,43 @@ pub async fn create(
     })))
 }
 
+fn capability_refresh_seen() -> &'static Mutex<HashMap<i64, i64>> {
+    static SEEN: OnceLock<Mutex<HashMap<i64, i64>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn schedule_capability_refresh(state: &Arc<AppState>, mount: &FederationMount) {
+    let now = crate::db::unix_now();
+    {
+        let mut seen = capability_refresh_seen()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if now - seen.get(&mount.id).copied().unwrap_or(0) < 300 {
+            return;
+        }
+        seen.insert(mount.id, now);
+    }
+    let state = Arc::clone(state);
+    let mount = mount.clone();
+    tokio::spawn(async move {
+        let Ok(client) = client_for_mount(&state, &mount).await else {
+            return;
+        };
+        let Ok(info) = client.info().await else {
+            return;
+        };
+        let capabilities = info
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let encoded = serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".to_owned());
+        let _ = state
+            .db
+            .federation_update_mount_capabilities(mount.id, mount.user_id, &encoded)
+            .await;
+    });
+}
+
 pub async fn list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -272,6 +310,7 @@ pub async fn list(
         .map_err(AppError::internal)?;
     let mut items = Vec::new();
     for mount in mounts {
+        schedule_capability_refresh(&state, &mount);
         let root = state
             .db
             .find_root(mount.root_id, current.user.id)
@@ -436,4 +475,47 @@ pub async fn activity(
         })
         .collect();
     Ok(Json(json!({ "activity": activity })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ThumbWarmRequest {
+    root: i64,
+    paths: Vec<String>,
+    width: Option<u32>,
+}
+
+pub async fn thumb_warm(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ThumbWarmRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    let root = state
+        .db
+        .find_root(request.root, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    if !root.is_remote() {
+        return Err(AppError::bad_request("root is not a remote mount"));
+    }
+    let settings = state.settings();
+    if !settings.settings.federation.enabled_outbound || !current.user.feature_federation_mount {
+        return Err(AppError::Forbidden);
+    }
+    if !settings.settings.federation.thumb_warm {
+        return Ok(Json(json!({
+            "queued": 0,
+            "cached": 0,
+            "skipped": 0,
+            "disabled": true,
+        })));
+    }
+    if request.paths.is_empty() || request.paths.len() > 500 {
+        return Err(AppError::bad_request("paths must contain 1-500 items"));
+    }
+    let width = request.width.unwrap_or(256).clamp(16, 1024);
+    crate::federation::proxy::thumb_warm(&state, current.user.id, &root, &request.paths, width)
+        .await
 }

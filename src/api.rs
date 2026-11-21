@@ -52,6 +52,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(crate::federation::admin::rotate_token),
         )
         .route("/remote/activity", get(crate::federation::mounts::activity))
+        .route(
+            "/remote/thumb-warm",
+            post(crate::federation::mounts::thumb_warm),
+        )
         .route("/remote/probe", post(crate::federation::mounts::probe))
         .route(
             "/remote/grants/preview",

@@ -44,6 +44,7 @@ https://filehub.ihtom.com
 - Per-user preferences, avatars, quotas, and read-only/writable storage roots
 - Admin console for users, external paths, quotas, per-user feature switches, expanded system settings, and audit logs
 - Restricted command panel over WebSocket: `help`, `ls`, `tree`, `cp`, `mv`, `rm`, `zip`, `unzip`, `job`, `roots`, and safe-delete confirmation codes
+- Federated remote directories: mount a directory exposed by another FileHub instance, read-only or read-write, with scoped tokens, invites, per-user switches, and proxied search, thumbnails, audio and ZIP
 - Linux single-binary deployment; Windows LocalSystem service support
 
 ## Quick start

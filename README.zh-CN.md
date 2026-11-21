@@ -44,6 +44,7 @@ https://filehub.ihtom.com
 - 每用户偏好、头像、配额、只读/读写存储根
 - 管理后台：用户、外部路径、配额、按用户功能开关、系统设置和审计日志
 - WebSocket 受限命令面板：`help`、`ls`、`tree`、`cp`、`mv`、`rm`、`zip`、`unzip`、`job`、`roots`，高危删除带验证码
+- 联邦远程目录：把另一个 FileHub 实例授权的目录挂载进来，支持只读/读写、范围令牌、邀请信息、按用户开关，以及代理搜索、缩略图、音频和 ZIP
 - Linux 单文件部署；Windows 支持 LocalSystem 服务
 
 ## 快速开始

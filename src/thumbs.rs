@@ -1093,7 +1093,7 @@ fn cache_key(path: &Path, width: u32, fit: Fit, edge: u32) -> Result<String, App
         .collect())
 }
 
-fn thumb_paths(
+pub(crate) fn thumb_paths(
     cache_dir: &Path,
     source: &Path,
     width: u32,

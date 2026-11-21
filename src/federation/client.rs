@@ -154,7 +154,11 @@ impl PeerClient {
         headers: &HeaderMap,
     ) -> Result<reqwest::Response, PeerError> {
         let mut request = self
-            .auth(self.http.get(self.endpoint("/download")))
+            .auth(
+                self.http
+                    .get(self.endpoint("/download"))
+                    .timeout(Duration::from_secs(600)),
+            )
             .query(&[
                 ("grant", grant.to_string()),
                 ("path", path.to_owned()),
@@ -239,6 +243,52 @@ impl PeerClient {
         .await
     }
 
+    pub async fn thumb_warm(
+        &self,
+        grant: i64,
+        paths: &[String],
+        width: u32,
+    ) -> Result<Value, PeerError> {
+        self.json(
+            self.auth(self.http.post(self.endpoint("/thumb-warm")))
+                .json(&serde_json::json!({
+                    "grant": grant,
+                    "paths": paths,
+                    "width": width,
+                })),
+        )
+        .await
+    }
+
+    pub async fn audio_info(&self, grant: i64, path: &str) -> Result<Value, PeerError> {
+        self.json(
+            self.auth(self.http.get(self.endpoint("/audio-info")))
+                .query(&[("grant", grant.to_string()), ("path", path.to_owned())]),
+        )
+        .await
+    }
+
+    pub async fn unzip(
+        &self,
+        grant: i64,
+        path: &str,
+        target: Option<&str>,
+    ) -> Result<Value, PeerError> {
+        let mut body = serde_json::json!({ "grant": grant, "path": path });
+        if let Some(target) = target {
+            body["target"] = Value::String(target.to_owned());
+        }
+        self.json(
+            self.auth(
+                self.http
+                    .post(self.endpoint("/unzip"))
+                    .timeout(Duration::from_secs(600)),
+            )
+            .json(&body),
+        )
+        .await
+    }
+
     pub async fn dir_size(&self, grant: i64, path: &str) -> Result<Value, PeerError> {
         self.json(
             self.auth(self.http.get(self.endpoint("/dir-size")))
@@ -288,6 +338,7 @@ impl PeerClient {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_upload(
         &self,
         grant: i64,
@@ -295,19 +346,23 @@ impl PeerClient {
         filename: &str,
         total_size: i64,
         chunk_size: i64,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
     ) -> Result<Value, PeerError> {
-        self.write(
-            "POST",
-            "/uploads",
-            &serde_json::json!({
-                "grant": grant,
-                "dir": dir,
-                "filename": filename,
-                "total_size": total_size,
-                "chunk_size": chunk_size,
-            }),
-        )
-        .await
+        let mut body = serde_json::json!({
+            "grant": grant,
+            "dir": dir,
+            "filename": filename,
+            "total_size": total_size,
+            "chunk_size": chunk_size,
+        });
+        if let Some(value) = if_match {
+            body["if_match"] = Value::String(value.to_owned());
+        }
+        if let Some(value) = if_none_match {
+            body["if_none_match"] = Value::String(value.to_owned());
+        }
+        self.write("POST", "/uploads", &body).await
     }
 
     pub async fn put_chunk(&self, id: &str, index: u32, body: Vec<u8>) -> Result<(), PeerError> {

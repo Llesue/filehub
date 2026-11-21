@@ -434,7 +434,15 @@ pub async fn save(
         let total = bytes.len() as i64;
         let chunk_size = total.max(1);
         let created = client
-            .create_upload(mount.grant_id, parent, filename, total, chunk_size)
+            .create_upload(
+                mount.grant_id,
+                parent,
+                filename,
+                total,
+                chunk_size,
+                Some(expected),
+                None,
+            )
             .await
             .map_err(|error| error.into_app())?;
         let peer_id = created.get("id").and_then(Value::as_str).ok_or_else(|| {

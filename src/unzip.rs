@@ -552,6 +552,16 @@ pub async fn archive_unzip(
     crate::auth::require_csrf(&current, &headers)?;
     crate::capabilities::require_unzip(&state, &current.user).await?;
     let root = crate::cmdrunner::load_root(&state, current.user.id, request.root).await?;
+    if root.is_remote() {
+        return crate::federation::proxy::unzip(
+            &state,
+            current.user.id,
+            &root,
+            &request.path,
+            request.target.as_deref(),
+        )
+        .await;
+    }
     let archive =
         crate::authz::resolve(&state, current.user.id, root.id, &request.path, false).await?;
     if !archive.absolute.is_file() {

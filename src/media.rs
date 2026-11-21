@@ -53,7 +53,7 @@ fn ffprobe_path(ffmpeg: &Path) -> PathBuf {
     ffmpeg.with_file_name(probe)
 }
 
-async fn probe_tracks(ffmpeg: &Path, source: &Path) -> Result<Vec<Value>, AppError> {
+pub(crate) async fn probe_tracks(ffmpeg: &Path, source: &Path) -> Result<Vec<Value>, AppError> {
     let source = source.to_path_buf();
     let ffprobe = ffprobe_path(ffmpeg);
     let output = tokio::task::spawn_blocking(move || {
@@ -126,11 +126,51 @@ async fn probe_tracks(ffmpeg: &Path, source: &Path) -> Result<Vec<Value>, AppErr
         .collect())
 }
 
+fn remote_media_key(mount_id: i64, path: &str, modified: i64, size: u64, track: usize) -> String {
+    auth::sha256_hex(&format!(
+        "remote:{mount_id}:{path}:{modified}:{size}:{track}:audio-v1"
+    ))
+}
+
+async fn remote_cache_key(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root: &crate::db::Root,
+    path: &str,
+    track: usize,
+) -> Result<String, AppError> {
+    let (client, mount) =
+        crate::federation::mounts::client_for_root(state, user_id, root.id).await?;
+    let stat = client
+        .stat(mount.grant_id, path)
+        .await
+        .map_err(|error| error.into_app())?;
+    let size = stat.get("size").and_then(Value::as_u64).unwrap_or(0);
+    let modified = stat.get("modified").and_then(Value::as_i64).unwrap_or(0);
+    Ok(remote_media_key(mount.id, path, modified, size, track))
+}
+
+struct SpoolGuard(Option<PathBuf>);
+
+impl Drop for SpoolGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 pub async fn audio_info(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<FileQuery>,
 ) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let root = crate::cmdrunner::load_root(&state, current.user.id, query.root).await?;
+    if root.is_remote() {
+        return crate::federation::proxy::audio_info(&state, current.user.id, &root, &query.path)
+            .await;
+    }
     let Some(ffmpeg) = state.ffmpeg.clone() else {
         return Ok(Json(json!({
             "ffmpeg": false,
@@ -139,7 +179,6 @@ pub async fn audio_info(
             "has_supported_track": true,
         })));
     };
-    let current = auth::current_user(&state, &headers).await?;
     let resolved = authz::resolve(&state, current.user.id, query.root, &query.path, false).await?;
     let identity = source_identity(&resolved.absolute);
     let key = identity
@@ -218,11 +257,16 @@ pub async fn transcode(
     if state.ffmpeg.is_none() {
         return Err(AppError::bad_request("ffmpeg is not available"));
     }
-    let resolved =
-        authz::resolve(&state, current.user.id, request.root, &request.path, false).await?;
+    let root = crate::cmdrunner::load_root(&state, current.user.id, request.root).await?;
     let track = request.track.unwrap_or(0);
-    let key = cache_key(&resolved.absolute, track)
-        .ok_or_else(|| AppError::bad_request("could not read the source file"))?;
+    let key = if root.is_remote() {
+        remote_cache_key(&state, current.user.id, &root, &request.path, track).await?
+    } else {
+        let resolved =
+            authz::resolve(&state, current.user.id, request.root, &request.path, false).await?;
+        cache_key(&resolved.absolute, track)
+            .ok_or_else(|| AppError::bad_request("could not read the source file"))?
+    };
     let target = media_cache_dir(&state).join(format!("{key}.mp4"));
     if target.is_file() {
         return Ok(Json(json!({
@@ -267,9 +311,15 @@ pub async fn transcoded(
     axum::extract::Query(query): axum::extract::Query<TranscodeQuery>,
 ) -> Result<Response, AppError> {
     let current = auth::current_user(&state, &headers).await?;
-    let resolved = authz::resolve(&state, current.user.id, query.root, &query.path, false).await?;
-    let key = cache_key(&resolved.absolute, query.track)
-        .ok_or_else(|| AppError::bad_request("could not read the source file"))?;
+    let root = crate::cmdrunner::load_root(&state, current.user.id, query.root).await?;
+    let key = if root.is_remote() {
+        remote_cache_key(&state, current.user.id, &root, &query.path, query.track).await?
+    } else {
+        let resolved =
+            authz::resolve(&state, current.user.id, query.root, &query.path, false).await?;
+        cache_key(&resolved.absolute, query.track)
+            .ok_or_else(|| AppError::bad_request("could not read the source file"))?
+    };
     let target = media_cache_dir(&state).join(format!("{key}.mp4"));
     if !target.is_file() {
         return Err(AppError::NotFound);
@@ -306,11 +356,37 @@ async fn run_transcode_job(
         .to_owned();
     let track = payload.get("track").and_then(Value::as_u64).unwrap_or(0) as usize;
     let root = crate::cmdrunner::load_root(&state, user_id, root_id).await?;
-    let source = authz::resolve(&state, user_id, root.id, &path, false).await?;
-    let key = cache_key(&source.absolute, track)
-        .ok_or_else(|| AppError::bad_request("could not read the source file"))?;
     let dir = media_cache_dir(&state);
     crate::platform::create_private_dir_all(&dir).map_err(crate::fsops::io_error)?;
+    let mut _spool_guard = SpoolGuard(None);
+    let (key, source_arg) = if root.is_remote() {
+        let (client, mount) =
+            crate::federation::mounts::client_for_root(&state, user_id, root.id).await?;
+        let stat = client
+            .stat(mount.grant_id, &path)
+            .await
+            .map_err(|error| error.into_app())?;
+        let size = stat.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let modified = stat.get("modified").and_then(Value::as_i64).unwrap_or(0);
+        let key = remote_media_key(mount.id, &path, modified, size, track);
+        let spool = dir.join(format!(".{key}.src"));
+        let valid = tokio::fs::metadata(&spool)
+            .await
+            .map(|metadata| metadata.len() == size)
+            .unwrap_or(false);
+        if !valid {
+            let limit = state.settings().settings.federation.max_spool_bytes;
+            crate::federation::proxy::spool_download(&client, mount.grant_id, &path, &spool, limit)
+                .await?;
+        }
+        _spool_guard = SpoolGuard(Some(spool.clone()));
+        (key, spool.to_string_lossy().to_string())
+    } else {
+        let source = authz::resolve(&state, user_id, root.id, &path, false).await?;
+        let key = cache_key(&source.absolute, track)
+            .ok_or_else(|| AppError::bad_request("could not read the source file"))?;
+        (key, source.absolute.to_string_lossy().to_string())
+    };
     let target = dir.join(format!("{key}.mp4"));
     if target.is_file() {
         return Ok(JobOutcome {
@@ -323,7 +399,6 @@ async fn run_transcode_job(
     }
     let temp = dir.join(format!(".{key}.part"));
     let _ = std::fs::remove_file(&temp);
-    let source_arg = source.absolute.to_string_lossy().to_string();
     let audio_map = format!("0:a:{track}");
     let temp_arg = temp.to_string_lossy().to_string();
     let mut command = tokio::process::Command::new(&ffmpeg);

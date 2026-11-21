@@ -105,6 +105,15 @@
     }
   }
 
+  function parseInvite(value: string): boolean {
+    const urlMatch = value.match(/https?:\/\/[^\s]+/);
+    const tokenMatch = value.match(/fhfed_[A-Za-z0-9_-]+/);
+    if (!urlMatch || !tokenMatch) return false;
+    url = urlMatch[0].replace(/[),.;]+$/, '');
+    token = tokenMatch[0];
+    return true;
+  }
+
   function close(): void {
     reset();
     onClose();
@@ -133,9 +142,16 @@
             bind:value={url}
             placeholder="https://nas.example.com"
             autocomplete="off"
+            oninput={(event) => {
+              const value = event.currentTarget.value;
+              if (value.includes('fhfed_')) {
+                parseInvite(value);
+              }
+            }}
           />
         </label>
         <p class="hint">{t($language, '先校验地址，未保存的令牌不会发送。')}</p>
+        <p class="hint">{t($language, '也可以直接粘贴对方给的邀请信息。')}</p>
         <footer>
           <button type="button" disabled={busy || !url.trim()} onclick={() => void checkAddress()}>
             {t($language, '检测地址')}
@@ -153,7 +169,18 @@
         {/if}
         <label class="field">
           <span>{t($language, '令牌')}</span>
-          <input bind:value={token} type="password" placeholder="fhfed_..." autocomplete="off" />
+          <input
+            bind:value={token}
+            type="password"
+            placeholder="fhfed_..."
+            autocomplete="off"
+            oninput={(event) => {
+              const value = event.currentTarget.value;
+              if (value.includes('https://') || value.includes('http://')) {
+                parseInvite(value);
+              }
+            }}
+          />
         </label>
         <footer>
           <button type="button" class="ghost" onclick={() => (step = 1)}>

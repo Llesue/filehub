@@ -19,6 +19,16 @@ components:
       scheme: bearer
       bearerFormat: fhfed_<token>
 
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 200 }
+      description: |
+        写操作去重键。相同键的重复请求返回第一次的响应；操作仍在执行时
+        返回 409。键在操作失败后自动释放，可以重试。
+
   schemas:
     Error:
       type: object
@@ -394,6 +404,12 @@ paths:
                 filename: { type: string }
                 total_size: { type: integer, format: int64 }
                 chunk_size: { type: integer }
+                if_match:
+                  type: string
+                  description: 目标文件必须仍然匹配该 ETag，否则完成上传时返回 412。
+                if_none_match:
+                  type: string
+                  description: 传 "*" 时目标文件已存在则返回 412。
       responses:
         "201":
           description: 已创建
@@ -449,3 +465,100 @@ paths:
                   path: { type: string }
                   etag: { type: string }
                   size: { type: integer, format: int64 }
+
+  /thumb-warm:
+    post:
+      summary: 预热目录缩略图（授权侧生成）
+      description: |
+        同一批路径重复调用不会重复排队。只预热列表尺寸（width 默认 256）。
+        按令牌限流，默认 2 次/分钟。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, paths]
+              properties:
+                grant: { type: integer }
+                paths:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { type: string }
+                width: { type: integer, minimum: 16, maximum: 1024, default: 256 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queued: { type: integer }
+                  cached: { type: integer }
+                  skipped: { type: integer }
+                  disabled: { type: boolean }
+
+  /unzip:
+    post:
+      summary: 就地解压 ZIP（同步执行）
+      description: |
+        由授权侧校验条目路径、加密标志、符号链接与压缩比，然后解压到
+        target（默认取归档文件名去掉 .zip）。失败时不留下部分文件。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant, path]
+              properties:
+                grant: { type: integer }
+                path: { type: string }
+                target: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  target: { type: string }
+                  entries: { type: integer }
+                  bytes: { type: integer, format: int64 }
+
+  /audio-info:
+    get:
+      summary: 音轨探测（授权侧 ffprobe）
+      parameters:
+        - { name: grant, in: query, required: true, schema: { type: integer } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ffmpeg: { type: boolean }
+                  default_track: { type: integer, nullable: true }
+                  has_supported_track: { type: boolean }
+                  tracks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: { type: integer }
+                        codec: { type: string }
+                        channels: { type: integer }
+                        layout: { type: string }
+                        language: { type: string }
+                        default: { type: boolean }
+                        supported: { type: boolean }

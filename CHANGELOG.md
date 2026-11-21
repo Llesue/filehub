@@ -5,8 +5,11 @@
 ### Added
 
 - Remote directory mounts between FileHub instances, with token-scoped read-only or read-write grants.
-- Browse, download, upload, create, rename and delete files on mounted directories.
-- Remote thumbnails and directory sizes are proxied, with local metadata and thumbnail caches.
+- Browse, download, upload, create, rename, copy, move and delete files on mounted directories.
+- Remote filename search, recursive ZIP downloads, in-place ZIP extraction, and audio track probing with local transcoding.
+- Remote thumbnails and directory sizes are proxied, with local metadata, thumbnail and transcoding caches.
+- Capability-driven UI: actions the peer does not support are hidden or disabled.
+- Thumbnail warm-up for remote directories, token rotation, and paste-ready invite text in the mount wizard.
 - Sidebar GitHub link and an optional update check against GitHub Releases.
 - Per-user switches for remote mounts and outgoing shares.
 
@@ -18,6 +21,7 @@
 ### Security
 
 - Hashed federation tokens, grant-bound path resolution, SSRF address classification and pinned DNS.
+- Idempotency keys for federation writes, upload ETag preconditions, per-token rate limits, and audit records for remote writes.
 
 ## v0.1.12 - 2026-11-20
 

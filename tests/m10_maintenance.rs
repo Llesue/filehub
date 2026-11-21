@@ -141,6 +141,8 @@ fn upload(
         created_at: now - 60,
         updated_at: now - 60,
         remote_upload_id: None,
+        if_match: None,
+        if_none_match: None,
     }
 }
 

@@ -458,6 +458,13 @@
   });
 
   let activeRoot = $derived(roots.find((root) => root.id === activeRootId) ?? null);
+  let remoteCaps = $state<Record<number, string[]>>({});
+  const activeRemoteCaps = $derived(
+    activeRoot?.kind === 'remote' ? (remoteCaps[activeRoot.id] ?? []) : null,
+  );
+  function remoteCan(capability: string): boolean {
+    return activeRemoteCaps === null || activeRemoteCaps.includes(capability);
+  }
   let pathSegments = $derived(currentPath.split('/').filter(Boolean));
   let quotaPercent = $derived(
     usage?.quota_bytes && usage.used_bytes !== null
@@ -1096,6 +1103,19 @@
     }, 120);
   }
 
+  async function refreshRemoteCaps(): Promise<void> {
+    try {
+      const result = await api.remoteMounts();
+      const next: Record<number, string[]> = {};
+      for (const mount of result.mounts) {
+        next[mount.root_id] = mount.capabilities;
+      }
+      remoteCaps = next;
+    } catch (error) {
+      console.debug('remote mount capabilities unavailable', error);
+    }
+  }
+
   async function refreshRoots(): Promise<void> {
     try {
       const result = await api.roots();
@@ -1111,6 +1131,7 @@
         return;
       }
       await loadList(next.id, next.id === activeRootId ? currentPath : '');
+      void refreshRemoteCaps();
     } catch (error) {
       handleFilesError(error);
     }
@@ -1124,6 +1145,32 @@
     void api.cancelThumbScope(rootId, path, scope, csrf).catch((error) => {
       console.warn('cancel thumbnail scope failed', error);
     });
+  }
+
+  let thumbWarmTimer = 0;
+  const thumbWarmSeen: Record<string, number> = {};
+
+  function scheduleRemoteThumbWarm(
+    root: Root,
+    path: string,
+    items: Entry[],
+  ): void {
+    if (root.kind !== 'remote') return;
+    const cacheKey = `${root.id}:${path}`;
+    const now = Date.now();
+    if (now - (thumbWarmSeen[cacheKey] ?? 0) < 300_000) return;
+    if (thumbWarmTimer) window.clearTimeout(thumbWarmTimer);
+    thumbWarmTimer = window.setTimeout(() => {
+      thumbWarmSeen[cacheKey] = Date.now();
+      const paths = items
+        .filter((entry) => !entry.is_dir && entry.has_preview)
+        .slice(0, 100)
+        .map((entry) => entry.name);
+      if (paths.length === 0) return;
+      void api.remoteThumbWarm(root.id, path, paths, csrf).catch((error) => {
+        console.debug('remote thumbnail warm skipped', error);
+      });
+    }, 800);
   }
 
   async function loadList(rootId: number, path: string, focus?: string): Promise<boolean> {
@@ -1190,6 +1237,7 @@
         : null;
       entries = result.entries;
       nextCursor = result.next_cursor;
+      scheduleRemoteThumbWarm(result.root, result.path, result.entries);
       loadDirectorySizes(entries, result.root.id, result.path, dirSizeGeneration, true);
       if (focus && typeof result.focus_index === 'number') {
         const offset = result.focus_offset ?? 0;
@@ -2824,7 +2872,7 @@
     startProgress(t($language, '解压'), 1, entry.name);
     try {
       const job = await api.archiveUnzip(rootId, path, undefined, csrf);
-      const result = await waitForTransferJob(job.job_id);
+      const result = job.job_id ? await waitForTransferJob(job.job_id) : null;
       finishProgress();
       await loadList(rootId, currentPath);
       const name =
@@ -3056,6 +3104,10 @@
     if (!activeRoot) return;
     if (currentReadOnly) {
       showToast(readOnlyMessage());
+      return;
+    }
+    if (!remoteCan('uploads')) {
+      showToast(t($language, '对方不支持这个操作'));
       return;
     }
     fileInput?.click();
@@ -3735,6 +3787,7 @@
             bind:value={searchQuery}
             aria-label={t($language, '搜索文件或目录')}
             placeholder={t($language, '搜索文件或目录')}
+            disabled={!remoteCan('search')}
             oninput={handleSearchInput}
           />
         </form>
@@ -3842,9 +3895,13 @@
           <button
             type="button"
             class="upload-top"
-            class:inactive={currentReadOnly}
-            aria-disabled={!activeRoot || currentReadOnly}
-            title={currentReadOnly ? readOnlyMessage() : t($language, '上传文件')}
+            class:inactive={currentReadOnly || !remoteCan('uploads')}
+            aria-disabled={!activeRoot || currentReadOnly || !remoteCan('uploads')}
+            title={
+              currentReadOnly || !remoteCan('uploads')
+                ? readOnlyMessage()
+                : t($language, '上传文件')
+            }
             aria-label={t($language, '上传')}
             onclick={uploadClick}
           >
@@ -4126,7 +4183,7 @@
                 {#each selectionSummary.parts as part, index (index)}
                   <span class="selection-kind">{part}</span>
                 {/each}
-                {#if capabilities.zip}
+                {#if capabilities.zip && remoteCan('download')}
                   <button
                     type="button"
                     class="icon-button"
@@ -4137,20 +4194,22 @@
                     <Icon name="download" size={16} />
                   </button>
                 {/if}
-                <button
-                  type="button"
-                  class="icon-button"
-                  aria-label={t($language, '复制到')}
-                  title={t($language, '复制到')}
-                  onclick={() =>
-                    (transfer = {
-                      mode: 'copy',
-                      entries: entries.filter((entry) => selected.includes(entry.name)),
-                    })}
-                >
-                  <Icon name="copy" size={16} />
-                </button>
-                {#if !currentReadOnly}
+                {#if remoteCan('copy')}
+                  <button
+                    type="button"
+                    class="icon-button"
+                    aria-label={t($language, '复制到')}
+                    title={t($language, '复制到')}
+                    onclick={() =>
+                      (transfer = {
+                        mode: 'copy',
+                        entries: entries.filter((entry) => selected.includes(entry.name)),
+                      })}
+                  >
+                    <Icon name="copy" size={16} />
+                  </button>
+                {/if}
+                {#if !currentReadOnly && remoteCan('move')}
                   <button
                     type="button"
                     class="icon-button"
@@ -4164,6 +4223,8 @@
                   >
                     <Icon name="move" size={16} />
                   </button>
+                {/if}
+                {#if !currentReadOnly && remoteCan('delete')}
                   <button
                     type="button"
                     class="icon-button danger"
@@ -5123,12 +5184,15 @@
             : t($language, '下载')}</button
         >
       {/if}
-      {#if capabilities.zip && (menuTargets.length > 1 || menuTargets.some((entry) => entry.is_dir))}
+      {#if capabilities.zip &&
+      remoteCan('download') &&
+      (menuTargets.length > 1 || menuTargets.some((entry) => entry.is_dir))}
         <button type="button" role="menuitem" onclick={() => runContextAction('archive-zip')}
           >{t($language, '打包为ZIP')}</button
         >
       {/if}
       {#if capabilities.unzip &&
+      remoteCan('unzip') &&
       menuTargets.length === 1 &&
       !contextMenu.entry.is_dir &&
       /\.zip$/i.test(contextMenu.entry.name)}
@@ -5136,23 +5200,27 @@
           >{t($language, '解压')}</button
         >
       {/if}
-      <button type="button" role="menuitem" onclick={() => runContextAction('share')}
-        >{t($language, '分享')}</button
-      >
-      {#if !currentReadOnly && menuTargets.length === 1}
+      {#if activeRoot?.kind !== 'remote'}
+        <button type="button" role="menuitem" onclick={() => runContextAction('share')}
+          >{t($language, '分享')}</button
+        >
+      {/if}
+      {#if !currentReadOnly && remoteCan('rename') && menuTargets.length === 1}
         <button type="button" role="menuitem" onclick={() => runContextAction('rename')}
           >{t($language, '重命名')}</button
         >
       {/if}
-      <button type="button" role="menuitem" onclick={() => runContextAction('copy-to')}
-        >{t($language, '复制到…')}</button
-      >
-      {#if !currentReadOnly}
+      {#if remoteCan('copy')}
+        <button type="button" role="menuitem" onclick={() => runContextAction('copy-to')}
+          >{t($language, '复制到…')}</button
+        >
+      {/if}
+      {#if !currentReadOnly && remoteCan('move')}
         <button type="button" role="menuitem" onclick={() => runContextAction('move-to')}
           >{t($language, '移动到…')}</button
         >
       {/if}
-      {#if !currentReadOnly}
+      {#if !currentReadOnly && remoteCan('delete')}
         <div class="menu-sep"></div>
         <button
           type="button"
@@ -5226,6 +5294,7 @@
         <button
           type="button"
           role="menuitem"
+          disabled={!remoteCan('mkdir')}
           onclick={() => {
             blankMenu = null;
             openMkdir();
@@ -5234,6 +5303,7 @@
         <button
           type="button"
           role="menuitem"
+          disabled={!remoteCan('touch')}
           onclick={() => {
             blankMenu = null;
             nameDialog = {
@@ -5248,6 +5318,7 @@
         <button
           type="button"
           role="menuitem"
+          disabled={!remoteCan('uploads')}
           onclick={() => {
             blankMenu = null;
             folderUploadClick();
