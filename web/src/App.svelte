@@ -4101,8 +4101,8 @@
               title={t($language, '挂载远程目录')}
               onclick={() => (mountDialogOpen = true)}
             >
-              <Icon name="plus" size={18} />
-              <span class="nav-label">{t($language, '挂载远程目录')}</span>
+              <Icon name="plus" size={16} />
+              <span class="nav-label">{t($language, '远程目录')}</span>
             </button>
           {/if}
           <div class="nav-sep"></div>

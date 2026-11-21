@@ -90,7 +90,7 @@
 <section class="preferences-page">
   <header class="page-header">
     <div>
-      <h1>{t($language, '偏好设置')}</h1>
+      <h1>{t($language, '个人设置')}</h1>
       <p>{t($language, '账号、外观和文件浏览行为，修改后即时保存。')}</p>
     </div>
     <Icon name="settings" size={24} />

@@ -145,7 +145,7 @@
       >{t($language, '个人资料')}</button
     >
     <button type="button" class:active={tab === 'preferences'} onclick={() => (tab = 'preferences')}
-      >{t($language, '偏好设置')}</button
+      >{t($language, '个人设置')}</button
     >
     <button type="button" class:active={tab === 'shares'} onclick={() => (tab = 'shares')}
       >{t($language, '分享设置')}</button

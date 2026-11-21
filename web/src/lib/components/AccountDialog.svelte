@@ -48,7 +48,7 @@
 
     <div class="menu-section">
       <button type="button" onclick={onSettings}>
-        <Icon name="settings" size={18} />{t($language, '偏好设置')}
+        <Icon name="settings" size={18} />{t($language, '个人设置')}
       </button>
       {#if user.role === 'admin'}
         <button type="button" onclick={onAdmin}>
