@@ -289,9 +289,6 @@
 
   <div class="section-head">
     <h3>{t($language, '共享目录')}</h3>
-    <button type="button" class="add-button" onclick={() => (newGrantOpen = !newGrantOpen)}>
-      {t($language, '添加授权目录')}
-    </button>
   </div>
 
   <div class="list">
@@ -304,6 +301,9 @@
             {grant.mode === 'rw' ? t($language, '读写') : t($language, '只读')}
           </em>
           <span class="count">{grant.token_count} {t($language, '个令牌')}</span>
+          {#if grant.available === false}
+            <span class="warn">{t($language, '目录已不存在')}</span>
+          {/if}
         </div>
         <button type="button" class="danger" disabled={busy} onclick={() => void revokeGrant(grant.id)}>
           {t($language, '撤销')}
@@ -311,6 +311,10 @@
       </div>
     {/each}
   </div>
+
+  <button type="button" class="row-add" onclick={() => (newGrantOpen = !newGrantOpen)}>
+    + {t($language, '添加授权目录')}
+  </button>
 
   {#if newGrantOpen}
   <div class="form form-card">
@@ -349,9 +353,6 @@
 
   <div class="section-head">
     <h3>{t($language, '访问令牌')}</h3>
-    <button type="button" class="add-button" onclick={() => (newTokenOpen = !newTokenOpen)}>
-      {t($language, '新建令牌')}
-    </button>
   </div>
 
   <div class="list">
@@ -412,6 +413,10 @@
       </div>
     {/each}
   </div>
+
+  <button type="button" class="row-add" onclick={() => (newTokenOpen = !newTokenOpen)}>
+    + {t($language, '新建令牌')}
+  </button>
 
   {#if newTokenOpen}
   <div class="form form-card">
@@ -709,9 +714,20 @@
     margin: 0;
   }
 
-  .add-button {
-    padding: 5px 10px;
+  .row-add {
+    width: 100%;
+    padding: 8px;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-2);
+    cursor: pointer;
     font-size: 12.5px;
+  }
+
+  .row-add:hover {
+    color: var(--accent-text);
+    border-color: var(--accent);
   }
 
   .form-card {

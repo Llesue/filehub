@@ -336,6 +336,17 @@ async fn federation_contract_round_trip() {
         .and_then(|entry| entry["shared"].as_bool());
     assert_eq!(shared_marked, Some(true));
 
+    let delete_shared = send_json(
+        &peer_instance.router,
+        Method::POST,
+        "/api/v1/fs/delete/preview",
+        Some(&peer_instance.cookie),
+        Some(&peer_instance.csrf),
+        json!({"root": peer_instance.root_id, "paths": ["shared"]}),
+    )
+    .await;
+    assert_eq!(delete_shared.status(), StatusCode::CONFLICT);
+
     let list = send(
         &mount_instance.router,
         Method::GET,

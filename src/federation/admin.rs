@@ -113,6 +113,7 @@ pub async fn list_grants(
             "path": grant.real_path,
             "mode": grant.mode,
             "revoked": grant.revoked,
+            "available": std::path::Path::new(&grant.real_path).is_dir(),
             "token_count": tokens,
             "created_at": grant.created_at,
         }));

@@ -251,12 +251,6 @@
   let dirVersionTimer: ReturnType<typeof setInterval> | null = null;
   let lastDirVersion = '';
   let jobProgressRestored = $state(false);
-  let terminalAvailable = $derived(
-    capabilities.terminal &&
-      systemFeatures.terminal &&
-      preferences?.terminal_enabled !== false,
-  );
-
   $effect(() => {
     if (!terminalAvailable) {
       terminalOpen = false;
@@ -466,6 +460,12 @@
   });
 
   let activeRoot = $derived(roots.find((root) => root.id === activeRootId) ?? null);
+  let terminalAvailable = $derived(
+    capabilities.terminal &&
+      systemFeatures.terminal &&
+      preferences?.terminal_enabled !== false &&
+      activeRoot?.kind !== 'remote',
+  );
   const localRoots = $derived(roots.filter((root) => root.kind !== 'remote'));
   const remoteRoots = $derived(roots.filter((root) => root.kind === 'remote'));
   let remoteCaps = $state<Record<number, string[]>>({});
@@ -4091,7 +4091,7 @@
               </button>
             {/each}
           {/if}
-          {#if canMountRemote}
+          {#if canMountRemote && preferences?.remote_mount_enabled !== false}
             {#if remoteRoots.length === 0}
               <div class="nav-sep"></div>
             {/if}
@@ -4405,6 +4405,7 @@
                     {capabilities}
                     system={systemFeatures}
                     canShareRemote={canShareRemote}
+                    canMountRemote={canMountRemote}
                     onPreferences={applyPreferences}
                   />
                 {/if}

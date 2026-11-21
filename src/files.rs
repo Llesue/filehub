@@ -1792,11 +1792,29 @@ pub async fn delete_preview(
     )
     .await?;
     let mut items = Vec::with_capacity(requested_paths.len());
+    let grants = state
+        .db
+        .federation_list_grants(current.user.id)
+        .await
+        .map_err(AppError::internal)?;
 
     for resolved in resolved_paths {
         if resolved.relative.is_empty() {
             return Err(AppError::invalid_path(
                 "the root directory cannot be deleted",
+            ));
+        }
+        if resolved.absolute.is_dir()
+            && grants.iter().any(|grant| {
+                !grant.revoked
+                    && crate::platform::path_within(
+                        std::path::Path::new(&grant.real_path),
+                        &resolved.absolute,
+                    )
+            })
+        {
+            return Err(AppError::Conflict(
+                "the directory contains a remote share; remove the share first".to_owned(),
             ));
         }
         if !resolved.absolute.exists() {

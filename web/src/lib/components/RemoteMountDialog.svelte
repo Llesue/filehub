@@ -122,6 +122,12 @@
     }
   }
 
+  function latencyClass(value: number): string {
+    if (value <= 100) return 'good';
+    if (value <= 300) return 'warn';
+    return 'bad';
+  }
+
   function cacheLabel(bytes: number | undefined): string {
     if (!bytes) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB'];
@@ -207,7 +213,9 @@
                     {stateLabel(item.state)}
                   </span>
                   {#if latency[item.id] !== undefined}
-                    <span class="latency">{latency[item.id]} ms</span>
+                    <span class="latency {latencyClass(latency[item.id] ?? 0)}">
+                      {latency[item.id]} ms
+                    </span>
                   {/if}
                   <span class="latency">{t($language, '缩略图缓存')} {cacheLabel(item.thumb_cache_bytes)}</span>
                 </div>
@@ -404,12 +412,12 @@
   }
 
   .meta em.rw {
-    color: var(--danger);
+    color: var(--success, #2e7d32);
   }
 
   .state {
     font-size: 11.5px;
-    color: var(--text-2);
+    color: var(--success, #2e7d32);
   }
 
   .state.bad {
@@ -419,6 +427,18 @@
   .latency {
     font-size: 11.5px;
     color: var(--text-2);
+  }
+
+  .latency.good {
+    color: var(--success, #2e7d32);
+  }
+
+  .latency.warn {
+    color: var(--warning, #b7791f);
+  }
+
+  .latency.bad {
+    color: var(--danger);
   }
 
   .actions {

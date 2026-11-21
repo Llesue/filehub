@@ -34,6 +34,7 @@ fn preferences_json(preferences: &UserPreferences) -> Value {
         "upload_conflict": preferences.upload_conflict,
         "terminal_enabled": preferences.terminal_enabled,
         "editor_enabled": preferences.editor_enabled,
+        "remote_mount_enabled": preferences.remote_mount_enabled,
         "avatar_version": preferences.avatar_version,
     })
 }
@@ -65,6 +66,7 @@ pub struct UpdatePreferencesRequest {
     upload_conflict: Option<String>,
     terminal_enabled: Option<bool>,
     editor_enabled: Option<bool>,
+    remote_mount_enabled: Option<bool>,
 }
 
 pub async fn update_preferences(
@@ -103,6 +105,9 @@ pub async fn update_preferences(
     }
     if let Some(editor_enabled) = request.editor_enabled {
         preferences.editor_enabled = editor_enabled;
+    }
+    if let Some(remote_mount_enabled) = request.remote_mount_enabled {
+        preferences.remote_mount_enabled = remote_mount_enabled;
     }
     if let Some(conflict) = request.upload_conflict {
         if !matches!(conflict.as_str(), "rename" | "overwrite" | "skip") {

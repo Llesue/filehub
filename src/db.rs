@@ -75,6 +75,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         33,
         include_str!("../migrations/0033_federation_hardening.sql"),
     ),
+    (
+        34,
+        include_str!("../migrations/0034_remote_mount_preference.sql"),
+    ),
 ];
 
 pub fn unix_now() -> i64 {
@@ -268,6 +272,7 @@ pub struct UserPreferences {
     pub custom_css_root_id: Option<i64>,
     pub custom_css_path: Option<String>,
     pub custom_css_version: i64,
+    pub remote_mount_enabled: bool,
     pub avatar_path: Option<String>,
     pub avatar_version: i64,
 }
@@ -1142,7 +1147,8 @@ impl Db {
             let preferences = connection
                 .query_row(
                     "SELECT theme, language, show_hidden, show_thumbnails, upload_conflict, terminal_enabled, editor_enabled, \
-                     custom_css_root_id, custom_css_path, custom_css_version, avatar_path, avatar_version \
+                     custom_css_root_id, custom_css_path, custom_css_version, remote_mount_enabled, \
+                     avatar_path, avatar_version \
                      FROM user_preferences WHERE user_id = ?1",
                     params![user_id],
                     |row| {
@@ -1157,8 +1163,9 @@ impl Db {
                             custom_css_root_id: row.get(7)?,
                             custom_css_path: row.get(8)?,
                             custom_css_version: row.get(9)?,
-                            avatar_path: row.get(10)?,
-                            avatar_version: row.get(11)?,
+                            remote_mount_enabled: row.get::<_, i64>(10)? != 0,
+                            avatar_path: row.get(11)?,
+                            avatar_version: row.get(12)?,
                         })
                     },
                 )
@@ -1174,6 +1181,7 @@ impl Db {
                 custom_css_root_id: None,
                 custom_css_path: None,
                 custom_css_version: 0,
+                remote_mount_enabled: true,
                 avatar_path: None,
                 avatar_version: 0,
             }))
@@ -1191,14 +1199,16 @@ impl Db {
             connection.execute(
                 "INSERT INTO user_preferences \
                  (user_id, theme, language, show_hidden, show_thumbnails, upload_conflict, terminal_enabled, editor_enabled, \
-                  custom_css_root_id, custom_css_path, custom_css_version, avatar_path, avatar_version, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                  custom_css_root_id, custom_css_path, custom_css_version, remote_mount_enabled, \
+                  avatar_path, avatar_version, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                  ON CONFLICT(user_id) DO UPDATE SET \
                    theme = excluded.theme, language = excluded.language, \
                    show_hidden = excluded.show_hidden, show_thumbnails = excluded.show_thumbnails, \
                    upload_conflict = excluded.upload_conflict, terminal_enabled = excluded.terminal_enabled, \
                    editor_enabled = excluded.editor_enabled, custom_css_root_id = excluded.custom_css_root_id, \
                    custom_css_path = excluded.custom_css_path, custom_css_version = excluded.custom_css_version, \
+                   remote_mount_enabled = excluded.remote_mount_enabled, \
                    avatar_path = excluded.avatar_path, avatar_version = excluded.avatar_version, \
                    updated_at = excluded.updated_at",
                 params![
@@ -1213,6 +1223,7 @@ impl Db {
                     preferences.custom_css_root_id,
                     preferences.custom_css_path,
                     preferences.custom_css_version,
+                    preferences.remote_mount_enabled as i64,
                     preferences.avatar_path,
                     preferences.avatar_version,
                     unix_now(),

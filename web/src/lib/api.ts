@@ -8,6 +8,7 @@ export interface UserPreferences {
   upload_conflict: 'rename' | 'overwrite' | 'skip';
   terminal_enabled: boolean;
   editor_enabled: boolean;
+  remote_mount_enabled: boolean;
   avatar_version: number;
 }
 
@@ -44,6 +45,7 @@ export interface RemoteGrantInfo {
   path: string;
   mode: 'ro' | 'rw';
   revoked: boolean;
+  available?: boolean;
   token_count: number;
   created_at: number;
 }
@@ -1456,6 +1458,7 @@ export const api = {
       upload_conflict: 'rename' | 'overwrite' | 'skip';
       terminal_enabled: boolean;
       editor_enabled: boolean;
+      remote_mount_enabled: boolean;
     }>,
     csrf: string,
   ): Promise<PreferencesResponse> {
