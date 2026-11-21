@@ -6,6 +6,7 @@
   import AvatarCropper from './AvatarCropper.svelte';
   import Icon from './Icon.svelte';
   import PasswordDialog from './PasswordDialog.svelte';
+  import RemoteMounts from './RemoteMounts.svelte';
 
   let {
     user,
@@ -118,6 +119,10 @@
       />
     </div>
   </section>
+
+  {#if user.features.federation_mount}
+    <RemoteMounts {csrf} />
+  {/if}
 
   <section class="pref-card">
     <h2>{t($language, '外观')}</h2>

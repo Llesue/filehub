@@ -138,6 +138,7 @@ pub struct AppState {
     pub events: Arc<EventBus>,
     pub edit_presence: Mutex<HashMap<PresenceKey, PresenceEntry>>,
     pub updates: Arc<crate::updates::UpdateChecker>,
+    pub federation_clients: Mutex<HashMap<i64, Arc<crate::federation::client::PeerClient>>>,
 }
 
 fn path_chain(target: &Path) -> Vec<String> {
@@ -269,6 +270,7 @@ impl AppState {
             events,
             edit_presence: Mutex::new(HashMap::new()),
             updates,
+            federation_clients: Mutex::new(HashMap::new()),
         });
         state.schedule_directory_size_counts_refresh();
         state.schedule_bigram_backfill();

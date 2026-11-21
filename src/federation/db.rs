@@ -350,3 +350,281 @@ impl Db {
         .await
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct FederationMount {
+    pub id: i64,
+    pub user_id: i64,
+    pub root_id: i64,
+    pub base_url: String,
+    pub grant_id: i64,
+    pub grant_label: String,
+    pub mode: String,
+    pub peer_version: String,
+    pub capabilities: String,
+    pub token_ciphertext: String,
+    pub created_at: i64,
+    pub last_ok_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+fn mount_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FederationMount> {
+    Ok(FederationMount {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        root_id: row.get(2)?,
+        base_url: row.get(3)?,
+        grant_id: row.get(4)?,
+        grant_label: row.get(5)?,
+        mode: row.get(6)?,
+        peer_version: row.get(7)?,
+        capabilities: row.get(8)?,
+        token_ciphertext: row.get(9)?,
+        created_at: row.get(10)?,
+        last_ok_at: row.get(11)?,
+        last_error: row.get(12)?,
+    })
+}
+
+impl Db {
+    pub async fn federation_mount_key(&self) -> anyhow::Result<String> {
+        self.call(|connection| {
+            let existing: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM server_secrets WHERE name = 'federation.mount_key'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(value) = existing {
+                return Ok(value);
+            }
+            let value = crate::auth::random_token(32);
+            connection.execute(
+                "INSERT INTO server_secrets (name, value) VALUES ('federation.mount_key', ?1)",
+                params![value],
+            )?;
+            Ok(value)
+        })
+        .await
+    }
+
+    pub async fn federation_add_remote_root(
+        &self,
+        user_id: i64,
+        alias: &str,
+        real_path: &str,
+        read_only: bool,
+    ) -> anyhow::Result<i64> {
+        let alias = alias.to_owned();
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            let next: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM user_roots WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "INSERT INTO user_roots \
+                 (user_id, real_path, alias, read_only, sort_order, created_at, kind, mount_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'remote', NULL)",
+                params![
+                    user_id,
+                    real_path,
+                    alias,
+                    read_only as i64,
+                    next,
+                    unix_now()
+                ],
+            )?;
+            Ok(connection.last_insert_rowid())
+        })
+        .await
+    }
+
+    pub async fn federation_bind_root(&self, root_id: i64, mount_id: i64) -> anyhow::Result<()> {
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE user_roots SET mount_id = ?1 WHERE id = ?2",
+                params![mount_id, root_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn federation_create_mount(
+        &self,
+        user_id: i64,
+        root_id: i64,
+        base_url: &str,
+        grant_id: i64,
+        grant_label: &str,
+        mode: &str,
+        peer_version: &str,
+        capabilities: &str,
+        token_ciphertext: &str,
+    ) -> anyhow::Result<i64> {
+        let base_url = base_url.to_owned();
+        let grant_label = grant_label.to_owned();
+        let mode = mode.to_owned();
+        let peer_version = peer_version.to_owned();
+        let capabilities = capabilities.to_owned();
+        let token_ciphertext = token_ciphertext.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO federation_mounts \
+                 (user_id, root_id, base_url, grant_id, grant_label, mode, peer_version, \
+                  capabilities, token_ciphertext, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    user_id,
+                    root_id,
+                    base_url,
+                    grant_id,
+                    grant_label,
+                    mode,
+                    peer_version,
+                    capabilities,
+                    token_ciphertext,
+                    unix_now()
+                ],
+            )?;
+            Ok(connection.last_insert_rowid())
+        })
+        .await
+    }
+
+    pub async fn federation_list_mounts(
+        &self,
+        user_id: i64,
+    ) -> anyhow::Result<Vec<FederationMount>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT m.id, m.user_id, m.root_id, m.base_url, m.grant_id, m.grant_label, m.mode, \
+                        m.peer_version, m.capabilities, m.token_ciphertext, m.created_at, \
+                        m.last_ok_at, m.last_error \
+                 FROM federation_mounts m JOIN user_roots r ON r.id = m.root_id \
+                 WHERE m.user_id = ?1 AND r.kind = 'remote' ORDER BY r.sort_order, m.id",
+            )?;
+            let rows = statement.query_map(params![user_id], mount_from_row)?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn federation_mount_by_root(
+        &self,
+        root_id: i64,
+        user_id: i64,
+    ) -> anyhow::Result<Option<FederationMount>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
+                            peer_version, capabilities, token_ciphertext, created_at, \
+                            last_ok_at, last_error \
+                     FROM federation_mounts WHERE root_id = ?1 AND user_id = ?2",
+                    params![root_id, user_id],
+                    mount_from_row,
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn federation_mount(
+        &self,
+        id: i64,
+        user_id: i64,
+    ) -> anyhow::Result<Option<FederationMount>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
+                            peer_version, capabilities, token_ciphertext, created_at, \
+                            last_ok_at, last_error \
+                     FROM federation_mounts WHERE id = ?1 AND user_id = ?2",
+                    params![id, user_id],
+                    mount_from_row,
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn federation_delete_mount(&self, id: i64, user_id: i64) -> anyhow::Result<bool> {
+        self.call(move |connection| {
+            let root_id: Option<i64> = connection
+                .query_row(
+                    "SELECT root_id FROM federation_mounts WHERE id = ?1 AND user_id = ?2",
+                    params![id, user_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(root_id) = root_id else {
+                return Ok(false);
+            };
+            connection.execute(
+                "DELETE FROM user_roots WHERE id = ?1 AND user_id = ?2 AND kind = 'remote'",
+                params![root_id, user_id],
+            )?;
+            Ok(true)
+        })
+        .await
+    }
+
+    pub async fn federation_update_mount_token(
+        &self,
+        id: i64,
+        user_id: i64,
+        token_ciphertext: &str,
+    ) -> anyhow::Result<bool> {
+        let token_ciphertext = token_ciphertext.to_owned();
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "UPDATE federation_mounts SET token_ciphertext = ?1, last_error = NULL \
+                 WHERE id = ?2 AND user_id = ?3",
+                params![token_ciphertext, id, user_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn federation_update_mount_state(
+        &self,
+        id: i64,
+        ok: bool,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let error = error.map(str::to_owned);
+        self.call(move |connection| {
+            if ok {
+                connection.execute(
+                    "UPDATE federation_mounts SET last_ok_at = ?1, last_error = NULL WHERE id = ?2",
+                    params![unix_now(), id],
+                )?;
+            } else {
+                connection.execute(
+                    "UPDATE federation_mounts SET last_error = ?1 WHERE id = ?2",
+                    params![error, id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_count_mounts(&self, user_id: i64) -> anyhow::Result<i64> {
+        self.call(move |connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM federation_mounts WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+        })
+        .await
+    }
+}

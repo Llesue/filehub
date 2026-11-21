@@ -3865,7 +3865,7 @@
                 void loadList(root.id, '');
               }}
             >
-              <Icon name="folder" size={18} />
+              <Icon name={root.kind === 'remote' ? 'link' : 'folder'} size={18} />
               <span class="nav-label">{rootLabel(root.alias)}</span>
               {#if root.read_only}
                 <span class="nav-readonly" title={t($language, '目录已设为只读')}

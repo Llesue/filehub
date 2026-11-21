@@ -87,6 +87,19 @@ pub async fn list(
         && settings.settings.thumbnails.video
         && state.ffmpeg.is_some();
     let root = load_root(&state, current.user.id, query.root).await?;
+    if root.is_remote() {
+        return crate::federation::proxy::list(
+            &state,
+            current.user.id,
+            &root,
+            query.path.as_deref(),
+            query.cursor.as_deref(),
+            query.limit,
+            query.sort.as_deref(),
+            query.order.as_deref(),
+        )
+        .await;
+    }
     let path = query.path.unwrap_or_default();
     let resolved = authz::resolve(&state, current.user.id, root.id, &path, false).await?;
     let policy_read_only = resolved.access_read_only;
@@ -549,6 +562,17 @@ pub async fn download(
 ) -> Result<Response, AppError> {
     let current = auth::current_user(&state, &headers).await?;
     let root = load_root(&state, current.user.id, query.root).await?;
+    if root.is_remote() {
+        return crate::federation::proxy::download(
+            &state,
+            current.user.id,
+            &root,
+            &query.path,
+            query.inline.unwrap_or(false),
+            &headers,
+        )
+        .await;
+    }
     let resolved = authz::resolve(&state, current.user.id, root.id, &query.path, false).await?;
     serve_file(&headers, &resolved.absolute, query.inline.unwrap_or(false)).await
 }
@@ -1888,6 +1912,8 @@ fn root_json(root: &Root) -> Value {
         "id": root.id,
         "alias": root.alias,
         "read_only": root.read_only,
+        "kind": root.kind,
+        "mount_id": root.mount_id,
     })
 }
 

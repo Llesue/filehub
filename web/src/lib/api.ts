@@ -28,6 +28,28 @@ export interface UserFeatures {
   terminal: boolean;
   zip: boolean;
   unzip: boolean;
+  federation_mount?: boolean;
+  federation_share?: boolean;
+}
+
+export interface RemoteGrant {
+  id: number;
+  label: string;
+  mode: 'ro' | 'rw';
+}
+
+export interface RemoteMount {
+  id: number;
+  root_id: number;
+  alias: string;
+  base_url: string;
+  grant_id: number;
+  grant_label: string;
+  mode: 'ro' | 'rw';
+  state: 'online' | 'offline' | 'token_invalid' | 'grant_revoked' | 'unsupported';
+  last_ok_at: number | null;
+  last_error: string | null;
+  created_at: number;
 }
 
 export interface Capabilities {
@@ -467,6 +489,64 @@ export const api = {
 
   version(): Promise<VersionInfo> {
     return request<VersionInfo>('/version');
+  },
+
+  remoteProbe(url: string, csrf: string): Promise<{
+    ok: boolean;
+    product: string;
+    version: number;
+    server_version: string;
+    instance_id: string;
+    capabilities: string[];
+    resolved_ips: string[];
+    address_class: string;
+    plaintext: boolean;
+  }> {
+    return request('/remote/probe', { method: 'POST', body: JSON.stringify({ url }) }, csrf);
+  },
+
+  remotePreview(
+    url: string,
+    token: string,
+    csrf: string,
+  ): Promise<{ grants: RemoteGrant[] }> {
+    return request(
+      '/remote/grants/preview',
+      { method: 'POST', body: JSON.stringify({ url, token }) },
+      csrf,
+    );
+  },
+
+  remoteMounts(): Promise<{ mounts: RemoteMount[] }> {
+    return request('/remote/mounts');
+  },
+
+  remoteCreateMount(
+    url: string,
+    token: string,
+    grantId: number,
+    alias: string,
+    csrf: string,
+  ): Promise<{ id: number; root_id: number }> {
+    return request(
+      '/remote/mounts',
+      {
+        method: 'POST',
+        body: JSON.stringify({ url, token, grant_id: grantId, alias }),
+      },
+      csrf,
+    );
+  },
+
+  remoteDeleteMount(id: number, csrf: string): Promise<void> {
+    return request(`/remote/mounts/${id}`, { method: 'DELETE' }, csrf);
+  },
+
+  remoteTestMount(
+    id: number,
+    csrf: string,
+  ): Promise<{ ok: boolean; latency_ms: number; server_version?: string; message?: string }> {
+    return request(`/remote/mounts/${id}/test`, { method: 'POST' }, csrf);
   },
 
   list(

@@ -51,6 +51,27 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/remote/tokens/{id}/rotate",
             post(crate::federation::admin::rotate_token),
         )
+        .route("/remote/probe", post(crate::federation::mounts::probe))
+        .route(
+            "/remote/grants/preview",
+            post(crate::federation::mounts::preview),
+        )
+        .route(
+            "/remote/mounts",
+            get(crate::federation::mounts::list).post(crate::federation::mounts::create),
+        )
+        .route(
+            "/remote/mounts/{id}",
+            axum::routing::delete(crate::federation::mounts::delete),
+        )
+        .route(
+            "/remote/mounts/{id}/test",
+            post(crate::federation::mounts::test),
+        )
+        .route(
+            "/remote/mounts/{id}/reauth",
+            post(crate::federation::mounts::reauth),
+        )
         .route("/me/password", post(change_password))
         .route("/events", get(events_stream))
         .route(
@@ -1449,6 +1470,8 @@ fn user_json(user: &User) -> Value {
             "terminal": user.feature_terminal,
             "zip": user.feature_zip,
             "unzip": user.feature_unzip,
+            "federation_mount": user.feature_federation_mount,
+            "federation_share": user.feature_federation_share,
         },
         "created_at": user.created_at,
         "updated_at": user.updated_at,

@@ -25,6 +25,9 @@ pub async fn resolve(
         .find(|root| root.id == root_id)
         .cloned()
         .ok_or(AppError::NotFound)?;
+    if root.is_remote() {
+        return Err(AppError::Forbidden);
+    }
     let links = state
         .db
         .list_trusted_links()
@@ -57,6 +60,9 @@ pub async fn resolve_many(
         .find(|root| root.id == root_id)
         .cloned()
         .ok_or(AppError::NotFound)?;
+    if root.is_remote() {
+        return Err(AppError::Forbidden);
+    }
     let links = state
         .db
         .list_trusted_links()
