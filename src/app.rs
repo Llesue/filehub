@@ -31,6 +31,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .nest("/api/v1", crate::api::router(state.clone()))
+        .nest("/api/federation/v1", crate::federation::peer::router())
         .fallback(web::serve_static)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())

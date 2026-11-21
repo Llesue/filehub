@@ -23,6 +23,8 @@ const en: Record<string, string> = {
   管理员: 'Admin',
   用户: 'User',
   退出登录: 'Sign out',
+  在GitHub上查看源码: 'View source on GitHub',
+  有新版本: 'Update available',
   关闭菜单: 'Close menu',
   打开菜单: 'Open menu',
   上传: 'Upload',

@@ -483,7 +483,7 @@ impl Db {
         })
     }
 
-    async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,

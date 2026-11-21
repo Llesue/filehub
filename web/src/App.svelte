@@ -63,6 +63,7 @@
     type SearchEntry,
     type Usage,
     type User,
+    type VersionInfo,
   } from './lib/api';
   import { applyTheme, resolveTheme, type Theme, type ThemePreference } from './lib/theme';
   import { splitFileName } from './lib/filename';
@@ -85,6 +86,7 @@
   let loading = $state(true);
   let initialized = $state(false);
   let user = $state<User | null>(null);
+  let versionInfo = $state<VersionInfo | null>(null);
   let preferences = $state<UserPreferences | null>(null);
   let systemFeatures = $state<SystemFeatures>({ thumbnails: true, editor: true, terminal: true });
   let capabilities = $state<Capabilities>({ terminal: true, zip: true, unzip: true });
@@ -753,6 +755,14 @@
     }
   }
 
+  async function loadVersionInfo(): Promise<void> {
+    try {
+      versionInfo = await api.version();
+    } catch {
+      // Update checks are best-effort; keep the baked version.
+    }
+  }
+
   function handleAuth(auth: AuthResponse): void {
     user = auth.user;
     csrf = auth.csrf_token;
@@ -765,6 +775,7 @@
     stopBootSlowHint();
     void loadPreferences();
     void loadRoots();
+    void loadVersionInfo();
   }
 
   async function restoreJobs(userId: number): Promise<void> {
@@ -3920,7 +3931,29 @@
             </div>
           {/each}
         </div>
-        <div class="app-version">v{__APP_VERSION__}</div>
+        <div class="app-version">
+          <a
+            class="version-link"
+            href={versionInfo?.repository ?? 'https://github.com/Llesue/filehub'}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={t($language, '在GitHub上查看源码')}
+            title="GitHub"
+          >
+            <Icon name="github" size={14} />
+          </a>
+          <span>v{versionInfo?.version ?? __APP_VERSION__}</span>
+          {#if versionInfo?.update_available}
+            <a
+              class="version-update"
+              href={versionInfo?.releases ?? 'https://github.com/Llesue/filehub/releases'}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {t($language, '有新版本')}
+            </a>
+          {/if}
+        </div>
       </aside>
 
       <input
@@ -5851,10 +5884,40 @@
   }
 
   .app-version {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     padding: 6px 2px 0;
     color: var(--text-2);
     font-size: 11.5px;
     text-align: left;
+  }
+
+  .version-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    margin: -6px 0 -6px -4px;
+    border-radius: 6px;
+    color: var(--text-2);
+    text-decoration: none;
+  }
+
+  .version-link:hover {
+    color: var(--text);
+    background: var(--surface-2);
+  }
+
+  .version-update {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+  }
+
+  .version-update:hover {
+    text-decoration: underline;
   }
 
   .quota-fill.disk {

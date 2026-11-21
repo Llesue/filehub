@@ -29,6 +29,28 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/me", get(me))
+        .route("/version", get(crate::updates::version))
+        .route("/admin/updates/check", post(crate::updates::admin_check))
+        .route(
+            "/remote/grants",
+            get(crate::federation::admin::list_grants).post(crate::federation::admin::create_grant),
+        )
+        .route(
+            "/remote/grants/{id}",
+            axum::routing::delete(crate::federation::admin::revoke_grant),
+        )
+        .route(
+            "/remote/tokens",
+            get(crate::federation::admin::list_tokens).post(crate::federation::admin::create_token),
+        )
+        .route(
+            "/remote/tokens/{id}",
+            axum::routing::delete(crate::federation::admin::revoke_token),
+        )
+        .route(
+            "/remote/tokens/{id}/rotate",
+            post(crate::federation::admin::rotate_token),
+        )
         .route("/me/password", post(change_password))
         .route("/events", get(events_stream))
         .route(

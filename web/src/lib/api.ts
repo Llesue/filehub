@@ -70,6 +70,18 @@ export interface Root {
   id: number;
   alias: string;
   read_only: boolean;
+  kind?: 'local' | 'remote';
+  mount_id?: number | null;
+}
+
+export interface VersionInfo {
+  version: string;
+  repository: string;
+  releases: string;
+  check_enabled: boolean;
+  latest: string | null;
+  update_available: boolean;
+  checked_at: number | null;
 }
 
 export interface Entry {
@@ -451,6 +463,10 @@ export const api = {
 
   roots(): Promise<{ roots: Root[] }> {
     return request<{ roots: Root[] }>('/roots');
+  },
+
+  version(): Promise<VersionInfo> {
+    return request<VersionInfo>('/version');
   },
 
   list(

@@ -137,6 +137,7 @@ pub struct AppState {
     pub slow_requests: Mutex<VecDeque<SlowRequest>>,
     pub events: Arc<EventBus>,
     pub edit_presence: Mutex<HashMap<PresenceKey, PresenceEntry>>,
+    pub updates: Arc<crate::updates::UpdateChecker>,
 }
 
 fn path_chain(target: &Path) -> Vec<String> {
@@ -236,6 +237,7 @@ impl AppState {
         let (audit_tx, audit_rx) = tokio::sync::mpsc::channel::<AuditMessage>(1024);
         spawn_audit_writer(db.clone(), audit_rx, Arc::clone(&events));
         let zip_permits = snapshot.settings.downloads.zip_concurrency.max(1);
+        let updates = Arc::new(crate::updates::UpdateChecker::new(crate::updates::API_URL)?);
 
         let state = Arc::new(Self {
             db,
@@ -266,6 +268,7 @@ impl AppState {
             slow_requests: Mutex::new(VecDeque::new()),
             events,
             edit_presence: Mutex::new(HashMap::new()),
+            updates,
         });
         state.schedule_directory_size_counts_refresh();
         state.schedule_bigram_backfill();

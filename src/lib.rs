@@ -33,6 +33,7 @@ pub mod db;
 pub mod editor;
 pub mod error;
 pub mod events;
+pub mod federation;
 pub mod files;
 pub mod fsops;
 pub mod indexer;
@@ -52,6 +53,7 @@ pub mod state;
 pub mod terminal_ws;
 pub mod thumbs;
 pub mod unzip;
+pub mod updates;
 pub mod usage;
 pub mod web;
 #[cfg(windows)]

@@ -45,6 +45,12 @@ pub enum AppError {
     ShareRevoked,
     #[error("share has expired")]
     ShareExpired,
+    #[error("federation token revoked")]
+    TokenRevoked,
+    #[error("federation token expired")]
+    TokenExpired,
+    #[error("federation grant revoked")]
+    GrantRevoked,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -93,6 +99,9 @@ impl AppError {
             Self::NotFound => "NOT_FOUND",
             Self::ShareRevoked => "SHARE_REVOKED",
             Self::ShareExpired => "SHARE_EXPIRED",
+            Self::TokenRevoked => "TOKEN_REVOKED",
+            Self::TokenExpired => "TOKEN_EXPIRED",
+            Self::GrantRevoked => "GRANT_REVOKED",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
     }
@@ -180,6 +189,21 @@ impl IntoResponse for AppError {
                 StatusCode::GONE,
                 "SHARE_EXPIRED",
                 "Share has expired".to_owned(),
+            ),
+            Self::TokenRevoked => (
+                StatusCode::GONE,
+                "TOKEN_REVOKED",
+                "Token has been revoked".to_owned(),
+            ),
+            Self::TokenExpired => (
+                StatusCode::GONE,
+                "TOKEN_EXPIRED",
+                "Token has expired".to_owned(),
+            ),
+            Self::GrantRevoked => (
+                StatusCode::GONE,
+                "GRANT_REVOKED",
+                "Grant has been revoked".to_owned(),
             ),
             Self::Internal(err) => {
                 tracing::error!(error = %err, "internal server error");

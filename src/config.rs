@@ -25,6 +25,7 @@ pub struct Settings {
     pub log: LogSettings,
     pub media: MediaSettings,
     pub federation: FederationSettings,
+    pub updates: UpdatesSettings,
     pub default_quota_bytes: i64,
     /// Maximum number of files+directories per user home. 0 disables the limit.
     pub max_entries_per_user: u64,
@@ -52,6 +53,7 @@ impl Default for Settings {
             log: LogSettings::default(),
             media: MediaSettings::default(),
             federation: FederationSettings::default(),
+            updates: UpdatesSettings::default(),
             default_quota_bytes: 15 * 1024 * 1024 * 1024,
             max_entries_per_user: 1_000_000,
             terminal_enabled: true,
@@ -322,6 +324,22 @@ impl Default for FederationSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct UpdatesSettings {
+    pub check_enabled: bool,
+    pub check_interval_hours: i64,
+}
+
+impl Default for UpdatesSettings {
+    fn default() -> Self {
+        Self {
+            check_enabled: true,
+            check_interval_hours: 12,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JobsSettings {
     pub io_workers: usize,
     pub interactive_workers: usize,
@@ -427,6 +445,9 @@ impl Settings {
         }
         if self.federation.max_spool_bytes == 0 {
             bail!("federation.max_spool_bytes must be greater than zero");
+        }
+        if !(1..=168).contains(&self.updates.check_interval_hours) {
+            bail!("updates.check_interval_hours must be between 1 and 168");
         }
         if self.security.session_ttl_hours == 0 {
             bail!("security.session_ttl_hours must be greater than zero");
