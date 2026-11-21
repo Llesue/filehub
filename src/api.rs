@@ -75,6 +75,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             axum::routing::patch(crate::federation::mounts::rename),
         )
         .route(
+            "/remote/mounts/{id}/avatar",
+            get(crate::federation::mounts::avatar),
+        )
+        .route(
             "/remote/mounts/{id}/test",
             post(crate::federation::mounts::test),
         )

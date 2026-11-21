@@ -106,6 +106,38 @@ impl PeerClient {
         self.json(self.http.get(self.endpoint("/info"))).await
     }
 
+    pub async fn avatar(&self, grant: i64) -> Result<reqwest::Response, PeerError> {
+        let response = self
+            .auth(self.http.get(self.endpoint("/avatar")))
+            .query(&[("grant", grant.to_string())])
+            .send()
+            .await
+            .map_err(|error| PeerError {
+                status: 0,
+                code: "PEER_UNREACHABLE".to_owned(),
+                message: error.to_string(),
+            })?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        let status = response.status();
+        let body = response.bytes().await.unwrap_or_default();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        Err(PeerError {
+            status: status.as_u16(),
+            code: body
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("PEER_ERROR")
+                .to_owned(),
+            message: body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("peer avatar failed")
+                .to_owned(),
+        })
+    }
+
     pub async fn grants(&self) -> Result<Value, PeerError> {
         self.json(self.auth(self.http.get(self.endpoint("/grants"))))
             .await

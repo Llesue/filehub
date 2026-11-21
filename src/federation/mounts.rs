@@ -224,6 +224,15 @@ async fn mount_inner(
         .and_then(Value::as_str)
         .unwrap_or("ro")
         .to_owned();
+    let owner_name = grant
+        .get("owner_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let avatar_version = grant
+        .get("avatar_version")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let key = crypto::mount_key(&state.db)
         .await
         .map_err(AppError::internal)?;
@@ -251,6 +260,8 @@ async fn mount_inner(
                 &serde_json::to_string(info.get("capabilities").unwrap_or(&json!([])))
                     .unwrap_or_else(|_| "[]".to_owned()),
                 &ciphertext,
+                &owner_name,
+                avatar_version,
             )
             .await
             .map_err(AppError::internal)?;
@@ -435,11 +446,34 @@ pub(crate) async fn health_loop(state: Arc<AppState>) {
                 continue;
             };
             match client.grants().await {
-                Ok(_) => {
+                Ok(value) => {
                     let _ = state
                         .db
                         .federation_update_mount_state(mount.id, true, None, None)
                         .await;
+                    if let Some(grant) =
+                        value
+                            .get("grants")
+                            .and_then(Value::as_array)
+                            .and_then(|items| {
+                                items.iter().find(|item| {
+                                    item.get("id").and_then(Value::as_i64) == Some(mount.grant_id)
+                                })
+                            })
+                    {
+                        let name = grant
+                            .get("owner_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let version = grant
+                            .get("avatar_version")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0);
+                        let _ = state
+                            .db
+                            .federation_update_mount_owner(mount.id, name, version)
+                            .await;
+                    }
                 }
                 Err(error) => {
                     if is_auth_error(&error) {
@@ -448,7 +482,9 @@ pub(crate) async fn health_loop(state: Arc<AppState>) {
                             code = %error.code,
                             "remote token is invalid; unmounting"
                         );
-                        let _ = remove_mount(&state, mount.user_id, &mount).await;
+                        let _ =
+                            remove_mount(&state, mount.user_id, &mount, Some(error.code.as_str()))
+                                .await;
                     } else {
                         let _ = state
                             .db
@@ -562,6 +598,8 @@ pub async fn list(
             "grant_id": mount.grant_id,
             "grant_label": mount.grant_label,
             "mode": mount.mode,
+            "owner_name": mount.owner_name,
+            "avatar_version": mount.avatar_version,
             "capabilities": serde_json::from_str::<Value>(&mount.capabilities)
                 .unwrap_or_else(|_| json!([])),
             "thumb_cache_bytes": thumb_cache_bytes,
@@ -579,6 +617,7 @@ pub(crate) async fn remove_mount(
     state: &Arc<AppState>,
     user_id: i64,
     mount: &FederationMount,
+    reason: Option<&str>,
 ) -> Result<bool, AppError> {
     let deleted = state
         .db
@@ -606,6 +645,18 @@ pub(crate) async fn remove_mount(
         Some(user_id),
         json!({ "user_id": user_id }),
     );
+    if let Some(reason) = reason {
+        state.events.publish(
+            "remote.unmounted",
+            Some(user_id),
+            json!({
+                "user_id": user_id,
+                "mount_id": mount.id,
+                "alias": mount.grant_label,
+                "reason": reason,
+            }),
+        );
+    }
     Ok(deleted)
 }
 
@@ -614,6 +665,54 @@ fn is_auth_error(error: &crate::federation::client::PeerError) -> bool {
         error.code.as_str(),
         "UNAUTHORIZED" | "TOKEN_REVOKED" | "TOKEN_EXPIRED" | "GRANT_REVOKED"
     ) || error.status == 401
+}
+
+pub async fn avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let mount = state
+        .db
+        .federation_mount(id, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    if mount.avatar_version <= 0 {
+        return Err(AppError::NotFound);
+    }
+    let cache_dir = state
+        .settings()
+        .settings
+        .cache_dir
+        .join("federation-avatars");
+    let cache_path = cache_dir.join(format!("{}-{}.jpg", mount.id, mount.avatar_version));
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "image/jpeg")
+            .header(axum::http::header::CACHE_CONTROL, "private, max-age=300")
+            .body(axum::body::Body::from(bytes))
+            .map_err(|error| AppError::internal(anyhow::anyhow!(error)));
+    }
+    let client = client_for_mount(&state, &mount).await?;
+    let response = client
+        .avatar(mount.grant_id)
+        .await
+        .map_err(|error| error.into_app())?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
+    let _ = crate::platform::create_private_dir_all(&cache_dir);
+    let _ = crate::platform::write_private_file(&cache_path, &bytes);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "image/jpeg")
+        .header(axum::http::header::CACHE_CONTROL, "private, max-age=300")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| AppError::internal(anyhow::anyhow!(error)))
 }
 
 pub async fn delete(
@@ -629,7 +728,7 @@ pub async fn delete(
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
-    let deleted = remove_mount(&state, current.user.id, &mount).await?;
+    let deleted = remove_mount(&state, current.user.id, &mount, None).await?;
     if !deleted {
         return Err(AppError::NotFound);
     }
@@ -670,7 +769,7 @@ pub async fn test(
     let latency = started.elapsed().as_millis() as i64;
     if let Err(error) = client.grants().await {
         if is_auth_error(&error) {
-            remove_mount(&state, current.user.id, &mount).await?;
+            remove_mount(&state, current.user.id, &mount, Some(error.code.as_str())).await?;
             return Ok(Json(json!({
                 "ok": false,
                 "removed": true,

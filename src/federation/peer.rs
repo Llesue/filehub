@@ -259,6 +259,7 @@ pub fn router() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
         .route("/info", get(info))
         .route("/grants", get(grants))
+        .route("/avatar", get(avatar))
         .route("/list", get(list))
         .route("/stat", get(stat))
         .route("/download", get(download))
@@ -333,11 +334,55 @@ pub async fn thumb(
     .await
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AvatarQuery {
+    grant: i64,
+}
+
+pub async fn avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AvatarQuery>,
+) -> Result<Response, AppError> {
+    let auth = authenticate(&state, &headers).await?;
+    let _grant = auth.grant(&state, query.grant).await?;
+    let preferences = state
+        .db
+        .get_user_preferences(auth.token.user_id)
+        .await
+        .map_err(AppError::internal)?;
+    if preferences.avatar_version <= 0 {
+        return Err(AppError::NotFound);
+    }
+    let Some(path) = preferences.avatar_path else {
+        return Err(AppError::NotFound);
+    };
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(crate::fsops::io_error)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "private, max-age=300")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| AppError::internal(anyhow::anyhow!(error)))
+}
+
 pub async fn grants(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let auth = authenticate(&state, &headers).await?;
+    let owner = state
+        .db
+        .find_user_by_id(auth.token.user_id)
+        .await
+        .map_err(AppError::internal)?;
+    let preferences = state
+        .db
+        .get_user_preferences(auth.token.user_id)
+        .await
+        .map_err(AppError::internal)?;
     let items: Vec<Value> = auth
         .grants
         .iter()
@@ -346,6 +391,8 @@ pub async fn grants(
                 "id": grant.id,
                 "label": grant.label,
                 "mode": grant.mode,
+                "owner_name": owner.as_ref().map(|user| user.username.clone()).unwrap_or_default(),
+                "avatar_version": preferences.avatar_version,
             })
         })
         .collect();

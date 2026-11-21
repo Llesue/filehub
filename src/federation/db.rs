@@ -360,6 +360,8 @@ pub struct FederationMount {
     pub grant_id: i64,
     pub grant_label: String,
     pub mode: String,
+    pub owner_name: String,
+    pub avatar_version: i64,
     pub peer_version: String,
     pub capabilities: String,
     pub token_ciphertext: String,
@@ -378,6 +380,8 @@ fn mount_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FederationMount> 
         grant_id: row.get(4)?,
         grant_label: row.get(5)?,
         mode: row.get(6)?,
+        owner_name: row.get(14)?,
+        avatar_version: row.get(15)?,
         peer_version: row.get(7)?,
         capabilities: row.get(8)?,
         token_ciphertext: row.get(9)?,
@@ -467,6 +471,8 @@ impl Db {
         peer_version: &str,
         capabilities: &str,
         token_ciphertext: &str,
+        owner_name: &str,
+        avatar_version: i64,
     ) -> anyhow::Result<i64> {
         let base_url = base_url.to_owned();
         let grant_label = grant_label.to_owned();
@@ -474,12 +480,13 @@ impl Db {
         let peer_version = peer_version.to_owned();
         let capabilities = capabilities.to_owned();
         let token_ciphertext = token_ciphertext.to_owned();
+        let owner_name = owner_name.to_owned();
         self.call(move |connection| {
             connection.execute(
                 "INSERT INTO federation_mounts \
                  (user_id, root_id, base_url, grant_id, grant_label, mode, peer_version, \
-                  capabilities, token_ciphertext, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  capabilities, token_ciphertext, created_at, owner_name, avatar_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     user_id,
                     root_id,
@@ -490,7 +497,9 @@ impl Db {
                     peer_version,
                     capabilities,
                     token_ciphertext,
-                    unix_now()
+                    unix_now(),
+                    owner_name,
+                    avatar_version
                 ],
             )?;
             Ok(connection.last_insert_rowid())
@@ -506,7 +515,8 @@ impl Db {
             let mut statement = connection.prepare(
                 "SELECT m.id, m.user_id, m.root_id, m.base_url, m.grant_id, m.grant_label, m.mode, \
                         m.peer_version, m.capabilities, m.token_ciphertext, m.created_at, \
-                        m.last_ok_at, m.last_error, m.last_error_code \
+                        m.last_ok_at, m.last_error, m.last_error_code, \
+                        m.owner_name, m.avatar_version \
                  FROM federation_mounts m JOIN user_roots r ON r.id = m.root_id \
                  WHERE m.user_id = ?1 AND r.kind = 'remote' ORDER BY r.sort_order, m.id",
             )?;
@@ -521,7 +531,7 @@ impl Db {
             let mut statement = connection.prepare(
                 "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
                         peer_version, capabilities, token_ciphertext, created_at, \
-                        last_ok_at, last_error, last_error_code \
+                        last_ok_at, last_error, last_error_code, owner_name, avatar_version \
                  FROM federation_mounts ORDER BY id",
             )?;
             let rows = statement.query_map([], mount_from_row)?;
@@ -540,7 +550,7 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
                             peer_version, capabilities, token_ciphertext, created_at, \
-                            last_ok_at, last_error, last_error_code \
+                            last_ok_at, last_error, last_error_code, owner_name, avatar_version \
                      FROM federation_mounts WHERE root_id = ?1 AND user_id = ?2",
                     params![root_id, user_id],
                     mount_from_row,
@@ -560,7 +570,7 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
                             peer_version, capabilities, token_ciphertext, created_at, \
-                            last_ok_at, last_error, last_error_code \
+                            last_ok_at, last_error, last_error_code, owner_name, avatar_version \
                      FROM federation_mounts WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     mount_from_row,
@@ -857,6 +867,23 @@ impl Db {
                 params![read_only as i64, root_id],
             )?;
             transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_update_mount_owner(
+        &self,
+        id: i64,
+        owner_name: &str,
+        avatar_version: i64,
+    ) -> anyhow::Result<()> {
+        let owner_name = owner_name.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE federation_mounts SET owner_name = ?1, avatar_version = ?2 WHERE id = ?3",
+                params![owner_name, avatar_version, id],
+            )?;
             Ok(())
         })
         .await

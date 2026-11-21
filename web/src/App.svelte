@@ -90,6 +90,7 @@
   let user = $state<User | null>(null);
   let versionInfo = $state<VersionInfo | null>(null);
   let mountDialogOpen = $state(false);
+  let avatarFailures = $state<Record<number, boolean>>({});
   let userRemote = $state<{ mount: boolean; share: boolean } | null>(null);
   const canMountRemote = $derived(
     userRemote?.mount ?? user?.features.federation_mount ?? false,
@@ -236,11 +237,8 @@
   let contextMenuLeft = $state(false);
   let contextMenuUp = $state(false);
   let sortMenuOpen = $state(false);
-  let uploadBatchStarted = 0;
   let uploadBatchBytes = 0;
   let uploadBatchCount = 0;
-  let uploadBatchRoot: number | null = null;
-  let uploadBatchPath = '';
   const shareNotifySeen = new SvelteMap<string, number>();
   let blankMenu = $state<{ x: number; y: number } | null>(null);
   let blankMenuElement = $state<HTMLElement | null>(null);
@@ -490,6 +488,16 @@
     );
   }
 
+  function avatarInitial(name: string): string {
+    return (name.trim().charAt(0) || '?').toUpperCase();
+  }
+
+  function avatarColor(name: string): string {
+    let hash = 0;
+    for (const char of name) hash = (hash * 31 + (char.codePointAt(0) ?? 0)) % 360;
+    return `hsl(${hash} 45% 52%)`;
+  }
+
   function remoteStateBadge(rootId: number): string | null {
     const mount = remoteMounts[rootId];
     if (!mount || mount.state === 'online') return null;
@@ -673,6 +681,19 @@
       if (event.type === 'roots.changed') {
         void refreshRoots();
         void refreshRemoteCaps();
+        return;
+      }
+      if (event.type === 'remote.unmounted') {
+        const alias = String(event.data.alias ?? '');
+        const reason = String(event.data.reason ?? '');
+        const label =
+          reason === 'GRANT_REVOKED' ? t($language, '授权已被撤销') : t($language, '令牌已失效');
+        const message = t($language, '远程目录「{alias}」已自动卸载：{reason}', {
+          alias,
+          reason: label,
+        });
+        addNotification('warning', message);
+        showToast(message);
         return;
       }
       if (event.type === 'usage.updated') {
@@ -1058,28 +1079,14 @@
       },
       onNotice: (message, kind) => showNotice(message, kind),
       onAllDone: () => {
-        showToast(t($language, '上传完成'));
-        if (
-          shouldNotifyLong(
-            uploadBatchStarted,
-            uploadBatchBytes,
-            uploadBatchCount,
-            activeRootId !== uploadBatchRoot || currentPath !== uploadBatchPath,
-          )
-        ) {
-          notifyLongCompletion(
-            t($language, '上传完成：{count} 项 · {size}', {
-              count: uploadBatchCount,
-              size: formatSize(uploadBatchBytes),
-            }),
-            activeRootId !== uploadBatchRoot || currentPath !== uploadBatchPath,
-          );
-        }
-        uploadBatchStarted = 0;
+        const message = t($language, '上传完成：{count} 项 · {size}', {
+          count: uploadBatchCount,
+          size: formatSize(uploadBatchBytes),
+        });
+        showToast(message);
+        addNotification('job_completed', message);
         uploadBatchBytes = 0;
         uploadBatchCount = 0;
-        uploadBatchRoot = null;
-        uploadBatchPath = '';
       },
     });
     if (uploadManager.pendingCount > 0) {
@@ -3364,11 +3371,8 @@
     }
     filesError = '';
     if (uploadBatchCount === 0) {
-      uploadBatchStarted = Date.now();
       uploadBatchBytes = 0;
       uploadBatchCount = 0;
-      uploadBatchRoot = activeRootId;
-      uploadBatchPath = basePath;
     }
     uploadBatchCount += candidates.length;
     uploadBatchBytes += candidates.reduce((sum, candidate) => sum + candidate.file.size, 0);
@@ -4184,6 +4188,7 @@
           {#if remoteRoots.length > 0}
             <div class="nav-sep"></div>
             {#each onlineRemoteRoots as root (root.id)}
+              {@const remote = remoteMounts[root.id]}
               <button
                 type="button"
                 class:active={appView === 'files' && root.id === activeRootId}
@@ -4191,7 +4196,21 @@
                 title={remoteTitle(root.id, rootLabel(root.alias))}
                 onclick={() => openRemoteRoot(root)}
               >
-                <Icon name="link" size={18} />
+                {#if remote?.avatar_version && !avatarFailures[root.id]}
+                  <img
+                    class="nav-avatar"
+                    src={api.remoteAvatarUrl(remote.id, remote.avatar_version ?? 0)}
+                    alt=""
+                    onerror={() => (avatarFailures = { ...avatarFailures, [root.id]: true })}
+                  />
+                {:else if remote?.owner_name}
+                  <span
+                    class="nav-avatar initial"
+                    style={`background:${avatarColor(remote.owner_name ?? '')}`}
+                  >{avatarInitial(remote.owner_name ?? '')}</span>
+                {:else}
+                  <Icon name="link" size={18} />
+                {/if}
                 <span class="nav-label">{rootLabel(root.alias)}</span>
                 {#if remoteStateBadge(root.id)}
                   <span
@@ -4224,13 +4243,28 @@
             </button>
             {#if offlineOpen}
               {#each offlineRemoteRoots as root (root.id)}
+                {@const remote = remoteMounts[root.id]}
                 <button
                   type="button"
                   class="nav-item offline"
                   title={remoteTitle(root.id, rootLabel(root.alias))}
                   onclick={() => openOfflineRoot(root)}
                 >
-                  <Icon name="link" size={18} />
+                  {#if remote?.avatar_version && !avatarFailures[root.id]}
+                    <img
+                      class="nav-avatar"
+                      src={api.remoteAvatarUrl(remote.id, remote.avatar_version ?? 0)}
+                      alt=""
+                      onerror={() => (avatarFailures = { ...avatarFailures, [root.id]: true })}
+                    />
+                  {:else if remote?.owner_name}
+                    <span
+                      class="nav-avatar initial"
+                      style={`background:${avatarColor(remote.owner_name ?? '')}`}
+                    >{avatarInitial(remote.owner_name ?? '')}</span>
+                  {:else}
+                    <Icon name="link" size={18} />
+                  {/if}
                   <span class="nav-label">{rootLabel(root.alias)}</span>
                   <span
                     class="nav-state"
@@ -5083,7 +5117,7 @@
                                 <FileTypeIcon name={entry.name} isDir={entry.is_dir} size={22} />
                               </span>
                               <span class="file-name">
-                                {#if entry.is_symlink}
+                                {#if entry.is_symlink && activeRoot?.kind !== 'remote'}
                                   <span
                                     class="symlink-mark"
                                     class:bad={entry.symlink_state !== 'ok'}
@@ -5244,7 +5278,7 @@
                             {/if}
                           </div>
                           <span class="card-name">
-                            {#if entry.is_symlink}
+                            {#if entry.is_symlink && activeRoot?.kind !== 'remote'}
                               <span
                                 class="symlink-mark"
                                 class:bad={entry.symlink_state !== 'ok'}
@@ -5358,7 +5392,7 @@
                           </div>
                           <span class="tile-info">
                             <span class="tile-name">
-                              {#if entry.is_symlink}
+                              {#if entry.is_symlink && activeRoot?.kind !== 'remote'}
                                 <span
                                   class="symlink-mark"
                                   class:bad={entry.symlink_state !== 'ok'}
@@ -6254,6 +6288,22 @@
     margin-left: 4px;
     color: var(--text-2);
     vertical-align: middle;
+  }
+
+  .nav-avatar {
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    object-fit: cover;
+  }
+
+  .nav-avatar.initial {
+    display: grid;
+    place-items: center;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
   }
 
   .nav-collapse {

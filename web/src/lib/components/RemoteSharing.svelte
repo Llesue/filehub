@@ -350,7 +350,6 @@
           <div class="path-input">
             <input
               bind:value={grantPath}
-              placeholder="/photos"
               onclick={() => void openBrowser()}
             />
             <span class="chevron">⌄</span>

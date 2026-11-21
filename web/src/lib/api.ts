@@ -70,6 +70,8 @@ export interface RemoteMount {
   grant_label: string;
   mode: 'ro' | 'rw';
   capabilities: string[];
+  owner_name?: string;
+  avatar_version?: number;
   thumb_cache_bytes?: number;
   state: 'online' | 'offline' | 'token_invalid' | 'grant_revoked' | 'unsupported';
   last_ok_at: number | null;
@@ -659,6 +661,10 @@ export const api = {
       { method: 'POST' },
       csrf,
     );
+  },
+
+  remoteAvatarUrl(id: number, version: number): string {
+    return `${BASE}/remote/mounts/${id}/avatar?v=${version}`;
   },
 
   remoteMounts(): Promise<{ mounts: RemoteMount[] }> {

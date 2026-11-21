@@ -79,6 +79,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         34,
         include_str!("../migrations/0034_remote_mount_preference.sql"),
     ),
+    (35, include_str!("../migrations/0035_remote_avatar.sql")),
 ];
 
 pub fn unix_now() -> i64 {

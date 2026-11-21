@@ -188,6 +188,7 @@ fn render_list(
 ) -> Json<Value> {
     let mut entries = value.get("entries").cloned().unwrap_or(json!([]));
     if let Some(array) = entries.as_array_mut() {
+        array.retain(|entry| entry.get("is_symlink").and_then(Value::as_bool) != Some(true));
         for entry in array {
             if let Some(object) = entry.as_object_mut() {
                 object.entry("is_symlink").or_insert(json!(false));
