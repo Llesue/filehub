@@ -122,6 +122,18 @@
     }
   }
 
+  function cacheLabel(bytes: number | undefined): string {
+    if (!bytes) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+  }
+
   function stateLabel(state: RemoteMount['state']): string {
     switch (state) {
       case 'online':
@@ -197,6 +209,7 @@
                   {#if latency[item.id] !== undefined}
                     <span class="latency">{latency[item.id]} ms</span>
                   {/if}
+                  <span class="latency">{t($language, '缩略图缓存')} {cacheLabel(item.thumb_cache_bytes)}</span>
                 </div>
                 <div class="actions">
                   <button type="button" disabled={busy} onclick={() => void test(item.id)}>

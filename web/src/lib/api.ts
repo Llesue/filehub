@@ -68,6 +68,7 @@ export interface RemoteMount {
   grant_label: string;
   mode: 'ro' | 'rw';
   capabilities: string[];
+  thumb_cache_bytes?: number;
   state: 'online' | 'offline' | 'token_invalid' | 'grant_revoked' | 'unsupported';
   last_ok_at: number | null;
   last_error: string | null;

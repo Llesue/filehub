@@ -645,6 +645,17 @@ pub async fn unzip(
     })))
 }
 
+fn thumb_cache_path(state: &Arc<AppState>, mount_id: i64, key: &str) -> std::path::PathBuf {
+    state
+        .settings()
+        .settings
+        .cache_dir
+        .join("federation-thumbs")
+        .join(mount_id.to_string())
+        .join(&key[..2])
+        .join(format!("{key}.jpg"))
+}
+
 pub async fn thumb(
     state: &Arc<AppState>,
     user_id: i64,
@@ -655,6 +666,24 @@ pub async fn thumb(
     fit: &str,
 ) -> Result<Response, AppError> {
     let (client, mount) = client_for_root(state, user_id, root.id).await?;
+    let cache_key =
+        crate::auth::sha256_hex(&format!("{}:{}:{}:{}:{}", mount.id, path, width, edge, fit));
+    let cache_path = thumb_cache_path(state, mount.id, &cache_key);
+    if let Ok(metadata) = tokio::fs::metadata(&cache_path).await
+        && metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < 3600)
+        && let Ok(bytes) = tokio::fs::read(&cache_path).await
+    {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .header(header::CACHE_CONTROL, "private, max-age=3600")
+            .body(Body::from(bytes))
+            .map_err(|error| AppError::internal(anyhow::anyhow!(error)));
+    }
     let response = client
         .thumb(
             mount.grant_id,
@@ -668,19 +697,32 @@ pub async fn thumb(
         .map_err(|error| error.into_app())?;
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut builder = Response::builder().status(status);
-    for name in [
-        header::CONTENT_TYPE,
-        header::CONTENT_LENGTH,
-        header::ETAG,
-        header::CACHE_CONTROL,
-    ] {
-        if let Some(value) = response.headers().get(&name) {
-            builder = builder.header(name, value);
+    if !status.is_success() {
+        let mut builder = Response::builder().status(status);
+        for name in [header::CONTENT_TYPE, header::CACHE_CONTROL] {
+            if let Some(value) = response.headers().get(&name) {
+                builder = builder.header(name, value);
+            }
         }
+        return builder
+            .body(Body::from_stream(response.bytes_stream()))
+            .map_err(|error| AppError::internal(anyhow::anyhow!(error)));
     }
-    builder
-        .body(Body::from_stream(response.bytes_stream()))
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::internal(anyhow::anyhow!(error)))?;
+    if bytes.len() <= 8 * 1024 * 1024 {
+        if let Some(parent) = cache_path.parent() {
+            let _ = crate::platform::create_private_dir_all(parent);
+        }
+        let _ = crate::platform::write_private_file(&cache_path, &bytes);
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .body(Body::from(bytes))
         .map_err(|error| AppError::internal(anyhow::anyhow!(error)))
 }
 

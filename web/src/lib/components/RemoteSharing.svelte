@@ -27,6 +27,10 @@
   let expiresDays = $state(0);
   let newToken = $state('');
   let copiedKind = $state<'token' | 'invite' | null>(null);
+  let browseOpen = $state(false);
+  let browsePath = $state('');
+  let browseDirs = $state<string[]>([]);
+  let browseBusy = $state(false);
   let busy = $state(false);
   let error = $state('');
 
@@ -57,6 +61,43 @@
     } catch (value) {
       error = message(value);
     }
+  }
+
+  async function openBrowser(): Promise<void> {
+    if (rootId === null) return;
+    browseOpen = true;
+    browsePath = grantPath.trim().replace(/^\/+|\/+$/g, '');
+    await loadBrowser();
+  }
+
+  async function loadBrowser(): Promise<void> {
+    if (rootId === null) return;
+    browseBusy = true;
+    error = '';
+    try {
+      const result = await api.list(rootId, browsePath, 'name', 'asc', false);
+      browseDirs = result.entries.filter((entry) => entry.is_dir).map((entry) => entry.name);
+    } catch (value) {
+      error = message(value);
+    } finally {
+      browseBusy = false;
+    }
+  }
+
+  function browseInto(name: string): void {
+    browsePath = browsePath ? `${browsePath}/${name}` : name;
+    void loadBrowser();
+  }
+
+  function browseUp(): void {
+    const index = browsePath.lastIndexOf('/');
+    browsePath = index < 0 ? '' : browsePath.slice(0, index);
+    void loadBrowser();
+  }
+
+  function chooseBrowse(): void {
+    grantPath = browsePath;
+    browseOpen = false;
   }
 
   async function createGrant(): Promise<void> {
@@ -210,6 +251,9 @@
       <span>{t($language, '路径')}</span>
       <input bind:value={grantPath} placeholder="/photos" />
     </label>
+    <button type="button" disabled={busy || rootId === null} onclick={() => void openBrowser()}>
+      {t($language, '浏览')}
+    </button>
     <label>
       <span>{t($language, '名称')}</span>
       <input bind:value={label} />
@@ -282,6 +326,33 @@
   >
     {t($language, '新建令牌')}
   </button>
+
+  {#if browseOpen}
+    <div class="browser">
+      <div class="browser-head">
+        <code>/{browsePath}</code>
+        <button type="button" disabled={browseBusy || !browsePath} onclick={browseUp}>
+          {t($language, '上一级')}
+        </button>
+        <button type="button" disabled={browseBusy} onclick={chooseBrowse}>
+          {t($language, '选择此目录')}
+        </button>
+        <button type="button" onclick={() => (browseOpen = false)}>
+          {t($language, '取消')}
+        </button>
+      </div>
+      <div class="browser-list">
+        {#each browseDirs as name (name)}
+          <button type="button" disabled={browseBusy} onclick={() => browseInto(name)}>
+            {name}/
+          </button>
+        {/each}
+        {#if browseDirs.length === 0}
+          <span class="hint">{t($language, '没有子目录')}</span>
+        {/if}
+      </div>
+    </div>
+  {/if}
 
   {#if revokedGrants.length > 0}
     <details class="revoked">
@@ -461,6 +532,36 @@
   .row-actions {
     display: flex;
     gap: 8px;
+  }
+
+  .browser {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+  }
+
+  .browser-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .browser-head code {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .browser-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
   }
 
   .revoked {

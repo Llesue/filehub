@@ -271,6 +271,24 @@ pub async fn create(
     })))
 }
 
+fn directory_size(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0_u64;
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path()));
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
+}
+
 fn capability_refresh_seen() -> &'static Mutex<HashMap<i64, i64>> {
     static SEEN: OnceLock<Mutex<HashMap<i64, i64>>> = OnceLock::new();
     SEEN.get_or_init(|| Mutex::new(HashMap::new()))
@@ -326,6 +344,13 @@ pub async fn list(
             .find_root(mount.root_id, current.user.id)
             .await
             .map_err(AppError::internal)?;
+        let thumb_dir = state
+            .settings()
+            .settings
+            .cache_dir
+            .join("federation-thumbs")
+            .join(mount.id.to_string());
+        let thumb_cache_bytes = directory_size(&thumb_dir);
         let state_name = match mount.last_error_code.as_deref() {
             Some("TOKEN_REVOKED" | "TOKEN_EXPIRED") => "token_invalid",
             Some("GRANT_REVOKED") => "grant_revoked",
@@ -344,6 +369,7 @@ pub async fn list(
             "mode": mount.mode,
             "capabilities": serde_json::from_str::<Value>(&mount.capabilities)
                 .unwrap_or_else(|_| json!([])),
+            "thumb_cache_bytes": thumb_cache_bytes,
             "state": state_name,
             "last_ok_at": mount.last_ok_at,
             "last_error": mount.last_error,
@@ -381,6 +407,13 @@ pub async fn delete(
         .federation_cache
         .lock()
         .retain(|key, _| key.0 != mount.root_id);
+    let thumb_dir = state
+        .settings()
+        .settings
+        .cache_dir
+        .join("federation-thumbs")
+        .join(mount.id.to_string());
+    let _ = tokio::fs::remove_dir_all(thumb_dir).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
