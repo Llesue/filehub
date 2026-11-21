@@ -721,6 +721,122 @@
     gap: 8px;
   }
 
+  .editor-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+  }
+
+  .editor-fields {
+    display: grid;
+    grid-template-columns: 140px minmax(180px, 1.6fr) minmax(120px, 1fr) 110px;
+    gap: 10px;
+    align-items: end;
+  }
+
+  .editor-fields.token-fields {
+    grid-template-columns: 1fr 180px;
+  }
+
+  .editor-fields label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    font-size: 12.5px;
+    color: var(--text-2);
+  }
+
+  .editor-fields input,
+  .editor-fields select {
+    min-width: 0;
+    padding: 7px 9px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+  }
+
+  .path-input {
+    display: flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+  }
+
+  .path-input input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    background: transparent;
+  }
+
+  .path-input input:focus {
+    outline: none;
+  }
+
+  .chevron {
+    padding: 0 8px;
+    color: var(--text-2);
+    font-size: 12px;
+    pointer-events: none;
+  }
+
+  .editor-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .path-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 260px;
+    padding: 10px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+  }
+
+  .panel-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .panel-head code {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .panel-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .panel-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  button.primary {
+    background: var(--accent);
+    color: #fff;
+  }
+
   .section-head {
     display: flex;
     align-items: center;
