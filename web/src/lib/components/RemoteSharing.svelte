@@ -115,12 +115,29 @@
       grantPath = '';
       label = '';
       newGrantOpen = false;
+      browseOpen = false;
       await load();
     } catch (value) {
       error = message(value);
     } finally {
       busy = false;
     }
+  }
+
+  function cancelGrant(): void {
+    newGrantOpen = false;
+    browseOpen = false;
+    grantPath = '';
+    label = '';
+    error = '';
+  }
+
+  function cancelToken(): void {
+    newTokenOpen = false;
+    tokenName = '';
+    selectedGrants = [];
+    expiresDays = 0;
+    error = '';
   }
 
   async function revokeGrant(id: number): Promise<void> {
@@ -312,43 +329,85 @@
     {/each}
   </div>
 
-  <button type="button" class="row-add" onclick={() => (newGrantOpen = !newGrantOpen)}>
-    + {t($language, '添加授权目录')}
-  </button>
-
-  {#if newGrantOpen}
-  <p class="hint">{t($language, '路径留空表示授权整个根目录。')}</p>
-  <div class="form form-card">
-    <label>
-      <span>{t($language, '根目录')}</span>
-      <select bind:value={rootId}>
-        {#each roots as root (root.id)}
-          <option value={root.id}>{root.alias}</option>
-        {/each}
-      </select>
-    </label>
-    <label>
-      <span>{t($language, '路径')}</span>
-      <input bind:value={grantPath} placeholder="/photos" />
-    </label>
-    <button type="button" disabled={busy || rootId === null} onclick={() => void openBrowser()}>
-      {t($language, '浏览')}
+  {#if !newGrantOpen}
+    <button type="button" class="row-add" onclick={() => (newGrantOpen = true)}>
+      + {t($language, '添加授权目录')}
     </button>
-    <label>
-      <span>{t($language, '名称')}</span>
-      <input bind:value={label} />
-    </label>
-    <label>
-      <span>{t($language, '权限')}</span>
-      <select bind:value={mode}>
-        <option value="ro">{t($language, '只读')}</option>
-        <option value="rw">{t($language, '读写')}</option>
-      </select>
-    </label>
-    <button type="button" disabled={busy || !label.trim()} onclick={() => void createGrant()}>
-      {t($language, '授权')}
-    </button>
-  </div>
+  {:else}
+    <div class="editor-card">
+      <p class="hint">{t($language, '路径留空表示授权整个根目录。')}</p>
+      <div class="editor-fields">
+        <label>
+          <span>{t($language, '根目录')}</span>
+          <select bind:value={rootId}>
+            {#each roots as root (root.id)}
+              <option value={root.id}>{root.alias}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="path-field">
+          <span>{t($language, '路径')}</span>
+          <div class="path-input">
+            <input
+              bind:value={grantPath}
+              placeholder="/photos"
+              onclick={() => void openBrowser()}
+            />
+            <span class="chevron">⌄</span>
+          </div>
+        </label>
+        <label>
+          <span>{t($language, '名称')}</span>
+          <input bind:value={label} />
+        </label>
+        <label>
+          <span>{t($language, '权限')}</span>
+          <select bind:value={mode}>
+            <option value="ro">{t($language, '只读')}</option>
+            <option value="rw">{t($language, '读写')}</option>
+          </select>
+        </label>
+      </div>
+      {#if browseOpen}
+        <div class="path-panel">
+          <div class="panel-head">
+            <code>/{browsePath}</code>
+            <button type="button" disabled={browseBusy || !browsePath} onclick={browseUp}>
+              {t($language, '上一级')}
+            </button>
+          </div>
+          <div class="panel-list">
+            {#each browseDirs as name (name)}
+              <button type="button" disabled={browseBusy} onclick={() => browseInto(name)}>
+                {name}/
+              </button>
+            {/each}
+            {#if browseDirs.length === 0}
+              <span class="hint">{t($language, '没有子目录')}</span>
+            {/if}
+          </div>
+          <div class="panel-actions">
+            <button type="button" onclick={() => (browseOpen = false)}>
+              {t($language, '取消')}
+            </button>
+            <button type="button" class="primary" disabled={browseBusy} onclick={chooseBrowse}>
+              {t($language, '选择此目录')}
+            </button>
+          </div>
+        </div>
+      {/if}
+      <div class="editor-actions">
+        <button type="button" onclick={cancelGrant}>{t($language, '取消')}</button>
+        <button
+          type="button"
+          class="primary"
+          disabled={busy || !label.trim()}
+          onclick={() => void createGrant()}
+        >
+          {t($language, '授权')}
+        </button>
+      </div>
+    </div>
   {/if}
 
   <div class="section-head">
@@ -414,68 +473,45 @@
     {/each}
   </div>
 
-  <button type="button" class="row-add" onclick={() => (newTokenOpen = !newTokenOpen)}>
-    + {t($language, '新建令牌')}
-  </button>
-
-  {#if newTokenOpen}
-  <div class="form form-card">
-    <label>
-      <span>{t($language, '名称')}</span>
-      <input bind:value={tokenName} />
-    </label>
-    <label>
-      <span>{t($language, '有效期（天，0 为永久）')}</span>
-      <input type="number" min="0" bind:value={expiresDays} />
-    </label>
-  </div>
-
-  {#if grants.length > 0}
-    <div class="grants">
-      {#each grants as grant (grant.id)}
-        <label class="grant">
-          <input type="checkbox" bind:group={selectedGrants} value={grant.id} />
-          <span>{grant.label}</span>
-          <em class:rw={grant.mode === 'rw'}>
-            {grant.mode === 'rw' ? t($language, '读写') : t($language, '只读')}
-          </em>
+  {#if !newTokenOpen}
+    <button type="button" class="row-add" onclick={() => (newTokenOpen = true)}>
+      + {t($language, '新建令牌')}
+    </button>
+  {:else}
+    <div class="editor-card">
+      <div class="editor-fields token-fields">
+        <label>
+          <span>{t($language, '名称')}</span>
+          <input bind:value={tokenName} />
         </label>
-      {/each}
-    </div>
-  {/if}
-
-  <button
-    type="button"
-    disabled={busy || !tokenName.trim() || selectedGrants.length === 0}
-    onclick={() => void createToken()}
-  >
-    {t($language, '新建令牌')}
-  </button>
-  {/if}
-
-  {#if browseOpen}
-    <div class="browser">
-      <div class="browser-head">
-        <code>/{browsePath}</code>
-        <button type="button" disabled={browseBusy || !browsePath} onclick={browseUp}>
-          {t($language, '上一级')}
-        </button>
-        <button type="button" disabled={browseBusy} onclick={chooseBrowse}>
-          {t($language, '选择此目录')}
-        </button>
-        <button type="button" onclick={() => (browseOpen = false)}>
-          {t($language, '取消')}
-        </button>
+        <label>
+          <span>{t($language, '有效期（天，0 为永久）')}</span>
+          <input type="number" min="0" bind:value={expiresDays} />
+        </label>
       </div>
-      <div class="browser-list">
-        {#each browseDirs as name (name)}
-          <button type="button" disabled={browseBusy} onclick={() => browseInto(name)}>
-            {name}/
-          </button>
-        {/each}
-        {#if browseDirs.length === 0}
-          <span class="hint">{t($language, '没有子目录')}</span>
-        {/if}
+      {#if grants.length > 0}
+        <div class="grants">
+          {#each grants as grant (grant.id)}
+            <label class="grant">
+              <input type="checkbox" bind:group={selectedGrants} value={grant.id} />
+              <span>{grant.label}</span>
+              <em class:rw={grant.mode === 'rw'}>
+                {grant.mode === 'rw' ? t($language, '读写') : t($language, '只读')}
+              </em>
+            </label>
+          {/each}
+        </div>
+      {/if}
+      <div class="editor-actions">
+        <button type="button" onclick={cancelToken}>{t($language, '取消')}</button>
+        <button
+          type="button"
+          class="primary"
+          disabled={busy || !tokenName.trim() || selectedGrants.length === 0}
+          onclick={() => void createToken()}
+        >
+          {t($language, '新建令牌')}
+        </button>
       </div>
     </div>
   {/if}
@@ -652,23 +688,6 @@
     color: var(--text-2);
   }
 
-  .form {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    align-items: flex-end;
-  }
-
-  .form label {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 160px;
-    flex: 1;
-    font-size: 12.5px;
-    color: var(--text-2);
-  }
-
   input,
   select {
     padding: 7px 9px;
@@ -730,13 +749,6 @@
     border-color: var(--accent);
   }
 
-  .form-card {
-    padding: 12px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--surface-2);
-  }
-
   .token-row {
     display: flex;
     flex-direction: column;
@@ -763,6 +775,28 @@
     gap: 8px;
     align-items: center;
     justify-content: space-between;
+  }
+
+  @media (max-width: 640px) {
+    .dialog {
+      width: 100vw;
+      height: 100vh;
+      max-height: none;
+      border-radius: 0;
+    }
+
+    .editor-fields,
+    .editor-fields.token-fields {
+      grid-template-columns: 1fr;
+    }
+
+    .path-panel {
+      position: fixed;
+      inset: 12px;
+      z-index: 90;
+      max-height: none;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
+    }
   }
 
   .recent {
@@ -816,36 +850,6 @@
     padding: 6px;
     border: 1px solid var(--border);
     border-radius: 6px;
-  }
-
-  .browser {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 10px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--surface-2);
-  }
-
-  .browser-head {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    align-items: center;
-  }
-
-  .browser-head code {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .browser-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
   }
 
   .activity {

@@ -125,25 +125,6 @@
     </div>
   </section>
 
-  {#if canMountRemote}
-    <section class="pref-card">
-      <h2>{t($language, '远程目录')}</h2>
-      <label class="pref-row">
-        <span>{t($language, '启用远程目录挂载')}</span>
-        <input
-          type="checkbox"
-          checked={preferences.remote_mount_enabled}
-          disabled={saving}
-          onchange={(event) =>
-            void persist({ remote_mount_enabled: event.currentTarget.checked })}
-        />
-      </label>
-      <p class="hint">
-        {t($language, '关闭后侧栏不再显示远程目录入口，已有挂载仍会保留。')}
-      </p>
-    </section>
-  {/if}
-
   {#if canShareRemote}
     <section class="pref-card">
       <h2>{t($language, '远程共享')}</h2>
@@ -206,6 +187,18 @@
 
   <section class="pref-card">
     <h2>{t($language, '文件浏览')}</h2>
+    {#if canMountRemote}
+      <div class="pref-row">
+        <span>{t($language, '启用远程目录挂载')}</span>
+        <input
+          type="checkbox"
+          checked={preferences.remote_mount_enabled}
+          disabled={saving}
+          onchange={(event) =>
+            void persist({ remote_mount_enabled: event.currentTarget.checked })}
+        />
+      </div>
+    {/if}
     <label class="pref-row">
       <span>{t($language, '显示隐藏文件')}</span>
       <input
