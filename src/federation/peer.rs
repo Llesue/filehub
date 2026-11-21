@@ -287,6 +287,7 @@ pub fn router() -> axum::Router<Arc<AppState>> {
                 response
             },
         ))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
 }
 
 #[derive(Debug, Deserialize)]

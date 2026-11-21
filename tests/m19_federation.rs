@@ -610,6 +610,57 @@ async fn federation_contract_round_trip() {
         b"peer body"
     );
 
+    let big_client = reqwest::Client::new();
+    let created = big_client
+        .post(format!("{}/api/federation/v1/uploads", peer_instance.base))
+        .bearer_auth(&token)
+        .header("idempotency-key", "big-upload")
+        .json(&json!({
+            "grant": grant_id,
+            "dir": "",
+            "filename": "big.bin",
+            "total_size": 5 * 1024 * 1024,
+            "chunk_size": 4 * 1024 * 1024,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = created.json::<Value>().await.unwrap();
+    let big_id = created["id"].as_str().unwrap().to_owned();
+    let chunk0 = big_client
+        .put(format!(
+            "{}/api/federation/v1/uploads/{big_id}/chunks/0",
+            peer_instance.base
+        ))
+        .bearer_auth(&token)
+        .body(vec![7_u8; 4 * 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunk0.status(), StatusCode::NO_CONTENT);
+    let chunk1 = big_client
+        .put(format!(
+            "{}/api/federation/v1/uploads/{big_id}/chunks/1",
+            peer_instance.base
+        ))
+        .bearer_auth(&token)
+        .body(vec![8_u8; 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunk1.status(), StatusCode::NO_CONTENT);
+    let completed = big_client
+        .post(format!(
+            "{}/api/federation/v1/uploads/{big_id}/complete",
+            peer_instance.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+
     let activity = send(
         &peer_instance.router,
         Method::GET,
