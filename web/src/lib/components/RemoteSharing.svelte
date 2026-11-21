@@ -317,8 +317,8 @@
   </button>
 
   {#if newGrantOpen}
+  <p class="hint">{t($language, '路径留空表示授权整个根目录。')}</p>
   <div class="form form-card">
-    <p class="hint">{t($language, '路径留空表示授权整个根目录。')}</p>
     <label>
       <span>{t($language, '根目录')}</span>
       <select bind:value={rootId}>
