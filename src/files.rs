@@ -34,10 +34,32 @@ pub async fn roots(
         .list_roots(current.user.id)
         .await
         .map_err(AppError::internal)?;
+    let grants = state
+        .db
+        .federation_list_grants(current.user.id)
+        .await
+        .unwrap_or_default();
+    let shared: Vec<std::path::PathBuf> = grants
+        .iter()
+        .filter(|grant| !grant.revoked)
+        .map(|grant| std::path::PathBuf::from(&grant.real_path))
+        .collect();
+    let values: Vec<Value> = roots
+        .iter()
+        .map(|root| {
+            let mut value = root_json(root);
+            if !root.is_remote()
+                && shared
+                    .iter()
+                    .any(|path| path == std::path::Path::new(&root.real_path))
+            {
+                value["shared"] = json!(true);
+            }
+            value
+        })
+        .collect();
 
-    Ok(Json(json!({
-        "roots": roots.iter().map(root_json).collect::<Vec<_>>()
-    })))
+    Ok(Json(json!({ "roots": values })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +72,38 @@ pub struct ListQuery {
     limit: Option<usize>,
     cursor: Option<String>,
     focus: Option<String>,
+}
+
+async fn mark_shared_entries(
+    state: &Arc<AppState>,
+    user_id: i64,
+    entries: Vec<fsops::Entry>,
+    directory: &std::path::Path,
+) -> Vec<Value> {
+    let grants = state
+        .db
+        .federation_list_grants(user_id)
+        .await
+        .unwrap_or_default();
+    let shared: Vec<std::path::PathBuf> = grants
+        .iter()
+        .filter(|grant| !grant.revoked)
+        .map(|grant| std::path::PathBuf::from(&grant.real_path))
+        .collect();
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut value = serde_json::to_value(&entry).unwrap_or_else(|_| json!({}));
+            if !shared.is_empty()
+                && shared
+                    .iter()
+                    .any(|path| path == &directory.join(&entry.name))
+            {
+                value["shared"] = json!(true);
+            }
+            value
+        })
+        .collect()
 }
 
 fn map_indexed_entry(entry: crate::db::IndexEntry, video_enabled: bool) -> fsops::Entry {
@@ -201,7 +255,13 @@ pub async fn list(
                         "path": resolved.relative,
                         "read_only": read_only_reason.is_some(),
                         "read_only_reason": read_only_reason,
-                        "entries": entries,
+                        "entries": mark_shared_entries(
+                            &state,
+                            current.user.id,
+                            entries,
+                            &resolved.absolute,
+                        )
+                        .await,
                         "next_cursor": has_more.then(|| (page_start + limit).to_string()),
                         "focus_index": focus_index,
                         "focus_offset": focus_offset,
@@ -235,7 +295,13 @@ pub async fn list(
                         "path": resolved.relative,
                         "read_only": read_only_reason.is_some(),
                         "read_only_reason": read_only_reason,
-                        "entries": entries,
+                        "entries": mark_shared_entries(
+                            &state,
+                            current.user.id,
+                            entries,
+                            &resolved.absolute,
+                        )
+                        .await,
                         "next_cursor": has_more.then(|| (offset + limit).to_string()),
                     })));
                 }
@@ -294,7 +360,13 @@ pub async fn list(
             "path": resolved.relative,
             "read_only": read_only_reason.is_some(),
             "read_only_reason": read_only_reason,
-            "entries": entries,
+            "entries": mark_shared_entries(
+                &state,
+                current.user.id,
+                entries,
+                &resolved.absolute,
+            )
+            .await,
             "next_cursor": (page_start.saturating_add(limit) < total)
                 .then(|| (page_start + limit).to_string()),
         });
@@ -347,7 +419,13 @@ pub async fn list(
             "path": resolved.relative,
             "read_only": read_only_reason.is_some(),
             "read_only_reason": read_only_reason,
-            "entries": entries,
+            "entries": mark_shared_entries(
+                &state,
+                current.user.id,
+                entries,
+                &resolved.absolute,
+            )
+            .await,
             "next_cursor": (page_start.saturating_add(limit) < total)
                 .then(|| (page_start + limit).to_string()),
             "focus_index": focus_index,
@@ -390,7 +468,13 @@ pub async fn list(
         "path": resolved.relative,
         "read_only": read_only_reason.is_some(),
         "read_only_reason": read_only_reason,
-        "entries": entries,
+        "entries": mark_shared_entries(
+                &state,
+                current.user.id,
+                entries,
+                &resolved.absolute,
+            )
+            .await,
         "next_cursor": has_more.then(|| (offset + limit).to_string()),
     })))
 }

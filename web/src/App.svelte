@@ -4019,6 +4019,11 @@
             >
               <Icon name="folder" size={18} />
               <span class="nav-label">{rootLabel(root.alias)}</span>
+              {#if root.shared}
+                <span class="nav-shared" title={t($language, '已共享给远程实例')}>
+                  <Icon name="link" size={13} />
+                </span>
+              {/if}
               {#if root.read_only}
                 <span class="nav-readonly" title={t($language, '目录已设为只读')}
                   >{t($language, '只读')}</span
@@ -4915,7 +4920,7 @@
                                 {/if}
                                 <span class="name-stem">{nameParts.stem}</span><span
                                   class="name-ext">{nameParts.ext}</span
-                                >
+                                >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="link" size={13} /></span>{/if}
                               </span>
                             </td>
                             <td
@@ -5076,7 +5081,7 @@
                             {/if}
                             <span class="name-stem">{nameParts.stem}</span><span class="name-ext"
                               >{nameParts.ext}</span
-                            >
+                            >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="link" size={13} /></span>{/if}
                           </span>
                           <span class="card-meta">
                             <span title={absoluteDate(entry.modified)}
@@ -5190,7 +5195,7 @@
                               {/if}
                               <span class="name-stem">{nameParts.stem}</span><span class="name-ext"
                                 >{nameParts.ext}</span
-                              >
+                              >{#if entry.shared}<span class="shared-mark" title={t($language, '已共享给远程实例')}><Icon name="link" size={13} /></span>{/if}
                             </span>
                             <span class="tile-meta">
                               <span title={absoluteDate(entry.modified)}
@@ -5534,7 +5539,6 @@
     />
   {/if}
 
-  {#if preview && activeRootId !== null}
     <RemoteMountDialog
       open={mountDialogOpen}
       {csrf}
@@ -5549,6 +5553,7 @@
       }}
     />
 
+  {#if preview && activeRootId !== null}
     <PreviewModal
       root={activeRootId}
       {currentPath}
@@ -6057,6 +6062,19 @@
 
   .nav-add {
     color: var(--text-2);
+  }
+
+  .nav-shared {
+    display: inline-flex;
+    flex: 0 0 auto;
+    color: var(--text-2);
+  }
+
+  .shared-mark {
+    display: inline-flex;
+    margin-left: 4px;
+    color: var(--text-2);
+    vertical-align: middle;
   }
 
   .nav-state {

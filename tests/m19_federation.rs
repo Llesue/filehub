@@ -319,6 +319,23 @@ async fn federation_contract_round_trip() {
     let mount = json_body(mount).await;
     let remote_root = mount["root_id"].as_i64().unwrap();
 
+    let peer_list = send(
+        &peer_instance.router,
+        Method::GET,
+        &format!("/api/v1/list?root={}&path=", peer_instance.root_id),
+        Some(&peer_instance.cookie),
+        None,
+    )
+    .await;
+    let peer_list = json_body(peer_list).await;
+    let shared_marked = peer_list["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some("shared"))
+        .and_then(|entry| entry["shared"].as_bool());
+    assert_eq!(shared_marked, Some(true));
+
     let list = send(
         &mount_instance.router,
         Method::GET,

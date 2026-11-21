@@ -71,6 +71,7 @@ const en: Record<string, string> = {
   '远程共享': 'Remote sharing',
   '管理远程共享': 'Manage remote sharing',
   '把本地目录授权给其他 FileHub 实例。': 'Share local folders with other FileHub instances.',
+  '已共享给远程实例': 'Shared with a remote instance',
   对方不支持这个操作: 'The remote server does not support this operation',
   远程目录: 'Remote directories',
   范围: 'Scope',

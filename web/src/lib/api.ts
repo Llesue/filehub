@@ -119,6 +119,7 @@ export interface Root {
   read_only: boolean;
   kind?: 'local' | 'remote';
   mount_id?: number | null;
+  shared?: boolean;
 }
 
 export interface VersionInfo {
@@ -141,6 +142,7 @@ export interface Entry {
   created_at: number;
   mime_type: string;
   has_preview: boolean;
+  shared?: boolean;
   symlink_state?: 'ok' | 'broken' | 'denied';
   symlink_target?: string | null;
 }
