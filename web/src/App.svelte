@@ -3708,8 +3708,8 @@
       editorOriginalContent = file.content;
       editorEtag = file.etag;
       editorError = '';
-      editorPreview = false;
-      editorPreviewSource = '';
+      editorPreview = isMarkdown(entry.name);
+      editorPreviewSource = editorPreview ? file.content : '';
       editorPreviewStale = false;
       editorReadOnly = file.writable === false || currentReadOnly;
       editorReadOnlyReason = file.writable === false
@@ -3753,7 +3753,7 @@
     editorEncoding = file.encoding ?? 'utf-8';
     editorBom = file.bom ?? false;
     editorLossy = file.lossy ?? false;
-    editorPreviewSource = '';
+    editorPreviewSource = editorPreview ? file.content : '';
     editorPreviewStale = false;
     editorReadOnly = file.writable === false || currentReadOnly || editorLossy;
     editorReadOnlyReason = editorLossy
