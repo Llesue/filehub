@@ -256,6 +256,10 @@
     }
   }
 
+  function displayPath(value: string): string {
+    return value.replace(/^\\\\\?\\/, '');
+  }
+
   function formatDate(value: number | null): string {
     if (!value) return t($language, '从未使用');
     return new Date(value * 1000).toLocaleString();
@@ -295,7 +299,7 @@
       <div class="row">
         <div class="meta">
           <strong>{grant.label}</strong>
-          <span class="path" title={grant.path}>{grant.path}</span>
+          <span class="path" title={displayPath(grant.path)}>{displayPath(grant.path)}</span>
           <em class:rw={grant.mode === 'rw'}>
             {grant.mode === 'rw' ? t($language, '读写') : t($language, '只读')}
           </em>
