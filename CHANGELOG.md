@@ -7,9 +7,10 @@
 - Remote directory mounts between FileHub instances, with token-scoped read-only or read-write grants.
 - Browse, download, upload, create, rename, copy, move and delete files on mounted directories.
 - Remote filename search, recursive ZIP downloads, in-place ZIP extraction, and audio track probing with local transcoding.
-- Remote thumbnails and directory sizes are proxied, with local metadata, thumbnail and transcoding caches.
+- Remote thumbnails and directory sizes are proxied, with local metadata, thumbnail and transcoding caches; remote thumbnails are cached per mount with a visible cache size.
 - Capability-driven UI: actions the peer does not support are hidden or disabled.
 - Thumbnail warm-up for remote directories, token rotation, and paste-ready invite text in the mount wizard.
+- The grant dialog includes a folder browser, and the mount manager supports renaming, latency and cache usage.
 - Streaming transfers between local and remote roots, and between two remote roots, with background jobs and per-item results.
 - Peer upload sessions restore from the authorization side after a reload or crash.
 - Sidebar GitHub link and an optional update check against GitHub Releases.
