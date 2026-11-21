@@ -1063,7 +1063,9 @@ pub async fn unzip(
         } else {
             format!("{parent}/{stem}")
         };
-        (relative, false)
+        let resolved = resolve_grant(&state, grant, &relative, true).await?;
+        let exists = std::fs::symlink_metadata(&resolved.absolute).is_ok();
+        (resolved.relative, exists)
     };
     if existing {
         let archive_path = archive.absolute.clone();

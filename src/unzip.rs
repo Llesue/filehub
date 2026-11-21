@@ -595,7 +595,10 @@ pub async fn archive_unzip(
         } else {
             format!("{parent}/{stem}")
         };
-        (relative, false)
+        let resolved =
+            crate::authz::resolve(&state, current.user.id, root.id, &relative, true).await?;
+        let exists = std::fs::symlink_metadata(&resolved.absolute).is_ok();
+        (resolved.relative, exists)
     };
     if existing {
         let archive_path = archive.absolute.clone();
