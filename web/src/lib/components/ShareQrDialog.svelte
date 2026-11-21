@@ -10,8 +10,14 @@
 
   onMount(() => {
     let cancelled = false;
+    type QrEncoder = {
+      toDataURL: (text: string, options: { width: number; margin: number }) => Promise<string>;
+    };
     void import('qrcode')
-      .then((QR) => QR.toDataURL(url, { width: 320, margin: 1 }))
+      .then((module) => {
+        const encoder = ((module as { default?: QrEncoder }).default ?? module) as QrEncoder;
+        return encoder.toDataURL(url, { width: 320, margin: 1 });
+      })
       .then((value) => {
         if (!cancelled) dataUrl = value;
       })
