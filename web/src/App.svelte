@@ -1705,6 +1705,9 @@
     const image = items.find(
       (item) => item.kind === 'file' && item.type.startsWith('image/'),
     );
+    const textFile = items.find(
+      (item) => item.kind === 'file' && item.type === 'text/plain',
+    );
     const text = items.find(
       (item) => item.kind === 'string' && item.type === 'text/plain',
     );
@@ -1723,6 +1726,18 @@
         [blob],
         `filehub_clipboard_${stamp}.${extension}`,
         { type: blob.type },
+      );
+      event.preventDefault();
+      uploadManager.enqueue([{ file }], activeRootId, currentPath);
+      return;
+    }
+    if (textFile) {
+      const blob = textFile.getAsFile();
+      if (!blob) return;
+      const file = new File(
+        [blob],
+        `filehub_clipboard_${stamp}.txt`,
+        { type: 'text/plain' },
       );
       event.preventDefault();
       uploadManager.enqueue([{ file }], activeRootId, currentPath);
