@@ -175,6 +175,9 @@ impl AppState {
             "cache_dir": base.join("cache").to_string_lossy(),
             "security": {
                 "session_ttl_hours": 1
+            },
+            "updates": {
+                "check_enabled": false
             }
         });
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
@@ -285,6 +288,7 @@ impl AppState {
         });
         tokio::spawn(crate::federation::mounts::health_loop(Arc::clone(&state)));
         tokio::spawn(crate::federation::peer::read_flush_loop(Arc::clone(&state)));
+        state.updates.start_loop(Arc::clone(&state));
         state.schedule_directory_size_counts_refresh();
         state.schedule_bigram_backfill();
         crate::media::warm_cache(&state).await;

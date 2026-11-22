@@ -2617,10 +2617,17 @@ pub async fn mkdir(
     }
     let target = join_relative(&request.path, &name);
     let resolved = authz::resolve(&state, current.user.id, root.id, &target, true).await?;
-    crate::usage::ensure_entry_capacity(&state, &current.user, 1).await?;
     let absolute = resolved.absolute.clone();
+    let exists_path = absolute.clone();
+    let target_exists =
+        tokio::task::spawn_blocking(move || std::fs::symlink_metadata(&exists_path).is_ok())
+            .await
+            .map_err(|err| AppError::internal(anyhow::anyhow!("mkdir stat task failed: {err}")))?;
+    if !target_exists {
+        crate::usage::ensure_entry_capacity(&state, &current.user, 1).await?;
+    }
     let recursive = request.recursive.unwrap_or(false);
-    tokio::task::spawn_blocking(move || {
+    let created = tokio::task::spawn_blocking(move || {
         if recursive {
             fsops::create_directory_all(&absolute)
         } else {
@@ -2629,6 +2636,9 @@ pub async fn mkdir(
     })
     .await
     .map_err(|err| AppError::internal(anyhow::anyhow!("mkdir task failed: {err}")))??;
+    if !created {
+        return Err(AppError::Conflict("directory already exists".to_owned()));
+    }
     state.adjust_entries(current.user.id, 1);
     state
         .invalidate_path_caches_with_usage(

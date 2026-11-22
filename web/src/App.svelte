@@ -751,6 +751,10 @@
         void loadPreferences();
         void loadBranding();
       }
+      if (event.type === 'updates.changed') {
+        void loadVersionInfo();
+        showToast(t($language, '有新版本'));
+      }
       if (event.type === 'resync') {
         scheduleRootsRefresh();
         void loadUsage();

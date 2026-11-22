@@ -333,7 +333,7 @@ impl Default for UpdatesSettings {
     fn default() -> Self {
         Self {
             check_enabled: true,
-            check_interval_hours: 12,
+            check_interval_hours: 1,
         }
     }
 }

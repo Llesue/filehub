@@ -1185,12 +1185,17 @@ paths:
           application/json:
             schema:
               type: object
-              required: [root, path]
+              required: [root, path, name]
               properties:
                 root: { type: integer, format: int64 }
                 path: { type: string }
+                name: { type: string }
+                recursive: { type: boolean, default: false }
       responses:
-        '200': { description: OK }
+        '200': { description: 新建成功 }
+        '400': { description: 父目录不存在或目标不是目录 }
+        '403': { description: 权限不足 }
+        '409': { description: 目录已存在 }
   /api/v1/fs/rename:
     post:
       tags: [files]

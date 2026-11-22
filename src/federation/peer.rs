@@ -824,9 +824,6 @@ pub async fn mkdir(
         || async {
             let resolved = resolve_grant(&state, &grant, &request.path, true).await?;
             let absolute = resolved.absolute.clone();
-            if absolute.exists() {
-                return Err(AppError::Conflict("path already exists".to_owned()));
-            }
             let relative = request.path.clone();
             let started = Instant::now();
             let result = tokio::task::spawn_blocking(move || fsops::create_directory(&absolute))
@@ -843,7 +840,10 @@ pub async fn mkdir(
                 started,
             )
             .await;
-            result?;
+            let created = result?;
+            if !created {
+                return Err(AppError::Conflict("directory already exists".to_owned()));
+            }
             Ok((StatusCode::CREATED, Json(json!({ "path": relative }))).into_response())
         },
     )

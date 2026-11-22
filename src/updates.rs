@@ -31,6 +31,7 @@ pub struct UpdateChecker {
     inflight: AtomicBool,
     api_url: String,
     client: reqwest::Client,
+    found: AtomicBool,
 }
 
 impl UpdateChecker {
@@ -45,6 +46,7 @@ impl UpdateChecker {
             inflight: AtomicBool::new(false),
             api_url: api_url.into(),
             client,
+            found: AtomicBool::new(false),
         })
     }
 
@@ -66,8 +68,14 @@ impl UpdateChecker {
     }
 
     /// Fire-and-forget refresh used by `GET /version`. Never blocks the request.
-    pub fn maybe_refresh(self: &Arc<Self>, enabled: bool, interval_hours: i64, current: &str) {
-        if !enabled {
+    pub fn maybe_refresh(
+        self: &Arc<Self>,
+        enabled: bool,
+        interval_hours: i64,
+        current: &str,
+        events: Arc<crate::events::EventBus>,
+    ) {
+        if !enabled || self.found.load(Ordering::SeqCst) {
             return;
         }
         let now = unix_now();
@@ -83,10 +91,65 @@ impl UpdateChecker {
         let checker = Arc::clone(self);
         let current = current.to_owned();
         tokio::spawn(async move {
-            if let Err(error) = checker.refresh_once(&current).await {
-                tracing::debug!(error = %error, "update check failed");
+            match checker.refresh_once(&current).await {
+                Ok(()) => {
+                    if checker.available(&current) {
+                        checker.publish(&events, &current);
+                    }
+                }
+                Err(error) => tracing::debug!(error = %error, "update check failed"),
             }
             checker.inflight.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn available(&self, current: &str) -> bool {
+        self.snapshot(true, current)
+            .get("update_available")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn publish(&self, events: &crate::events::EventBus, current: &str) -> bool {
+        if !self.available(current) {
+            return false;
+        }
+        if !self.found.swap(true, Ordering::SeqCst) {
+            let latest = self.state.lock().latest.clone();
+            events.publish_all(
+                "updates.changed",
+                json!({ "latest": latest, "available": true }),
+            );
+        }
+        true
+    }
+
+    pub fn start_loop(self: &Arc<Self>, state: Arc<AppState>) {
+        let checker = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                if checker.found.load(Ordering::SeqCst) {
+                    break;
+                }
+                let settings = state.settings();
+                if !settings.settings.updates.check_enabled {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    continue;
+                }
+                let current = env!("CARGO_PKG_VERSION");
+                if let Err(error) = checker.refresh_once(current).await {
+                    tracing::debug!(error = %error, "background update check failed");
+                } else if checker.publish(&state.events, current) {
+                    break;
+                }
+                let interval = state
+                    .settings()
+                    .settings
+                    .updates
+                    .check_interval_hours
+                    .max(1) as u64;
+                tokio::time::sleep(Duration::from_secs(interval * 3600)).await;
+            }
         });
     }
 
@@ -207,6 +270,7 @@ pub async fn version(
         enabled,
         snapshot.settings.updates.check_interval_hours,
         env!("CARGO_PKG_VERSION"),
+        Arc::clone(&state.events),
     );
     Ok(Json(
         state.updates.snapshot(enabled, env!("CARGO_PKG_VERSION")),
@@ -228,6 +292,9 @@ pub async fn admin_check(
         tracing::warn!(error = %error, "manual update check failed");
         return Err(AppError::BadRequest("update check failed".to_owned()));
     }
+    state
+        .updates
+        .publish(&state.events, env!("CARGO_PKG_VERSION"));
     Ok(Json(
         state.updates.snapshot(true, env!("CARGO_PKG_VERSION")),
     ))

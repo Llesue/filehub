@@ -302,6 +302,9 @@ paths:
                 path: { type: string }
       responses:
         "201": { description: 已创建 }
+        "400": { description: 父目录不存在或目标不是目录 }
+        "403": { description: 权限不足 }
+        "409": { description: 目录已存在 }
 
   /touch:
     post:

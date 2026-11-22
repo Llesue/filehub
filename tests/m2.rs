@@ -599,3 +599,52 @@ async fn upload_preserves_client_mtime() {
         .as_secs();
     assert_eq!(modified, mtime as u64);
 }
+
+#[tokio::test]
+async fn mkdir_reports_existing_directories_and_file_conflicts() {
+    let app = setup_app().await;
+    let create = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "", "name": "album"}),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let again = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "", "name": "album"}),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+
+    std::fs::write(app.home.join("photo.jpg"), b"image").unwrap();
+    let file_conflict = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "", "name": "photo.jpg"}),
+    )
+    .await;
+    assert_eq!(file_conflict.status(), StatusCode::BAD_REQUEST);
+
+    let missing_parent = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "missing", "name": "nested"}),
+    )
+    .await;
+    assert_eq!(missing_parent.status(), StatusCode::BAD_REQUEST);
+}

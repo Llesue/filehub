@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.2 - 2026-11-22
+
+### Fixed
+
+- Creating an existing directory now returns 409 instead of 500, so Android photo sync can safely ignore an already-created target directory. Entry counts only change when a directory is actually created.
+- Missing parents, file-name collisions and permission errors return distinct client errors instead of being reported as server failures.
+- Update checks run every hour in the background, notify connected clients over SSE, and stop polling after a new version is found.
+
 ## v0.2.1 - 2026-11-22
 
 ### Added

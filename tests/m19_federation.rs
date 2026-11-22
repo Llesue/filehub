@@ -364,6 +364,27 @@ async fn federation_contract_round_trip() {
         1
     );
 
+    let remote_mkdir = send_json(
+        &mount_instance.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({"root": remote_root, "path": "", "name": "repeat-dir"}),
+    )
+    .await;
+    assert_eq!(remote_mkdir.status(), StatusCode::OK);
+    let remote_mkdir = send_json(
+        &mount_instance.router,
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({"root": remote_root, "path": "", "name": "repeat-dir"}),
+    )
+    .await;
+    assert_eq!(remote_mkdir.status(), StatusCode::CONFLICT);
+
     let mtime = 1_700_000_001_i64;
     let remote_upload = send_json(
         &mount_instance.router,

@@ -43,6 +43,7 @@ const eventTypes = [
   'user.features_changed',
   'roots.changed',
   'settings.changed',
+  'updates.changed',
   'share.updated',
   'user.updated',
   'resync',

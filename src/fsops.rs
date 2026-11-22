@@ -729,7 +729,9 @@ fn walk_usage(
 
 pub(crate) fn io_error(error: std::io::Error) -> AppError {
     match error.kind() {
+        std::io::ErrorKind::NotFound => AppError::NotFound,
         std::io::ErrorKind::PermissionDenied => AppError::PermissionDenied,
+        std::io::ErrorKind::AlreadyExists => AppError::Conflict(error.to_string()),
         _ => AppError::internal(anyhow::Error::from(error)),
     }
 }
@@ -858,12 +860,34 @@ pub fn count_entries_limited(path: &Path, limit: u64) -> u64 {
     count
 }
 
-pub fn create_directory(path: &Path) -> Result<(), AppError> {
-    std::fs::create_dir(path).map_err(io_error)
+pub fn create_directory(path: &Path) -> Result<bool, AppError> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => Ok(false),
+                Ok(_) => Err(AppError::bad_request(
+                    "path already exists and is not a directory",
+                )),
+                Err(error) => Err(io_error(error)),
+            }
+        }
+        Err(error) => Err(io_error(error)),
+    }
 }
 
-pub fn create_directory_all(path: &Path) -> Result<(), AppError> {
-    std::fs::create_dir_all(path).map_err(io_error)
+pub fn create_directory_all(path: &Path) -> Result<bool, AppError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(false),
+        Ok(_) => Err(AppError::bad_request(
+            "path already exists and is not a directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path).map_err(io_error)?;
+            Ok(true)
+        }
+        Err(error) => Err(io_error(error)),
+    }
 }
 
 pub fn rename_path(source: &Path, target: &Path) -> Result<(), AppError> {
