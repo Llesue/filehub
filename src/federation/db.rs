@@ -369,6 +369,19 @@ pub struct FederationMount {
     pub last_ok_at: Option<i64>,
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
+    pub peer_instance_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FederationMountEndpoint {
+    pub id: i64,
+    pub mount_id: i64,
+    pub url: String,
+    pub sort_order: i64,
+    pub state: String,
+    pub last_ok_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_error_code: Option<String>,
 }
 
 fn mount_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FederationMount> {
@@ -389,6 +402,7 @@ fn mount_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FederationMount> 
         last_ok_at: row.get(11)?,
         last_error: row.get(12)?,
         last_error_code: row.get(13)?,
+        peer_instance_id: row.get(16)?,
     })
 }
 
@@ -473,6 +487,7 @@ impl Db {
         token_ciphertext: &str,
         owner_name: &str,
         avatar_version: i64,
+        peer_instance_id: &str,
     ) -> anyhow::Result<i64> {
         let base_url = base_url.to_owned();
         let grant_label = grant_label.to_owned();
@@ -481,12 +496,14 @@ impl Db {
         let capabilities = capabilities.to_owned();
         let token_ciphertext = token_ciphertext.to_owned();
         let owner_name = owner_name.to_owned();
+        let peer_instance_id = peer_instance_id.to_owned();
         self.call(move |connection| {
             connection.execute(
                 "INSERT INTO federation_mounts \
                  (user_id, root_id, base_url, grant_id, grant_label, mode, peer_version, \
-                  capabilities, token_ciphertext, created_at, owner_name, avatar_version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  capabilities, token_ciphertext, created_at, owner_name, avatar_version, \
+                  peer_instance_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     user_id,
                     root_id,
@@ -499,10 +516,195 @@ impl Db {
                     token_ciphertext,
                     unix_now(),
                     owner_name,
-                    avatar_version
+                    avatar_version,
+                    peer_instance_id
                 ],
             )?;
             Ok(connection.last_insert_rowid())
+        })
+        .await
+    }
+
+    pub async fn federation_list_endpoints(
+        &self,
+        mount_id: i64,
+    ) -> anyhow::Result<Vec<FederationMountEndpoint>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, mount_id, url, sort_order, state, last_ok_at, last_error, \
+                        last_error_code \
+                 FROM federation_mount_endpoints WHERE mount_id = ?1 ORDER BY sort_order, id",
+            )?;
+            let rows = statement.query_map(params![mount_id], |row| {
+                Ok(FederationMountEndpoint {
+                    id: row.get(0)?,
+                    mount_id: row.get(1)?,
+                    url: row.get(2)?,
+                    sort_order: row.get(3)?,
+                    state: row.get(4)?,
+                    last_ok_at: row.get(5)?,
+                    last_error: row.get(6)?,
+                    last_error_code: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Replace the ordered endpoint list while keeping health state for URLs
+    /// that were already present.
+    pub async fn federation_replace_endpoints(
+        &self,
+        mount_id: i64,
+        urls: &[String],
+    ) -> anyhow::Result<()> {
+        let urls = urls.to_vec();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let mut existing = std::collections::HashMap::new();
+            {
+                let mut statement = transaction.prepare(
+                    "SELECT url, state, last_ok_at, last_error, last_error_code \
+                     FROM federation_mount_endpoints WHERE mount_id = ?1",
+                )?;
+                let rows = statement.query_map(params![mount_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ),
+                    ))
+                })?;
+                for row in rows {
+                    let (url, state) = row?;
+                    existing.insert(url, state);
+                }
+            }
+            transaction.execute(
+                "DELETE FROM federation_mount_endpoints WHERE mount_id = ?1",
+                params![mount_id],
+            )?;
+            let now = unix_now();
+            for (index, url) in urls.iter().enumerate() {
+                let (state, last_ok_at, last_error, last_error_code) = existing
+                    .get(url)
+                    .cloned()
+                    .unwrap_or_else(|| ("unknown".to_owned(), None, None, None));
+                transaction.execute(
+                    "INSERT INTO federation_mount_endpoints \
+                     (mount_id, url, sort_order, state, last_ok_at, last_error, \
+                      last_error_code, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        mount_id,
+                        url,
+                        index as i64,
+                        state,
+                        last_ok_at,
+                        last_error,
+                        last_error_code,
+                        now
+                    ],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_update_endpoint_state(
+        &self,
+        mount_id: i64,
+        url: &str,
+        state: &str,
+        last_ok: bool,
+        error: Option<&str>,
+        error_code: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let url = url.to_owned();
+        let state = state.to_owned();
+        let error = error.map(str::to_owned);
+        let error_code = error_code.map(str::to_owned);
+        self.call(move |connection| {
+            if last_ok {
+                connection.execute(
+                    "UPDATE federation_mount_endpoints \
+                     SET state = ?1, last_ok_at = ?2, last_error = NULL, last_error_code = NULL \
+                     WHERE mount_id = ?3 AND url = ?4",
+                    params![state, unix_now(), mount_id, url],
+                )?;
+            } else {
+                connection.execute(
+                    "UPDATE federation_mount_endpoints \
+                     SET state = ?1, last_error = ?2, last_error_code = ?3 \
+                     WHERE mount_id = ?4 AND url = ?5",
+                    params![state, error, error_code, mount_id, url],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_set_mount_active_url(
+        &self,
+        id: i64,
+        user_id: i64,
+        url: &str,
+    ) -> anyhow::Result<bool> {
+        let url = url.to_owned();
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "UPDATE federation_mounts SET base_url = ?1 WHERE id = ?2 AND user_id = ?3",
+                params![url, id, user_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn federation_set_mount_peer_instance(
+        &self,
+        id: i64,
+        instance_id: &str,
+    ) -> anyhow::Result<()> {
+        let instance_id = instance_id.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE federation_mounts SET peer_instance_id = ?1 WHERE id = ?2",
+                params![instance_id, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_find_mount_by_peer(
+        &self,
+        user_id: i64,
+        peer_instance_id: &str,
+        grant_id: i64,
+    ) -> anyhow::Result<Option<FederationMount>> {
+        let peer_instance_id = peer_instance_id.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
+                            peer_version, capabilities, token_ciphertext, created_at, \
+                            last_ok_at, last_error, last_error_code, owner_name, avatar_version, \
+                            peer_instance_id \
+                     FROM federation_mounts \
+                     WHERE user_id = ?1 AND peer_instance_id = ?2 AND grant_id = ?3 \
+                     ORDER BY id LIMIT 1",
+                    params![user_id, peer_instance_id, grant_id],
+                    mount_from_row,
+                )
+                .optional()
         })
         .await
     }
@@ -516,7 +718,7 @@ impl Db {
                 "SELECT m.id, m.user_id, m.root_id, m.base_url, m.grant_id, m.grant_label, m.mode, \
                         m.peer_version, m.capabilities, m.token_ciphertext, m.created_at, \
                         m.last_ok_at, m.last_error, m.last_error_code, \
-                        m.owner_name, m.avatar_version \
+                        m.owner_name, m.avatar_version, m.peer_instance_id \
                  FROM federation_mounts m JOIN user_roots r ON r.id = m.root_id \
                  WHERE m.user_id = ?1 AND r.kind = 'remote' ORDER BY r.sort_order, m.id",
             )?;
@@ -531,7 +733,8 @@ impl Db {
             let mut statement = connection.prepare(
                 "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
                         peer_version, capabilities, token_ciphertext, created_at, \
-                        last_ok_at, last_error, last_error_code, owner_name, avatar_version \
+                        last_ok_at, last_error, last_error_code, owner_name, avatar_version, \
+                        peer_instance_id \
                  FROM federation_mounts ORDER BY id",
             )?;
             let rows = statement.query_map([], mount_from_row)?;
@@ -550,7 +753,8 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
                             peer_version, capabilities, token_ciphertext, created_at, \
-                            last_ok_at, last_error, last_error_code, owner_name, avatar_version \
+                            last_ok_at, last_error, last_error_code, owner_name, avatar_version, \
+                            peer_instance_id \
                      FROM federation_mounts WHERE root_id = ?1 AND user_id = ?2",
                     params![root_id, user_id],
                     mount_from_row,
@@ -570,7 +774,8 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
                             peer_version, capabilities, token_ciphertext, created_at, \
-                            last_ok_at, last_error, last_error_code, owner_name, avatar_version \
+                            last_ok_at, last_error, last_error_code, owner_name, avatar_version, \
+                            peer_instance_id \
                      FROM federation_mounts WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     mount_from_row,

@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::fs::File;
-use std::fs::OpenOptions;
+use std::fs::{FileTimes, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -371,7 +371,7 @@ pub fn write_new_file(target: &Path, data: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-pub fn finalize_upload(temp: &Path, target: &Path) -> Result<(), AppError> {
+pub fn finalize_upload(temp: &Path, target: &Path, mtime: Option<i64>) -> Result<(), AppError> {
     if target.exists() {
         return Err(AppError::conflict("target file already exists"));
     }
@@ -381,6 +381,13 @@ pub fn finalize_upload(temp: &Path, target: &Path) -> Result<(), AppError> {
         .write(true)
         .open(temp)
         .map_err(io_error)?;
+    if let Some(mtime) = mtime {
+        let modified = UNIX_EPOCH
+            .checked_add(Duration::from_secs(mtime as u64))
+            .ok_or_else(|| AppError::bad_request("mtime is out of range"))?;
+        file.set_times(FileTimes::new().set_modified(modified))
+            .map_err(io_error)?;
+    }
     file.sync_all().map_err(io_error)?;
     std::fs::rename(temp, target).map_err(io_error)?;
 

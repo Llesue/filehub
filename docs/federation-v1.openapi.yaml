@@ -425,6 +425,10 @@ paths:
                 filename: { type: string }
                 total_size: { type: integer, format: int64 }
                 chunk_size: { type: integer }
+                mtime:
+                  type: integer
+                  format: int64
+                  description: 源文件修改时间（Unix 秒，可选）。省略时使用服务端落盘时间。
                 if_match:
                   type: string
                   description: 目标文件必须仍然匹配该 ETag，否则完成上传时返回 412。

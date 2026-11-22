@@ -1370,6 +1370,8 @@ pub struct CreateUploadRequest {
     filename: String,
     total_size: i64,
     chunk_size: Option<i64>,
+    /// Source file modified time as Unix seconds. Omitted keeps server time.
+    mtime: Option<i64>,
     /// Expected ETag of the target file. The upload is rejected with 412 when
     /// the file no longer matches, closing the stat-then-write race.
     if_match: Option<String>,
@@ -1435,6 +1437,7 @@ pub async fn create_upload(
             if request.total_size < 0 {
                 return Err(AppError::bad_request("invalid upload size"));
             }
+            let mtime = crate::files::validate_upload_mtime(request.mtime)?;
             let chunk_size = request.chunk_size.unwrap_or(4 * 1024 * 1024);
             if !(1..=64 * 1024 * 1024).contains(&chunk_size) {
                 return Err(AppError::bad_request("invalid chunk size"));
@@ -1481,6 +1484,7 @@ pub async fn create_upload(
                 if_match: request.if_match.clone(),
                 if_none_match: request.if_none_match.clone(),
                 token_id: Some(token_id),
+                mtime,
             };
             state
                 .db
@@ -1649,7 +1653,7 @@ pub async fn complete_upload(
         let _ = fsops::remove_path(&target, &relative);
     }
     let temp = std::path::PathBuf::from(&upload.temp_path);
-    tokio::task::spawn_blocking(move || fsops::finalize_upload(&temp, &target))
+    tokio::task::spawn_blocking(move || fsops::finalize_upload(&temp, &target, upload.mtime))
         .await
         .map_err(|error| AppError::internal(anyhow::Error::from(error)))??;
     let info = tokio::task::spawn_blocking({

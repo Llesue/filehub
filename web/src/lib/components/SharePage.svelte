@@ -504,6 +504,7 @@
         path,
         filename: task.name,
         total_size: task.file.size,
+        mtime: task.file.lastModified > 0 ? Math.floor(task.file.lastModified / 1000) : undefined,
         ticket,
       });
       task.uploadId = created.upload_id;

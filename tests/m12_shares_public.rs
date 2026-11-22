@@ -446,7 +446,13 @@ async fn writable_share_supports_chunked_upload_and_cancel() {
         &format!("/api/v1/public/shares/{token}/uploads"),
         None,
         None,
-        json!({"path": "", "filename": "chunked.bin", "total_size": 5, "chunk_size": 2}),
+        json!({
+            "path": "",
+            "filename": "chunked.bin",
+            "total_size": 5,
+            "chunk_size": 2,
+            "mtime": 1_700_000_002_i64
+        }),
     )
     .await;
     assert_eq!(created.status(), StatusCode::OK);
@@ -508,6 +514,14 @@ async fn writable_share_supports_chunked_upload_and_cancel() {
     .await;
     assert_eq!(complete.status(), StatusCode::OK);
     assert_eq!(json_body(complete).await["name"], "chunked.bin");
+    let modified = std::fs::metadata(app.home.join("pub/chunked.bin"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(modified, 1_700_000_002);
     assert_eq!(
         std::fs::read(app.home.join("pub/chunked.bin")).unwrap(),
         b"abcde"

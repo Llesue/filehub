@@ -1513,9 +1513,14 @@ paths:
           application/json:
             schema:
               type: object
-              required: [url, token, grant_id]
+              required: [token, grant_id]
               properties:
-                url: { type: string }
+                url: { type: string, description: 兼容单地址客户端 }
+                urls:
+                  type: array
+                  maxItems: 5
+                  items: { type: string }
+                  description: 按优先级排列；第一行为优先地址。
                 token: { type: string }
                 grant_id: { type: integer, format: int64 }
                 alias: { type: string }
@@ -1543,6 +1548,26 @@ paths:
               required: [alias]
               properties:
                 alias: { type: string, maxLength: 64 }
+      responses:
+        '200': { description: OK }
+  /api/v1/remote/mounts/{id}/addresses:
+    put:
+      tags: [remote]
+      summary: 修改挂载地址列表
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [urls]
+              properties:
+                urls:
+                  type: array
+                  maxItems: 5
+                  items: { type: string }
       responses:
         '200': { description: OK }
   /api/v1/remote/mounts/{id}/test:
@@ -1671,6 +1696,17 @@ components:
         root_id: { type: integer, format: int64 }
         alias: { type: string }
         base_url: { type: string }
+        addresses:
+          type: array
+          items:
+            type: object
+            properties:
+              url: { type: string }
+              state: { type: string }
+              active: { type: boolean }
+              last_ok_at: { type: integer, format: int64, nullable: true }
+              last_error: { type: string, nullable: true }
+              last_error_code: { type: string, nullable: true }
         grant_id: { type: integer, format: int64 }
         grant_label: { type: string }
         mode: { type: string, enum: [ro, rw] }

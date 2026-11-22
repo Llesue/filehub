@@ -400,6 +400,7 @@ impl PeerClient {
         chunk_size: i64,
         if_match: Option<&str>,
         if_none_match: Option<&str>,
+        mtime: Option<i64>,
     ) -> Result<Value, PeerError> {
         let mut body = serde_json::json!({
             "grant": grant,
@@ -413,6 +414,9 @@ impl PeerClient {
         }
         if let Some(value) = if_none_match {
             body["if_none_match"] = Value::String(value.to_owned());
+        }
+        if let Some(value) = mtime {
+            body["mtime"] = Value::Number(value.into());
         }
         self.write("POST", "/uploads", &body).await
     }

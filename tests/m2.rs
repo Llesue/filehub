@@ -545,3 +545,57 @@ async fn user_updates_are_published_to_the_admin_list_and_the_affected_user() {
         "the affected user needs a scoped user.updated event"
     );
 }
+
+#[tokio::test]
+async fn upload_preserves_client_mtime() {
+    let app = setup_app().await;
+    let mtime = 1_700_000_000_i64;
+    let create = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/uploads",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "",
+            "filename": "photo.jpg",
+            "total_size": 3,
+            "chunk_size": 3,
+            "mtime": mtime
+        }),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+    let upload_id = json_body(create).await["upload_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let response = send_bytes(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/uploads/{upload_id}/chunks/0"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        b"abc".to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/uploads/{upload_id}/complete"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let modified = std::fs::metadata(app.home.join("photo.jpg"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(modified, mtime as u64);
+}

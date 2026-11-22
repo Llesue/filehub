@@ -692,7 +692,7 @@
 
   .meta em.rw,
   .grant em.rw {
-    color: var(--danger);
+    color: var(--success, #2e7d32);
   }
 
   .count {
@@ -913,9 +913,10 @@
   @media (max-width: 640px) {
     .dialog {
       width: 100vw;
-      height: 100vh;
+      height: 100dvh;
       max-height: none;
       border-radius: 0;
+      padding-bottom: max(20px, env(safe-area-inset-bottom, 20px));
     }
 
     .editor-fields,

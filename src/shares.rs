@@ -510,6 +510,8 @@ pub struct CreateShareUploadRequest {
     total_size: i64,
     chunk_size: Option<i64>,
     ticket: Option<String>,
+    /// Source file modified time as Unix seconds. Omitted keeps server time.
+    mtime: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,6 +537,7 @@ pub async fn create_upload(
         return Err(AppError::Forbidden);
     }
     let path = request.path.unwrap_or_default();
+    let mtime = crate::files::validate_upload_mtime(request.mtime)?;
     ensure_public_path(&share, &path)?;
     let resolved = resolve_share_path(&share, &path).await?;
     if !resolved.absolute.is_dir() {
@@ -584,6 +587,7 @@ pub async fn create_upload(
         expires_at: now + ttl.saturating_mul(3600),
         created_at: now,
         updated_at: now,
+        mtime,
     };
     if let Err(error) = state.db.insert_share_upload(&upload).await {
         fsops::delete_temp(&temp);
@@ -726,9 +730,12 @@ pub async fn complete_upload(
     }
     let temp = std::path::PathBuf::from(&upload.temp_path);
     let target = fsops::unique_target(&resolved.absolute.join(&upload.filename));
-    tokio::fs::rename(&temp, &target)
-        .await
-        .map_err(|error| AppError::internal(anyhow::Error::from(error)))?;
+    let finalize_target = target.clone();
+    tokio::task::spawn_blocking(move || {
+        fsops::finalize_upload(&temp, &finalize_target, upload.mtime)
+    })
+    .await
+    .map_err(|error| AppError::internal(anyhow::Error::from(error)))??;
     state
         .invalidate_path_caches(&target, Some(share.creator_id), false)
         .await;

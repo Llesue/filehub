@@ -82,6 +82,13 @@ const en: Record<string, string> = {
   '从未连接': 'Never connected',
   '上次在线': 'Last seen',
   '共享目录': 'Shared folders',
+  '备用地址（每行一个，内网优先）': 'Alternate addresses (one per line, LAN first)',
+  '编辑地址': 'Edit addresses',
+  '地址列表': 'Addresses',
+  '每行一个地址，第一行为优先；内网建议放第一行。':
+    'One address per line; the first line has priority. Put the LAN address first.',
+  '保存地址': 'Save addresses',
+  '至少需要一个地址': 'At least one address is required',
   '没有更多目录': 'No more folders',
   '远程目录的令牌或授权已失效，请在挂载设置中重新连接。': 'The remote token or grant is no longer valid. Reconnect it from mount settings.',
   '启用远程目录挂载': 'Enable remote directory mounts',

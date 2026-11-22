@@ -6,6 +6,7 @@
     | 'list'
     | 'grid'
     | 'tile'
+    | 'sort'
     | 'image'
     | 'eye'
     | 'play'
@@ -81,6 +82,13 @@
     <rect x="4" y="14" width="6" height="6" rx="1" />
     <rect x="14" y="14" width="6" height="6" rx="1" />
   {:else if name === 'tile'}
+    <rect x="3" y="3" width="7" height="7" rx="1" />
+    <rect x="14" y="3" width="7" height="7" rx="1" />
+    <rect x="3" y="14" width="7" height="7" rx="1" />
+    <rect x="14" y="14" width="7" height="7" rx="1" />
+  {:else if name === 'sort'}
+    <path d="M4 6h10M4 12h7M4 18h4" />
+    <path d="M18 5v14m0 0-3-3m3 3 3-3" />
     <rect x="6" y="3.5" width="12" height="7" rx="1.5" />
     <rect x="6" y="13.5" width="12" height="7" rx="1.5" />
   {:else if name === 'eye'}

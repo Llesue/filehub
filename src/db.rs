@@ -80,6 +80,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/0034_remote_mount_preference.sql"),
     ),
     (35, include_str!("../migrations/0035_remote_avatar.sql")),
+    (36, include_str!("../migrations/0036_upload_mtime.sql")),
+    (37, include_str!("../migrations/0037_mount_endpoints.sql")),
 ];
 
 pub fn unix_now() -> i64 {
@@ -204,6 +206,7 @@ pub struct UploadSession {
     pub if_match: Option<String>,
     pub if_none_match: Option<String>,
     pub token_id: Option<i64>,
+    pub mtime: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +223,7 @@ pub struct ShareUploadSession {
     pub expires_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub mtime: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1339,8 +1343,8 @@ impl Db {
                 "INSERT INTO upload_sessions \
                  (id, user_id, root_id, dir_path, filename, total_size, chunk_size, received, \
                   chunk_bitmap, temp_path, sha256, expires_at, created_at, updated_at, remote_upload_id, \
-                  if_match, if_none_match, token_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12, ?13, ?14, ?15, ?16)",
+                  if_match, if_none_match, token_id, mtime) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     upload.id,
                     upload.user_id,
@@ -1357,7 +1361,8 @@ impl Db {
                     upload.remote_upload_id,
                     upload.if_match,
                     upload.if_none_match,
-                    upload.token_id
+                    upload.token_id,
+                    upload.mtime
                 ],
             )?;
             Ok(())
@@ -1376,7 +1381,7 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, dir_path, filename, total_size, chunk_size, \
                      received, chunk_bitmap, temp_path, expires_at, created_at, updated_at, \
-                     remote_upload_id, if_match, if_none_match, token_id \
+                     remote_upload_id, if_match, if_none_match, token_id, mtime \
                      FROM upload_sessions WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     |row| {
@@ -1398,6 +1403,7 @@ impl Db {
                             if_match: row.get(14)?,
                             if_none_match: row.get(15)?,
                             token_id: row.get(16)?,
+                            mtime: row.get(17)?,
                         })
                     },
                 )
@@ -1415,7 +1421,7 @@ impl Db {
             let mut statement = connection.prepare(
                 "SELECT id, user_id, root_id, dir_path, filename, total_size, chunk_size, \
                         received, chunk_bitmap, temp_path, expires_at, created_at, updated_at, \
-                        remote_upload_id, if_match, if_none_match, token_id \
+                        remote_upload_id, if_match, if_none_match, token_id, mtime \
                  FROM upload_sessions WHERE user_id = ?1 AND root_id = ?2",
             )?;
             let rows = statement.query_map(params![user_id, root_id], |row| {
@@ -1437,6 +1443,7 @@ impl Db {
                     if_match: row.get(14)?,
                     if_none_match: row.get(15)?,
                     token_id: row.get(16)?,
+                    mtime: row.get(17)?,
                 })
             })?;
             rows.collect()
@@ -1482,8 +1489,8 @@ impl Db {
             connection.execute(
                 "INSERT INTO share_upload_sessions \
                  (id, share_id, dir_path, filename, total_size, chunk_size, received, \
-                  chunk_bitmap, temp_path, expires_at, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  chunk_bitmap, temp_path, expires_at, created_at, updated_at, mtime) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     upload.id,
                     upload.share_id,
@@ -1496,7 +1503,8 @@ impl Db {
                     upload.temp_path,
                     upload.expires_at,
                     upload.created_at,
-                    upload.updated_at
+                    upload.updated_at,
+                    upload.mtime
                 ],
             )?;
             Ok(())
@@ -1514,7 +1522,7 @@ impl Db {
             connection
                 .query_row(
                     "SELECT id, share_id, dir_path, filename, total_size, chunk_size, received, \
-                     chunk_bitmap, temp_path, expires_at, created_at, updated_at \
+                     chunk_bitmap, temp_path, expires_at, created_at, updated_at, mtime \
                      FROM share_upload_sessions WHERE id = ?1 AND share_id = ?2",
                     params![id, share_id],
                     |row| {
@@ -1531,6 +1539,7 @@ impl Db {
                             expires_at: row.get(9)?,
                             created_at: row.get(10)?,
                             updated_at: row.get(11)?,
+                            mtime: row.get(12)?,
                         })
                     },
                 )

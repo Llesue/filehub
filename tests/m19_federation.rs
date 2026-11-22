@@ -310,7 +310,7 @@ async fn federation_contract_round_trip() {
         Some(&mount_instance.cookie),
         Some(&mount_instance.csrf),
         json!({
-            "url": peer_instance.base,
+            "urls": ["http://127.0.0.1:1", peer_instance.base],
             "token": token.clone(),
             "grant_id": grant_id,
             "alias": "peer",
@@ -320,6 +320,125 @@ async fn federation_contract_round_trip() {
     assert_eq!(mount.status(), StatusCode::OK, "mount failed");
     let mount = json_body(mount).await;
     let remote_root = mount["root_id"].as_i64().unwrap();
+    let listed = send(
+        &mount_instance.router,
+        Method::GET,
+        "/api/v1/remote/mounts",
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    let listed = json_body(listed).await;
+    let addresses = listed["mounts"][0]["addresses"].as_array().unwrap();
+    assert_eq!(addresses.len(), 2);
+    assert_eq!(addresses[0]["state"], "offline");
+    assert_eq!(addresses[1]["active"], true);
+    assert_eq!(listed["mounts"][0]["base_url"], peer_instance.base);
+
+    let duplicate = send_json(
+        &mount_instance.router,
+        Method::POST,
+        "/api/v1/remote/mounts",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({
+            "urls": [peer_instance.base],
+            "token": token.clone(),
+            "grant_id": grant_id,
+            "alias": "another name",
+        }),
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::OK);
+    assert_eq!(json_body(duplicate).await["root_id"], remote_root);
+    let listed = send(
+        &mount_instance.router,
+        Method::GET,
+        "/api/v1/remote/mounts",
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        json_body(listed).await["mounts"].as_array().unwrap().len(),
+        1
+    );
+
+    let mtime = 1_700_000_001_i64;
+    let remote_upload = send_json(
+        &mount_instance.router,
+        Method::POST,
+        "/api/v1/uploads",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({
+            "root": remote_root,
+            "path": "",
+            "filename": "remote-mtime.txt",
+            "total_size": 3,
+            "chunk_size": 3,
+            "mtime": mtime
+        }),
+    )
+    .await;
+    assert_eq!(remote_upload.status(), StatusCode::OK);
+    let remote_upload = json_body(remote_upload).await;
+    let remote_upload_id = remote_upload["upload_id"].as_str().unwrap();
+    let chunk = send_bytes(
+        &mount_instance.router,
+        Method::PUT,
+        &format!("/api/v1/uploads/{remote_upload_id}/chunks/0"),
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        b"abc".to_vec(),
+    )
+    .await;
+    assert_eq!(chunk.status(), StatusCode::OK);
+    let complete = send(
+        &mount_instance.router,
+        Method::POST,
+        &format!("/api/v1/uploads/{remote_upload_id}/complete"),
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+    )
+    .await;
+    assert_eq!(complete.status(), StatusCode::OK);
+    let remote_mtime = std::fs::metadata(
+        peer_instance
+            ._dir
+            .path()
+            .join("users/admin/shared/remote-mtime.txt"),
+    )
+    .unwrap()
+    .modified()
+    .unwrap()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_secs();
+    assert_eq!(remote_mtime, mtime as u64);
+
+    let update = send_json(
+        &mount_instance.router,
+        Method::PUT,
+        "/api/v1/remote/mounts/1/addresses",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({"urls": [peer_instance.base, "http://127.0.0.1:1"]}),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+    let listed = send(
+        &mount_instance.router,
+        Method::GET,
+        "/api/v1/remote/mounts",
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    let listed = json_body(listed).await;
+    let addresses = listed["mounts"][0]["addresses"].as_array().unwrap();
+    assert_eq!(addresses.len(), 2);
+    assert_eq!(addresses[0]["active"], true);
 
     std::fs::create_dir_all(peer_instance._dir.path().join("users/admin/shared/sub")).unwrap();
     std::fs::write(

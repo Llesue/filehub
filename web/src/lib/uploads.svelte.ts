@@ -365,6 +365,7 @@ class UploadManager {
         item.name,
         file.size,
         this.getCsrf(),
+        file.lastModified > 0 ? Math.floor(file.lastModified / 1000) : undefined,
       );
       item.uploadId = created.upload_id;
       item.chunkSize = created.chunk_size;

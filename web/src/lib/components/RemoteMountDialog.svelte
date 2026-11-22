@@ -39,6 +39,13 @@
   >([]);
   let grantsBusy = $state(false);
   let grantsError = $state('');
+  let menuId = $state<number | null>(null);
+  let addressEditId = $state<number | null>(null);
+  let addressEditText = $state('');
+  let addressEditBusy = $state(false);
+  let addressEditError = $state('');
+  let menuPosition = $state<{ left: number; top: number; maxHeight: number } | null>(null);
+  const menuMount = $derived(menuId === null ? null : (mounts.find((item) => item.id === menuId) ?? null));
 
   $effect(() => {
     if (open) {
@@ -46,14 +53,72 @@
       confirmRemove = null;
       reconnectId = null;
       reconnectToken = '';
+      menuId = null;
+      addressEditId = null;
+      addressEditError = '';
       void load();
     }
+  });
+
+  $effect(() => {
+    if (menuId === null) return;
+    const close = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('.row-actions') || target?.closest('.row-menu')) return;
+      menuId = null;
+      menuPosition = null;
+    };
+    window.addEventListener('pointerdown', close);
+    return () => window.removeEventListener('pointerdown', close);
   });
 
   function message(value: unknown): string {
     if (value instanceof ApiError) return value.message;
     if (value instanceof Error) return value.message;
     return String(value);
+  }
+
+  $effect(() => {
+    if (menuId === null) return;
+    const close = () => {
+      menuId = null;
+      menuPosition = null;
+    };
+    const onScroll = (event: Event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('.row-menu')) return;
+      close();
+    };
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', close);
+    return () => {
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', close);
+    };
+  });
+
+  function openRowMenu(event: MouseEvent, mount: RemoteMount): void {
+    event.stopPropagation();
+    if (menuId === mount.id) {
+      menuId = null;
+      menuPosition = null;
+      return;
+    }
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const width = 168;
+    const margin = 8;
+    const left = Math.max(margin, Math.min(rect.right - width, window.innerWidth - width - margin));
+    const height = 168;
+    const up = rect.bottom + height + margin > window.innerHeight;
+    const top = up
+      ? Math.max(margin, rect.top - height - 4)
+      : rect.bottom + 4;
+    menuId = mount.id;
+    menuPosition = {
+      left,
+      top,
+      maxHeight: Math.max(120, window.innerHeight - top - margin),
+    };
   }
 
   async function load(): Promise<void> {
@@ -190,6 +255,68 @@
     }
   }
 
+  function activeAddress(mount: RemoteMount): string {
+    return (
+      mount.addresses?.find((address) => address.active)?.url ??
+      mount.base_url
+    );
+  }
+
+  function addressCount(mount: RemoteMount): number {
+    return mount.addresses?.length ?? 0;
+  }
+
+  function addressTitle(mount: RemoteMount): string {
+    const addresses = mount.addresses ?? [];
+    if (addresses.length === 0) return mount.base_url;
+    return addresses
+      .map(
+        (address) =>
+          `${address.active ? '✓ ' : ''}${address.url}${
+            address.state && address.state !== 'online' ? ` (${address.state})` : ''
+          }`,
+      )
+      .join('\n');
+  }
+
+  function openAddressEditor(mount: RemoteMount): void {
+    addressEditId = mount.id;
+    addressEditText = (mount.addresses?.length
+      ? mount.addresses.map((address) => address.url)
+      : [mount.base_url]
+    ).join('\n');
+    addressEditError = '';
+    menuId = null;
+  }
+
+  async function saveAddresses(mount: RemoteMount): Promise<void> {
+    const urls = addressEditText
+      .split(/[\n,]+/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (urls.length === 0) {
+      addressEditError = t($language, '至少需要一个地址');
+      return;
+    }
+    addressEditBusy = true;
+    addressEditError = '';
+    try {
+      await api.remoteUpdateMountAddresses(mount.id, urls, csrf);
+      addressEditId = null;
+      await load();
+      const updated = mounts.find((item) => item.id === mount.id) ?? null;
+      if (view === 'grants' && updated) {
+        grantsMount = updated;
+        await openMountGrants(updated);
+      }
+      onMounted(null);
+    } catch (value) {
+      addressEditError = message(value);
+    } finally {
+      addressEditBusy = false;
+    }
+  }
+
   function stateLabel(state: RemoteMount['state']): string {
     switch (state) {
       case 'online':
@@ -243,7 +370,55 @@
             <Icon name="close" size={16} />
           </button>
         </header>
-        <p class="hint">{grantsMount?.base_url}</p>
+        <div class="grants-address">
+          <p class="hint" title={grantsMount ? addressTitle(grantsMount) : ''}>
+            {grantsMount ? activeAddress(grantsMount) : ''}
+          </p>
+          {#if grantsMount}
+            <button
+              type="button"
+              class="pencil"
+              aria-label={t($language, '编辑地址')}
+              title={t($language, '编辑地址')}
+              onclick={() => {
+                if (grantsMount) openAddressEditor(grantsMount);
+              }}
+            >
+              <Icon name="pencil" size={14} />
+            </button>
+          {/if}
+        </div>
+        {#if grantsMount && addressEditId === grantsMount.id}
+          <div class="address-editor">
+            <label for={`addresses-grants-${grantsMount.id}`}>{t($language, '地址列表')}</label>
+            <textarea
+              id={`addresses-grants-${grantsMount.id}`}
+              bind:value={addressEditText}
+              rows="3"
+              placeholder="https://nas.example.com"
+            ></textarea>
+            <p class="hint">{t($language, '每行一个地址，第一行为优先；内网建议放第一行。')}</p>
+            {#if addressEditError}
+              <p class="error">{addressEditError}</p>
+            {/if}
+            <div class="address-actions">
+              <button
+                type="button"
+                class="ghost"
+                disabled={addressEditBusy}
+                onclick={() => (addressEditId = null)}>{t($language, '取消')}</button
+              >
+              <button
+                type="button"
+                disabled={addressEditBusy}
+                onclick={() => grantsMount && void saveAddresses(grantsMount)}>{t(
+                  $language,
+                  '保存地址',
+                )}</button
+              >
+            </div>
+          </div>
+        {/if}
         {#if grantsError}
           <p class="error">{grantsError}</p>
         {/if}
@@ -315,67 +490,83 @@
           <div class="list">
             {#each mounts as item (item.id)}
               <div class="row">
-                <div class="meta">
-                  <strong>{item.alias}</strong>
-                  <button
-                    type="button"
-                    class="url"
-                    title={item.base_url}
-                    onclick={() => void openMountGrants(item)}
-                  >{item.base_url}</button>
-                  <em class:rw={item.mode === 'rw'}>
-                    {item.mode === 'rw' ? t($language, '读写') : t($language, '只读')}
-                  </em>
-                  <span class="state" class:bad={item.state !== 'online'}>
-                    {stateLabel(item.state)}
-                  </span>
-                  {#if latency[item.id] !== undefined}
-                    <span class="latency {latencyClass(latency[item.id] ?? 0)}">
-                      {latency[item.id]} ms
+                <div class="mount-info">
+                  <div class="title-line">
+                    <strong>{item.alias}</strong>
+                    <button
+                      type="button"
+                      class="url"
+                      title={addressTitle(item)}
+                      onclick={() => void openMountGrants(item)}
+                    >{activeAddress(item)}{#if addressCount(item) > 1}<span class="address-count"
+                          >+{addressCount(item) - 1}</span
+                        >{/if}</button
+                    >
+                    <button
+                      type="button"
+                      class="pencil"
+                      aria-label={t($language, '编辑地址')}
+                      title={t($language, '编辑地址')}
+                      onclick={() => openAddressEditor(item)}
+                    >
+                      <Icon name="pencil" size={14} />
+                    </button>
+                  </div>
+                  <div class="detail-line">
+                    <em class:rw={item.mode === 'rw'}>
+                      {item.mode === 'rw' ? t($language, '读写') : t($language, '只读')}
+                    </em>
+                    <span class="state" class:bad={item.state !== 'online'}>
+                      {stateLabel(item.state)}
                     </span>
-                  {/if}
-                  <span class="latency">{t($language, '缩略图缓存')} {cacheLabel(item.thumb_cache_bytes)}</span>
-                </div>
-                <div class="actions">
-                  <button type="button" disabled={busy} onclick={() => void test(item.id)}>
-                    {t($language, '测试连接')}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onclick={() => {
-                      renameId = renameId === item.id ? null : item.id;
-                      renameAlias = item.alias;
-                      reconnectId = null;
-                      confirmRemove = null;
-                    }}
-                  >
-                    {t($language, '改名')}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onclick={() => {
-                      reconnectId = reconnectId === item.id ? null : item.id;
-                      reconnectToken = '';
-                      renameId = null;
-                      confirmRemove = null;
-                    }}
-                  >
-                    {t($language, '重新连接')}
-                  </button>
-                  <button
-                    type="button"
-                    class="danger"
-                    disabled={busy}
-                    onclick={() => void remove(item.id)}
-                  >
-                    {confirmRemove === item.id
-                      ? t($language, '确认断开')
-                      : t($language, '断开挂载')}
-                  </button>
+                    {#if latency[item.id] !== undefined}
+                      <span class="latency {latencyClass(latency[item.id] ?? 0)}">
+                        {latency[item.id]} ms
+                      </span>
+                    {/if}
+                    <span class="latency"
+                      >{t($language, '缩略图缓存')} {cacheLabel(item.thumb_cache_bytes)}</span
+                    >
+                    <div class="row-actions">
+                      <button
+                        type="button"
+                        class="menu-trigger"
+                        aria-label={t($language, '更多操作')}
+                        title={t($language, '更多操作')}
+                        onclick={(event) => openRowMenu(event, item)}>⋮</button
+                      >
+                    </div>
+                  </div>
                 </div>
               </div>
+              {#if addressEditId === item.id}
+                <div class="address-editor">
+                  <label for={`addresses-${item.id}`}>{t($language, '地址列表')}</label>
+                  <textarea
+                    id={`addresses-${item.id}`}
+                    bind:value={addressEditText}
+                    rows="3"
+                    placeholder="https://nas.example.com"
+                  ></textarea>
+                  <p class="hint">{t($language, '每行一个地址，第一行为优先；内网建议放第一行。')}</p>
+                  {#if addressEditError}
+                    <p class="error">{addressEditError}</p>
+                  {/if}
+                  <div class="address-actions">
+                    <button
+                      type="button"
+                      class="ghost"
+                      disabled={addressEditBusy}
+                      onclick={() => (addressEditId = null)}>{t($language, '取消')}</button
+                    >
+                    <button
+                      type="button"
+                      disabled={addressEditBusy}
+                      onclick={() => void saveAddresses(item)}>{t($language, '保存地址')}</button
+                    >
+                  </div>
+                </div>
+              {/if}
               {#if confirmRemove === item.id}
                 <p class="warn">{t($language, '只删除本地挂载记录，不会删除对方文件。')}</p>
               {/if}
@@ -421,6 +612,72 @@
           </button>
         </footer>
       </div>
+      {#if menuMount && menuPosition}
+        <div
+          class="row-menu fixed"
+          role="menu"
+          tabindex="-1"
+          style={`left:${menuPosition.left}px;top:${menuPosition.top}px;max-height:${menuPosition.maxHeight}px`}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={busy}
+            onclick={() => {
+              const mount = menuMount;
+              menuId = null;
+              menuPosition = null;
+              if (mount) void test(mount.id);
+            }}>{t($language, '测试连接')}</button
+          >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={busy}
+            onclick={() => {
+              const mount = menuMount;
+              menuId = null;
+              menuPosition = null;
+              if (mount) {
+                renameId = mount.id;
+                renameAlias = mount.alias;
+                reconnectId = null;
+                confirmRemove = null;
+              }
+            }}>{t($language, '改名')}</button
+          >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={busy}
+            onclick={() => {
+              const mount = menuMount;
+              menuId = null;
+              menuPosition = null;
+              if (mount) {
+                reconnectId = mount.id;
+                reconnectToken = '';
+                renameId = null;
+                confirmRemove = null;
+              }
+            }}>{t($language, '重新连接')}</button
+          >
+          <button
+            type="button"
+            role="menuitem"
+            class="danger"
+            disabled={busy}
+            onclick={() => {
+              const mount = menuMount;
+              menuId = null;
+              menuPosition = null;
+              if (mount) void remove(mount.id);
+            }}>{confirmRemove === menuMount?.id
+              ? t($language, '确认断开')
+              : t($language, '断开挂载')}</button
+          >
+        </div>
+      {/if}
     </div>
   {/if}
 {/if}
@@ -505,17 +762,46 @@
     border-radius: 6px;
   }
 
-  .meta {
+  .mount-info {
     display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    align-items: center;
+    flex: 1;
+    flex-direction: column;
+    gap: 6px;
     min-width: 0;
   }
 
-  .meta .url {
+  .title-line,
+  .detail-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .detail-line em {
+    font-style: normal;
+    font-size: 11.5px;
+    color: var(--text-2);
+  }
+
+  .detail-line em.rw {
+    color: var(--success, #2e7d32);
+  }
+
+  .title-line strong {
+    flex: 0 1 auto;
+    min-width: 0;
     overflow: hidden;
-    max-width: 280px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .title-line .url {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    max-width: 360px;
     padding: 0;
     border: none;
     background: none;
@@ -528,14 +814,127 @@
     cursor: pointer;
   }
 
-  .meta em {
-    font-style: normal;
-    font-size: 11.5px;
+  .address-count {
+    margin-left: 4px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--surface-2);
     color: var(--text-2);
+    font-size: 10.5px;
+    text-decoration: none;
   }
 
-  .meta em.rw {
-    color: var(--success, #2e7d32);
+  .pencil,
+  .menu-trigger {
+    display: inline-grid;
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    place-items: center;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-2);
+    cursor: pointer;
+  }
+
+  .pencil:hover,
+  .menu-trigger:hover {
+    background: var(--hover);
+    color: var(--text);
+  }
+
+  .row-actions {
+    position: relative;
+    margin-left: auto;
+  }
+
+  .row-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 5;
+    display: flex;
+    min-width: 148px;
+    flex-direction: column;
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .row-menu.fixed {
+    position: fixed;
+    right: auto;
+    z-index: 90;
+    overflow-y: auto;
+  }
+
+  .row-menu button {
+    min-height: 36px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 13px;
+    text-align: left;
+  }
+
+  .row-menu button:hover {
+    background: var(--hover);
+  }
+
+  .row-menu button.danger {
+    color: var(--danger);
+  }
+
+  .address-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-2);
+  }
+
+  .address-editor label {
+    color: var(--text-2);
+    font-size: 12px;
+  }
+
+  .address-editor textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    resize: vertical;
+  }
+
+  .address-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .grants-address {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .grants-address .hint {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .state {
@@ -668,9 +1067,10 @@
   @media (max-width: 640px) {
     .dialog {
       width: 100vw;
-      height: 100vh;
+      height: 100dvh;
       max-height: none;
       border-radius: 0;
+      padding-bottom: max(20px, env(safe-area-inset-bottom, 20px));
     }
 
     .row {

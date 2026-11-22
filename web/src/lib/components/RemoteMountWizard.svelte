@@ -18,6 +18,7 @@
 
   let step = $state(1);
   let url = $state('');
+  let alternateUrls = $state('');
   let token = $state('');
   let probe = $state<{
     server_version: string;
@@ -67,6 +68,7 @@
   function reset(): void {
     step = 1;
     url = '';
+    alternateUrls = '';
     token = '';
     probe = null;
     grants = [];
@@ -81,21 +83,36 @@
     busy = true;
     error = '';
     probe = null;
-    url = normalizedUrl(url);
-    try {
-      const result = await api.remoteProbe(url, csrf);
-      probe = {
-        server_version: result.server_version,
-        resolved_ips: result.resolved_ips,
-        address_class: result.address_class,
-        plaintext: result.plaintext,
-      };
-      if (jump) step = 2;
-    } catch (value) {
-      error = message(value);
-    } finally {
-      busy = false;
+    let lastError: unknown = null;
+    const original = normalizedUrl(url);
+    for (const candidate of urlsForMount()) {
+      try {
+        const result = await api.remoteProbe(candidate, csrf);
+        if (candidate !== original && original) {
+          const extras = alternateUrls
+            .split(/[\n,]+/)
+            .map((value) => normalizedUrl(value))
+            .filter(Boolean);
+          if (!extras.includes(original)) {
+            alternateUrls = [original, ...extras].join('\n');
+          }
+        }
+        url = candidate;
+        probe = {
+          server_version: result.server_version,
+          resolved_ips: result.resolved_ips,
+          address_class: result.address_class,
+          plaintext: result.plaintext,
+        };
+        if (jump) step = 2;
+        busy = false;
+        return;
+      } catch (value) {
+        lastError = value;
+      }
     }
+    error = lastError ? message(lastError) : t($language, '至少需要一个地址');
+    busy = false;
   }
 
   async function nextStep(): Promise<void> {
@@ -134,7 +151,7 @@
     error = '';
     try {
       const created = await api.remoteCreateMount(
-        normalizedUrl(url),
+        urlsForMount(),
         token.trim(),
         selected,
         alias.trim(),
@@ -148,6 +165,16 @@
     } finally {
       busy = false;
     }
+  }
+
+  function urlsForMount(): string[] {
+    const values = [url, ...alternateUrls.split(/[\n,]+/)];
+    const result: string[] = [];
+    for (const value of values) {
+      const normalized = normalizedUrl(value);
+      if (normalized && !result.includes(normalized)) result.push(normalized);
+    }
+    return result;
   }
 
   function parseInvite(value: string): boolean {
@@ -199,6 +226,15 @@
               if (!probe && url && !busy) void probeAddress(false);
             }}
           />
+        </label>
+        <label class="field">
+          <span>{t($language, '备用地址（每行一个，内网优先）')}</span>
+          <textarea
+            bind:value={alternateUrls}
+            rows="2"
+            placeholder="https://192.168.1.10:8080"
+            autocomplete="off"
+          ></textarea>
         </label>
         {#if probe}
           <div class="probe">
@@ -319,6 +355,7 @@
     color: var(--text-2);
     font-size: 12px;
     letter-spacing: 2px;
+    white-space: nowrap;
   }
 
   .icon {
@@ -336,7 +373,8 @@
     color: var(--text-2);
   }
 
-  input {
+  input,
+  textarea {
     padding: 8px 10px;
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -358,6 +396,12 @@
 
   .secret input {
     flex: 1;
+  }
+
+  textarea {
+    resize: vertical;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
   }
 
   .secret button {
@@ -418,7 +462,7 @@
   }
 
   .grant em.rw {
-    color: var(--danger);
+    color: var(--success, #2e7d32);
   }
 
   footer {
@@ -449,9 +493,10 @@
   @media (max-width: 640px) {
     .wizard {
       width: 100vw;
-      height: 100vh;
+      height: 100dvh;
       max-height: none;
       border-radius: 0;
+      padding-bottom: max(20px, env(safe-area-inset-bottom, 20px));
     }
   }
 </style>

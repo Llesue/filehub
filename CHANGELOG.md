@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.2.1 - 2026-11-22
+
+### Added
+
+- Remote mounts can store several ordered addresses. The first healthy address is used; the mount fails over automatically and prefers the LAN address again when it recovers.
+- Address lists can be edited from the mount manager or token folder view, with one address per line.
+- Upload sessions accept an optional source modified time (`mtime`, Unix seconds) and preserve it for local, remote and public-share uploads.
+
+### Changed
+
+- Small screens use the tile view only, with a compact icon top bar and a search dialog instead of the inline search field.
+
+### Fixed
+
+- English translations for remote directory state labels and folder picker messages.
+- Mobile file rows no longer grow vertically from hidden action buttons.
+- Context menus keep their submenus inside the viewport.
+- Remote mount row menus are rendered above the dialog scroll container, so they are not clipped, and close when clicking blank space. "Read/write" labels use the same green as the online state.
+- The mobile selection toolbar fits 320px screens.
+- Narrow phone top bars no longer overflow, and the tile view fits 320px screens.
+- Small-screen context menus no longer show sort or view-switch entries; sort remains available from the compact top bar.
+- Remote mount dialogs use the dynamic viewport height and respect the bottom safe area.
+
 ## v0.2.0 - 2026-11-21
 
 ### Added

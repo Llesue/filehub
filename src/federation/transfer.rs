@@ -322,6 +322,7 @@ async fn copy_one(
                 CHUNK_SIZE as i64,
                 None,
                 None,
+                None,
             )
             .await
             .map_err(|error| error.into_app())?;

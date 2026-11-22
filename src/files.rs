@@ -1309,6 +1309,18 @@ pub struct CreateUploadRequest {
     filename: String,
     total_size: i64,
     chunk_size: Option<i64>,
+    /// Source file modified time as Unix seconds. Omitted keeps server time.
+    mtime: Option<i64>,
+}
+
+pub(crate) fn validate_upload_mtime(value: Option<i64>) -> Result<Option<i64>, AppError> {
+    match value {
+        Some(value) if value < 0 => Err(AppError::bad_request(
+            "mtime must be a non-negative Unix timestamp",
+        )),
+        Some(0) | None => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
 }
 
 fn warn_upload(user_id: i64, filename: &str, action: &str, error: &AppError) {
@@ -1329,6 +1341,7 @@ pub async fn create_upload(
     let current = auth::current_user(&state, &headers).await?;
     let root = load_root(&state, current.user.id, request.root).await?;
     let path = request.path.unwrap_or_default();
+    let mtime = validate_upload_mtime(request.mtime)?;
     if root.is_remote() {
         let filename = validate_filename(&request.filename)?;
         let size = validate_upload_size(&state, request.total_size)?;
@@ -1350,6 +1363,7 @@ pub async fn create_upload(
             chunk_size,
             None,
             None,
+            mtime,
         )
         .await;
     }
@@ -1440,6 +1454,7 @@ pub async fn create_upload(
         if_match: None,
         if_none_match: None,
         token_id: None,
+        mtime,
     };
 
     if let Err(err) = state.db.insert_upload(&upload).await {
@@ -1661,10 +1676,11 @@ pub async fn complete_upload(
     }
 
     let finalize_target = target_path.clone();
-    let finalized =
-        tokio::task::spawn_blocking(move || fsops::finalize_upload(&temp, &finalize_target))
-            .await
-            .map_err(|err| AppError::internal(anyhow::anyhow!("finalize task failed: {err}")))?;
+    let finalized = tokio::task::spawn_blocking(move || {
+        fsops::finalize_upload(&temp, &finalize_target, upload.mtime)
+    })
+    .await
+    .map_err(|err| AppError::internal(anyhow::anyhow!("finalize task failed: {err}")))?;
     if let Err(error) = finalized {
         warn_upload(current.user.id, &upload.filename, "finalize", &error);
         return Err(error);

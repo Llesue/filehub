@@ -61,11 +61,21 @@ export interface RemoteTokenInfo {
   grant_ids: number[];
 }
 
+export interface RemoteMountAddress {
+  url: string;
+  state: RemoteMount['state'] | 'unknown';
+  last_ok_at: number | null;
+  last_error: string | null;
+  last_error_code?: string | null;
+  active: boolean;
+}
+
 export interface RemoteMount {
   id: number;
   root_id: number;
   alias: string;
   base_url: string;
+  addresses?: RemoteMountAddress[];
   grant_id: number;
   grant_label: string;
   mode: 'ro' | 'rw';
@@ -672,7 +682,7 @@ export const api = {
   },
 
   remoteCreateMount(
-    url: string,
+    urls: string[],
     token: string,
     grantId: number,
     alias: string,
@@ -682,7 +692,28 @@ export const api = {
       '/remote/mounts',
       {
         method: 'POST',
-        body: JSON.stringify({ url, token, grant_id: grantId, alias }),
+        body: JSON.stringify({
+          url: urls[0] ?? '',
+          urls,
+          token,
+          grant_id: grantId,
+          alias,
+        }),
+      },
+      csrf,
+    );
+  },
+
+  remoteUpdateMountAddresses(
+    id: number,
+    urls: string[],
+    csrf: string,
+  ): Promise<{ ok: boolean; active_url: string }> {
+    return request(
+      `/remote/mounts/${id}/addresses`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ urls }),
       },
       csrf,
     );
@@ -914,6 +945,7 @@ export const api = {
       filename: string;
       total_size: number;
       chunk_size?: number;
+      mtime?: number;
       ticket?: string;
     },
   ): Promise<{ upload_id: string; chunk_size: number; chunks: number; expires_at: number }> {
@@ -1686,6 +1718,7 @@ export const api = {
     filename: string,
     totalSize: number,
     csrf: string,
+    mtime?: number,
   ): Promise<UploadCreated> {
     return request<UploadCreated>(
       '/uploads',
@@ -1696,6 +1729,7 @@ export const api = {
           path,
           filename,
           total_size: totalSize,
+          ...(mtime && mtime > 0 ? { mtime } : {}),
         }),
       },
       csrf,

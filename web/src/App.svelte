@@ -81,6 +81,10 @@
   }
 
   let view = $state<'list' | 'thumb' | 'tile'>(storedView());
+  let compactMobile = $state(false);
+  let compactPreviousView: 'list' | 'thumb' | 'tile' | null = null;
+  let searchModalOpen = $state(false);
+  let searchModalInput = $state<HTMLInputElement | null>(null);
   let sortField = $state<'name' | 'size' | 'modified'>('name');
   let sortOrder = $state<'asc' | 'desc'>('asc');
   let sidebarOpen = $state(false);
@@ -547,7 +551,12 @@
     const lastSeen = mount.last_ok_at
       ? formatRelativeDate(mount.last_ok_at)
       : t($language, '从未连接');
-    return `${mount.alias} · ${mount.base_url} · ${mount.grant_label} · ${mode} · ${state} · ${t($language, '上次在线')} ${lastSeen}`;
+    const addresses = mount.addresses?.length
+      ? mount.addresses
+          .map((address) => `${address.active ? '✓ ' : ''}${address.url}`)
+          .join('\n')
+      : mount.base_url;
+    return `${mount.alias} · ${addresses} · ${mount.grant_label} · ${mode} · ${state} · ${t($language, '上次在线')} ${lastSeen}`;
   }
 
   function remoteStateLabel(state: RemoteMount['state']): string {
@@ -623,6 +632,27 @@
     }
 
     applyTheme(theme);
+    const compactQuery = window.matchMedia('(max-width: 640px)');
+    const applyCompact = (next: boolean) => {
+      if (next === compactMobile) return;
+      if (next) {
+        compactPreviousView = view;
+        compactMobile = true;
+        view = 'tile';
+      } else {
+        compactMobile = false;
+        view = compactPreviousView ?? storedView();
+        compactPreviousView = null;
+      }
+      updateVirtualRange();
+    };
+    compactMobile = compactQuery.matches;
+    if (compactMobile) {
+      compactPreviousView = view;
+      view = 'tile';
+    }
+    const onCompactChange = () => applyCompact(compactQuery.matches);
+    compactQuery.addEventListener('change', onCompactChange);
     if (!shareToken) {
       void bootstrap();
     } else {
@@ -798,6 +828,7 @@
       window.clearInterval(clockTimer);
       window.clearInterval(remoteStatusTimer);
       window.clearInterval(presencePruneTimer);
+      compactQuery.removeEventListener('change', onCompactChange);
       stopPresenceHeartbeat();
       unsubscribeEvents();
       if (usagePollTimer) clearTimeout(usagePollTimer);
@@ -806,6 +837,16 @@
       if (rootsRefreshTimer !== null) clearTimeout(rootsRefreshTimer);
     };
   });
+
+  $effect(() => {
+    if (!searchModalOpen) return;
+    requestAnimationFrame(() => searchModalInput?.focus());
+  });
+
+  function closeSearchModal(): void {
+    searchModalOpen = false;
+    searchModalInput?.blur();
+  }
 
   function setTheme(next: ThemePreference): void {
     const prefersDark =
@@ -1369,10 +1410,12 @@
     clearDrag();
     startFilesSlowHint();
     try {
-      const storedView = resolveViewPreference(
-        localStorage.getItem('filehub.view'),
-        localStorage.getItem(`view:${rootId}:${path}`),
-      );
+      const storedView = compactMobile
+        ? 'tile'
+        : resolveViewPreference(
+            localStorage.getItem('filehub.view'),
+            localStorage.getItem(`view:${rootId}:${path}`),
+          );
       if (storedView) view = storedView;
       const savedSort =
         localStorage.getItem(`sort:${rootId}:${path}`) ?? localStorage.getItem('filehub.sort');
@@ -3575,6 +3618,10 @@
   }
 
   function setView(next: 'list' | 'thumb' | 'tile'): void {
+    if (compactMobile) {
+      view = 'tile';
+      return;
+    }
     view = next;
     try {
       localStorage.setItem('filehub.view', next);
@@ -4046,32 +4093,46 @@
       </div>
 
       {#if appView === 'files'}
-        <form
-          class="search"
-          onsubmit={(event) => {
-            event.preventDefault();
-            submitSearch();
-          }}
-        >
-          <button type="submit" class="search-submit" aria-label={t($language, '搜索')}>
-            <Icon name="search" size={18} />
-          </button>
-          <input
-            bind:this={searchInput}
-            bind:value={searchQuery}
-            aria-label={t($language, '搜索文件或目录')}
-            placeholder={t($language, '搜索文件或目录')}
+        {#if compactMobile}
+          <button
+            type="button"
+            class="icon-button search-mobile"
+            aria-label={t($language, '搜索')}
+            title={t($language, '搜索')}
             disabled={!remoteCan('search')}
-            oninput={handleSearchInput}
-          />
-        </form>
+            onclick={() => (searchModalOpen = true)}
+          >
+            <Icon name="search" size={19} />
+          </button>
+        {:else}
+          <form
+            class="search"
+            onsubmit={(event) => {
+              event.preventDefault();
+              submitSearch();
+            }}
+          >
+            <button type="submit" class="search-submit" aria-label={t($language, '搜索')}>
+              <Icon name="search" size={18} />
+            </button>
+            <input
+              bind:this={searchInput}
+              bind:value={searchQuery}
+              aria-label={t($language, '搜索文件或目录')}
+              placeholder={t($language, '搜索文件或目录')}
+              disabled={!remoteCan('search')}
+              oninput={handleSearchInput}
+            />
+          </form>
+        {/if}
       {:else}
         <div class="page-context"></div>
       {/if}
 
       <div class="top-actions">
         {#if appView === 'files'}
-          <div class="segmented" role="group" aria-label={t($language, '视图')}>
+          {#if !compactMobile}
+            <div class="segmented" role="group" aria-label={t($language, '视图')}>
             <button
               type="button"
               class:active={view === 'list'}
@@ -4102,7 +4163,8 @@
             >
               <Icon name="tile" size={18} />
             </button>
-          </div>
+            </div>
+          {/if}
           {#if view !== 'list'}
             <div class="sort-control">
               <button
@@ -4114,11 +4176,15 @@
                   sortMenuOpen = !sortMenuOpen;
                 }}
               >
-                {sortField === 'name'
-                  ? t($language, '名称')
-                  : sortField === 'size'
-                    ? t($language, '大小')
-                    : t($language, '修改时间')}{sortOrder === 'asc' ? ' ↑' : ' ↓'}
+                {#if compactMobile}
+                  <Icon name="sort" size={18} />
+                {:else}
+                  {sortField === 'name'
+                    ? t($language, '名称')
+                    : sortField === 'size'
+                      ? t($language, '大小')
+                      : t($language, '修改时间')}{sortOrder === 'asc' ? ' ↑' : ' ↓'}
+                {/if}
               </button>
               {#if sortMenuOpen}
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -5199,7 +5265,7 @@
                               {#if !entry.is_dir && isAudioName(entry.name)}
                                 <button
                                   type="button"
-                                  class="row-action"
+                                  class="row-action action-play"
                                   aria-label={t($language, '播放')}
                                   title={t($language, '播放')}
                                   onclick={(event) => {
@@ -5212,7 +5278,7 @@
                               {/if}
                               <button
                                 type="button"
-                                class="row-action"
+                                class="row-action action-more"
                                 aria-label={t($language, '更多操作')}
                                 title={t($language, '更多操作')}
                                 onclick={(event) => openEntryMenu(event, entry)}
@@ -5221,7 +5287,7 @@
                               </button>
                               <button
                                 type="button"
-                                class="row-action"
+                                class="row-action action-delete"
                                 aria-label={t($language, '删除 {name}', { name: entry.name })}
                                 title={t($language, '删除')}
                                 disabled={!activeRoot || currentReadOnly}
@@ -5493,6 +5559,55 @@
   <UploadPanel />
   <ToastPanel />
 
+  {#if searchModalOpen}
+    <button
+      type="button"
+      class="search-backdrop"
+      aria-label={t($language, '关闭')}
+      onclick={closeSearchModal}
+    ></button>
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <form
+      class="search-dialog"
+      role="search"
+      onsubmit={(event) => {
+        event.preventDefault();
+        closeSearchModal();
+        submitSearch();
+      }}
+      onkeydown={(event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          closeSearchModal();
+        }
+      }}
+    >
+      <Icon name="search" size={19} />
+      <input
+        bind:this={searchModalInput}
+        bind:value={searchQuery}
+        aria-label={t($language, '搜索文件或目录')}
+        placeholder={t($language, '搜索文件或目录')}
+        type="search"
+        enterkeyhint="search"
+        disabled={!remoteCan('search')}
+        oninput={handleSearchInput}
+      />
+      <button type="submit" class="search-go" disabled={!searchQuery.trim()}
+        >{t($language, '搜索')}</button
+      >
+      <button
+        type="button"
+        class="icon-button"
+        aria-label={t($language, '关闭')}
+        onclick={closeSearchModal}
+      >
+        <Icon name="close" size={18} />
+      </button>
+    </form>
+  {/if}
+
   {#if accountOpen}
     <AccountDialog
       {user}
@@ -5717,6 +5832,7 @@
         >
         <div class="menu-sep"></div>
       {/if}
+      {#if !compactMobile}
       <div class="menu-item">
         <button type="button" role="menuitem">
           {t($language, '排序方式')} <span class="menu-arrow">›</span>
@@ -5782,6 +5898,7 @@
           >
         </div>
       </div>
+      {/if}
     </div>
   {/if}
 
@@ -7080,8 +7197,9 @@
   }
 
   .file-table .actions {
-    width: 44px;
+    width: 88px;
     text-align: right;
+    white-space: nowrap;
   }
 
   .row-action {
@@ -7697,6 +7815,23 @@
       width: 40px;
       height: 40px;
     }
+
+    .file-table .actions {
+      width: 40px;
+    }
+
+    .file-table .action-play,
+    .file-table .action-delete {
+      display: none;
+    }
+
+    .file-table .action-more {
+      opacity: 1;
+    }
+
+    .file-table .check {
+      width: 44px;
+    }
   }
 
   @media (max-width: 640px) {
@@ -7708,11 +7843,38 @@
       width: auto;
       max-height: 70dvh;
       border-radius: 16px;
+      overflow-y: auto;
     }
 
-    .context-menu button[role='menuitem'] {
+    .context-menu button[role='menuitem'],
+    .context-menu .submenu button {
       min-height: 44px;
       font-size: 15px;
+    }
+
+    .context-menu.has-submenu {
+      max-height: 70dvh;
+      overflow-y: auto;
+    }
+
+    .context-menu.has-submenu .submenu {
+      position: static;
+      display: none;
+      min-width: 0;
+      max-height: none;
+      overflow: visible;
+      margin: 2px 0 4px 10px;
+      padding: 4px 0 0;
+      border: 0;
+      border-left: 1px solid var(--border);
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .context-menu.has-submenu .menu-item:focus-within > .submenu,
+    .context-menu.has-submenu .menu-item:hover > .submenu {
+      display: flex;
     }
   }
 
@@ -8270,6 +8432,113 @@
     }
   }
 
+  @media (max-width: 640px) {
+    .topbar {
+      gap: 4px;
+      padding-left: 8px;
+      padding-right: 8px;
+    }
+
+    .mobile-menu,
+    .search-mobile,
+    .top-actions .icon-button {
+      width: 34px;
+      height: 34px;
+    }
+
+    .sort-trigger {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      place-items: center;
+    }
+
+    .upload-top {
+      width: 34px;
+      height: 34px;
+      padding: 0;
+    }
+
+    .top-avatar-button {
+      width: 30px;
+      height: 30px;
+      font-size: 12px;
+    }
+
+    .top-actions {
+      gap: 2px;
+    }
+  }
+
+  .search-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 75;
+    border: 0;
+    background: rgba(0, 0, 0, 0.35);
+  }
+
+  .search-dialog {
+    position: fixed;
+    z-index: 76;
+    top: calc(env(safe-area-inset-top, 0px) + 12px);
+    left: 12px;
+    right: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--surface);
+    box-shadow: var(--shadow-2);
+    color: var(--text-2);
+  }
+
+  .search-dialog input {
+    min-width: 0;
+    flex: 1;
+    height: 36px;
+    padding: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--text);
+    font-size: 16px;
+  }
+
+  .search-go {
+    height: 34px;
+    flex: 0 0 auto;
+    padding: 0 12px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: var(--accent);
+    color: var(--on-accent);
+    font-size: 13px;
+  }
+
+  .search-go:disabled {
+    opacity: 0.45;
+  }
+
+  @media (max-width: 380px) {
+    .selection-size,
+    .selection-kind {
+      display: none;
+    }
+
+    .pathbar-actions {
+      gap: 0;
+    }
+
+    .pathbar-actions .icon-button {
+      width: 32px;
+      height: 32px;
+    }
+  }
+
   @media (max-width: 520px) {
     .segmented {
       display: none;
@@ -8291,6 +8560,37 @@
 
     .top-actions {
       gap: 4px;
+    }
+  }
+  @media (max-width: 640px) {
+    .context-menu.has-submenu {
+      max-height: 70dvh;
+      overflow-y: auto;
+    }
+
+    .context-menu.has-submenu .submenu {
+      position: static;
+      display: none;
+      min-width: 0;
+      max-height: none;
+      overflow: visible;
+      margin: 2px 0 4px 10px;
+      padding: 4px 0 0;
+      border: 0;
+      border-left: 1px solid var(--border);
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .context-menu.has-submenu .menu-item:focus-within > .submenu,
+    .context-menu.has-submenu .menu-item:hover > .submenu {
+      display: flex;
+    }
+
+    .context-menu .submenu button {
+      min-height: 44px;
+      font-size: 15px;
     }
   }
 </style>

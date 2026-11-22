@@ -87,6 +87,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(crate::federation::mounts::reauth),
         )
         .route(
+            "/remote/mounts/{id}/addresses",
+            axum::routing::put(crate::federation::mounts::update_addresses),
+        )
+        .route(
             "/remote/mounts/{id}/grants",
             get(crate::federation::mounts::mount_grants),
         )

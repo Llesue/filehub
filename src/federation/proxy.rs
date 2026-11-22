@@ -423,6 +423,7 @@ pub async fn create_upload(
     chunk_size: i64,
     if_match: Option<&str>,
     if_none_match: Option<&str>,
+    mtime: Option<i64>,
 ) -> Result<Json<Value>, AppError> {
     let (client, mount) = client_for_root(state, user_id, root.id).await?;
     let value = client
@@ -434,6 +435,7 @@ pub async fn create_upload(
             chunk_size,
             if_match,
             if_none_match,
+            mtime,
         )
         .await
         .map_err(|error| error.into_app())?;
@@ -468,6 +470,7 @@ pub async fn create_upload(
         if_match: None,
         if_none_match: None,
         token_id: None,
+        mtime,
     };
     state
         .db

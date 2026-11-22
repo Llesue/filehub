@@ -39,18 +39,19 @@ async fn target_for(state: &Arc<AppState>, url: &str) -> Result<ssrf::ResolvedTa
     .map_err(|error| AppError::bad_request(error.message()))
 }
 
-async fn client_for_mount(
+async fn client_for_url(
     state: &Arc<AppState>,
     mount: &FederationMount,
+    url: &str,
 ) -> Result<PeerClient, AppError> {
     let key = crypto::mount_key(&state.db)
         .await
         .map_err(AppError::internal)?;
     let token =
         crypto::decrypt(&key, &mount.token_ciphertext).map_err(|_| AppError::TokenRevoked)?;
-    let target = target_for(state, &mount.base_url).await?;
+    let target = target_for(state, url).await?;
     PeerClient::new(
-        &mount.base_url,
+        url,
         &target.host,
         target.ip,
         target.port,
@@ -58,6 +59,13 @@ async fn client_for_mount(
         state.settings().settings.federation.request_timeout_seconds,
     )
     .map_err(AppError::internal)
+}
+
+async fn client_for_mount(
+    state: &Arc<AppState>,
+    mount: &FederationMount,
+) -> Result<PeerClient, AppError> {
+    client_for_url(state, mount, &mount.base_url).await
 }
 
 pub async fn client_for_root(
@@ -158,10 +166,108 @@ pub async fn preview(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateMountRequest {
-    url: String,
+    url: Option<String>,
+    urls: Option<Vec<String>>,
     token: String,
     grant_id: i64,
     alias: Option<String>,
+}
+
+fn requested_urls(url: Option<&str>, urls: Option<&[String]>) -> Result<Vec<String>, AppError> {
+    let raw: Vec<&str> = urls
+        .filter(|items| !items.is_empty())
+        .map(|items| items.iter().map(String::as_str).collect())
+        .or_else(|| url.map(|value| vec![value]))
+        .unwrap_or_default();
+    let mut result: Vec<String> = Vec::new();
+    for item in raw {
+        let normalized = ssrf::normalize_url(item);
+        if normalized.is_empty() || result.iter().any(|existing| existing == &normalized) {
+            continue;
+        }
+        result.push(normalized);
+    }
+    if result.is_empty() {
+        return Err(AppError::bad_request("at least one address is required"));
+    }
+    if result.len() > 5 {
+        return Err(AppError::bad_request("at most 5 addresses are supported"));
+    }
+    Ok(result)
+}
+
+fn endpoint_state(error_code: &str) -> &'static str {
+    match error_code {
+        "TOKEN_REVOKED" | "TOKEN_EXPIRED" | "UNAUTHORIZED" => "token_invalid",
+        "GRANT_REVOKED" => "grant_revoked",
+        "REMOTE_ROOT_UNSUPPORTED" => "unsupported",
+        _ => "offline",
+    }
+}
+
+async fn probe_endpoint(
+    state: &Arc<AppState>,
+    token: &str,
+    url: &str,
+) -> Result<(Value, Value), AppError> {
+    let check = async {
+        let target = target_for(state, url).await?;
+        let client = PeerClient::new(
+            url,
+            &target.host,
+            target.ip,
+            target.port,
+            Some(token),
+            state.settings().settings.federation.request_timeout_seconds,
+        )
+        .map_err(AppError::internal)?;
+        let info = client.info().await.map_err(|error| error.into_app())?;
+        let grants = client.grants().await.map_err(|error| error.into_app())?;
+        Ok::<_, AppError>((info, grants))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), check)
+        .await
+        .map_err(|_| AppError::bad_request("peer check timed out"))?
+}
+
+fn grant_for(grants: &Value, grant_id: i64) -> Option<&Value> {
+    grants
+        .get("grants")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_i64) == Some(grant_id))
+        })
+}
+
+async fn update_endpoint_states(
+    state: &Arc<AppState>,
+    mount_id: i64,
+    urls: &[String],
+    working: &std::collections::HashMap<String, (Value, Value)>,
+    errors: &std::collections::HashMap<String, (String, String)>,
+) {
+    for url in urls {
+        if working.contains_key(url) {
+            let _ = state
+                .db
+                .federation_update_endpoint_state(mount_id, url, "online", true, None, None)
+                .await;
+        } else if let Some((code, message)) = errors.get(url) {
+            let _ = state
+                .db
+                .federation_update_endpoint_state(
+                    mount_id,
+                    url,
+                    endpoint_state(code),
+                    false,
+                    Some(message),
+                    Some(code),
+                )
+                .await;
+        }
+    }
 }
 
 async fn ensure_mount_limit(state: &Arc<AppState>, user_id: i64) -> Result<(), AppError> {
@@ -181,41 +287,87 @@ async fn ensure_mount_limit(state: &Arc<AppState>, user_id: i64) -> Result<(), A
 async fn mount_inner(
     state: &Arc<AppState>,
     user: &User,
-    url: &str,
+    urls: &[String],
     token: &str,
     grant_id: i64,
     alias: Option<String>,
 ) -> Result<(i64, i64, String, String), AppError> {
-    let url = ssrf::normalize_url(url);
-    let target = target_for(state, &url).await?;
-    let client = PeerClient::new(
-        &url,
-        &target.host,
-        target.ip,
-        target.port,
-        Some(token),
-        state.settings().settings.federation.request_timeout_seconds,
-    )
-    .map_err(AppError::internal)?;
-    let info = client.info().await.map_err(|error| error.into_app())?;
     let own_instance = state
         .db
         .federation_instance_id()
         .await
         .map_err(AppError::internal)?;
-    if info.get("instance_id").and_then(Value::as_str) == Some(own_instance.as_str()) {
-        return Err(AppError::bad_request("cannot mount this instance"));
+    let mut working: std::collections::HashMap<String, (Value, Value)> =
+        std::collections::HashMap::new();
+    let mut errors: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut peer_instance_id: Option<String> = None;
+    for url in urls {
+        match probe_endpoint(state, token, url).await {
+            Ok((info, grants)) => {
+                let instance = info
+                    .get("instance_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if instance.is_empty() {
+                    errors.insert(
+                        url.clone(),
+                        (
+                            "OFFLINE".to_owned(),
+                            "peer did not return an instance id".to_owned(),
+                        ),
+                    );
+                    continue;
+                }
+                if instance == own_instance {
+                    return Err(AppError::bad_request("cannot mount this instance"));
+                }
+                if let Some(expected) = peer_instance_id.as_deref()
+                    && expected != instance
+                {
+                    return Err(AppError::bad_request(
+                        "all addresses must point to the same FileHub instance",
+                    ));
+                }
+                peer_instance_id = Some(instance);
+                if grant_for(&grants, grant_id).is_none() {
+                    errors.insert(
+                        url.clone(),
+                        (
+                            "GRANT_REVOKED".to_owned(),
+                            "grant is not available".to_owned(),
+                        ),
+                    );
+                    continue;
+                }
+                working.insert(url.clone(), (info, grants));
+            }
+            Err(error) => {
+                errors.insert(url.clone(), (error.code().to_owned(), error.to_string()));
+            }
+        }
     }
-    let grants = client.grants().await.map_err(|error| error.into_app())?;
-    let grant = grants
-        .get("grants")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.get("id").and_then(Value::as_i64) == Some(grant_id))
-        })
-        .ok_or(AppError::NotFound)?;
+    let Some(primary_url) = urls.iter().find(|url| working.contains_key(*url)).cloned() else {
+        let detail = errors
+            .values()
+            .next()
+            .map(|(_, message)| message.clone())
+            .unwrap_or_else(|| "no address is reachable".to_owned());
+        return Err(AppError::bad_request(format!(
+            "no remote address is reachable: {detail}"
+        )));
+    };
+    let Some(peer_instance_id) = peer_instance_id else {
+        return Err(AppError::bad_request(
+            "could not identify the remote instance",
+        ));
+    };
+    let (info, grants) = working
+        .get(&primary_url)
+        .cloned()
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("primary endpoint vanished")))?;
+    let grant = grant_for(&grants, grant_id).ok_or(AppError::NotFound)?;
     let label = grant
         .get("label")
         .and_then(Value::as_str)
@@ -239,6 +391,71 @@ async fn mount_inner(
         .await
         .map_err(AppError::internal)?;
     let ciphertext = crypto::encrypt(&key, token).map_err(AppError::internal)?;
+
+    // Adding the same instance/grant through another address should update the
+    // existing mount instead of creating a second root.
+    if let Some(existing) = state
+        .db
+        .federation_find_mount_by_peer(user.id, &peer_instance_id, grant_id)
+        .await
+        .map_err(AppError::internal)?
+    {
+        let mut merged: Vec<String> = state
+            .db
+            .federation_list_endpoints(existing.id)
+            .await
+            .map_err(AppError::internal)?
+            .into_iter()
+            .map(|endpoint| endpoint.url)
+            .collect();
+        for url in urls {
+            if !merged.contains(url) {
+                merged.push(url.clone());
+            }
+        }
+        state
+            .db
+            .federation_replace_endpoints(existing.id, &merged)
+            .await
+            .map_err(AppError::internal)?;
+        update_endpoint_states(state, existing.id, urls, &working, &errors).await;
+        let _ = state
+            .db
+            .federation_update_mount_token(existing.id, user.id, &ciphertext)
+            .await;
+        let active = if working.contains_key(&existing.base_url) {
+            existing.base_url.clone()
+        } else {
+            primary_url.clone()
+        };
+        let _ = state
+            .db
+            .federation_set_mount_active_url(existing.id, user.id, &active)
+            .await;
+        let _ = state
+            .db
+            .federation_update_mount_state(existing.id, true, None, None)
+            .await;
+        state.federation_clients.lock().remove(&existing.root_id);
+        state.events.publish(
+            "roots.changed",
+            Some(user.id),
+            json!({ "user_id": user.id }),
+        );
+        let root = state
+            .db
+            .find_root(existing.root_id, user.id)
+            .await
+            .map_err(AppError::internal)?;
+        return Ok((
+            existing.id,
+            existing.root_id,
+            root.map(|root| root.alias).unwrap_or(existing.grant_label),
+            existing.mode,
+        ));
+    }
+
+    ensure_mount_limit(state, user.id).await?;
     let alias = alias.unwrap_or_else(|| label.clone());
     let existing_roots = state
         .db
@@ -264,7 +481,7 @@ async fn mount_inner(
             .federation_create_mount(
                 user.id,
                 root_id,
-                &url,
+                &primary_url,
                 grant_id,
                 &label,
                 &mode,
@@ -276,6 +493,7 @@ async fn mount_inner(
                 &ciphertext,
                 &owner_name,
                 avatar_version,
+                &peer_instance_id,
             )
             .await
             .map_err(AppError::internal)?;
@@ -296,14 +514,14 @@ async fn mount_inner(
     };
     state
         .db
-        .federation_update_mount_capabilities(
-            mount_id,
-            user.id,
-            &serde_json::to_string(info.get("capabilities").unwrap_or(&json!([])))
-                .unwrap_or_else(|_| "[]".to_owned()),
-        )
+        .federation_replace_endpoints(mount_id, urls)
         .await
-        .ok();
+        .map_err(AppError::internal)?;
+    update_endpoint_states(state, mount_id, urls, &working, &errors).await;
+    let _ = state
+        .db
+        .federation_update_mount_state(mount_id, true, None, None)
+        .await;
     Ok((mount_id, root_id, alias, mode))
 }
 
@@ -315,11 +533,11 @@ pub async fn create(
     let current = auth::current_user(&state, &headers).await?;
     auth::require_csrf(&current, &headers)?;
     require_outbound(&state, &current.user)?;
-    ensure_mount_limit(&state, current.user.id).await?;
+    let urls = requested_urls(request.url.as_deref(), request.urls.as_deref())?;
     let (mount_id, root_id, alias, mode) = mount_inner(
         &state,
         &current.user,
-        &request.url,
+        &urls,
         &request.token,
         request.grant_id,
         request.alias,
@@ -409,10 +627,12 @@ pub async fn attach_grant(
         .federation_list_mounts(current.user.id)
         .await
         .map_err(AppError::internal)?;
-    if mounts
-        .iter()
-        .any(|m| m.base_url == source.base_url && m.grant_id == grant_id)
-    {
+    if mounts.iter().any(|m| {
+        m.grant_id == grant_id
+            && (m.base_url == source.base_url
+                || (!m.peer_instance_id.is_empty()
+                    && m.peer_instance_id == source.peer_instance_id))
+    }) {
         return Err(AppError::Conflict(
             "this grant is already mounted".to_owned(),
         ));
@@ -425,7 +645,7 @@ pub async fn attach_grant(
     let (mount_id, root_id, alias, mode) = mount_inner(
         &state,
         &current.user,
-        &source.base_url,
+        std::slice::from_ref(&source.base_url),
         &token,
         grant_id,
         None,
@@ -478,50 +698,189 @@ fn has_grant(value: &Value, grant_id: i64) -> bool {
         })
 }
 
-async fn health_check(state: &Arc<AppState>, mount: FederationMount) {
-    let client = match client_for_mount(state, &mount).await {
+fn is_auth_code(code: &str) -> bool {
+    matches!(
+        code,
+        "UNAUTHORIZED" | "TOKEN_REVOKED" | "TOKEN_EXPIRED" | "GRANT_REVOKED"
+    )
+}
+
+struct EndpointCheck {
+    url: String,
+    grants: Option<Value>,
+    code: String,
+    message: String,
+    latency_ms: i64,
+}
+
+async fn check_mount_endpoint(
+    state: &Arc<AppState>,
+    mount: &FederationMount,
+    url: &str,
+) -> EndpointCheck {
+    let started = Instant::now();
+    let client = match client_for_url(state, mount, url).await {
         Ok(client) => client,
         Err(error) => {
-            let _ = state
-                .db
-                .federation_update_mount_state(
-                    mount.id,
-                    false,
-                    Some(&error.to_string()),
-                    Some("OFFLINE"),
-                )
-                .await;
-            return;
+            return EndpointCheck {
+                url: url.to_owned(),
+                grants: None,
+                code: error.code().to_owned(),
+                message: error.to_string(),
+                latency_ms: started.elapsed().as_millis() as i64,
+            };
         }
     };
     match tokio::time::timeout(std::time::Duration::from_secs(10), client.grants()).await {
         Ok(Ok(value)) => {
-            if !has_grant(&value, mount.grant_id) {
-                tracing::info!(mount = mount.id, "remote grant is gone; unmounting");
-                let _ = remove_mount(state, mount.user_id, &mount, Some("GRANT_REVOKED")).await;
-                return;
+            if has_grant(&value, mount.grant_id) {
+                EndpointCheck {
+                    url: url.to_owned(),
+                    grants: Some(value),
+                    code: String::new(),
+                    message: String::new(),
+                    latency_ms: started.elapsed().as_millis() as i64,
+                }
+            } else {
+                EndpointCheck {
+                    url: url.to_owned(),
+                    grants: None,
+                    code: "GRANT_REVOKED".to_owned(),
+                    message: "grant is no longer available".to_owned(),
+                    latency_ms: started.elapsed().as_millis() as i64,
+                }
             }
+        }
+        Ok(Err(error)) => EndpointCheck {
+            url: url.to_owned(),
+            grants: None,
+            code: error.code,
+            message: error.message,
+            latency_ms: started.elapsed().as_millis() as i64,
+        },
+        Err(_) => EndpointCheck {
+            url: url.to_owned(),
+            grants: None,
+            code: "OFFLINE".to_owned(),
+            message: "peer check timed out".to_owned(),
+            latency_ms: started.elapsed().as_millis() as i64,
+        },
+    }
+}
+
+struct HealthOutcome {
+    online: bool,
+    removed: bool,
+    code: Option<String>,
+    message: Option<String>,
+    active_url: Option<String>,
+    latency_ms: i64,
+}
+
+async fn refresh_mount_health(
+    state: &Arc<AppState>,
+    mount: &FederationMount,
+) -> Result<HealthOutcome, AppError> {
+    let mut urls: Vec<String> = state
+        .db
+        .federation_list_endpoints(mount.id)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .map(|endpoint| endpoint.url)
+        .collect();
+    if urls.is_empty() {
+        urls.push(mount.base_url.clone());
+        state
+            .db
+            .federation_replace_endpoints(mount.id, &urls)
+            .await
+            .map_err(AppError::internal)?;
+    }
+
+    let checks = futures_util::future::join_all(
+        urls.iter()
+            .map(|url| check_mount_endpoint(state, mount, url)),
+    )
+    .await;
+
+    let mut working: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut failures: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for check in &checks {
+        if let Some(grants) = &check.grants {
+            working.insert(check.url.clone(), grants.clone());
+        } else {
+            failures.insert(
+                check.url.clone(),
+                (check.code.clone(), check.message.clone()),
+            );
+        }
+    }
+    let working_check = checks.iter().find(|check| check.grants.is_some());
+    if let Some(active) = working_check {
+        let mut active_url = mount.base_url.clone();
+        let mut active_changed = false;
+        let mut owner_changed = false;
+        for check in &checks {
+            if check.grants.is_some() {
+                state
+                    .db
+                    .federation_update_endpoint_state(
+                        mount.id, &check.url, "online", true, None, None,
+                    )
+                    .await
+                    .map_err(AppError::internal)?;
+            } else {
+                state
+                    .db
+                    .federation_update_endpoint_state(
+                        mount.id,
+                        &check.url,
+                        endpoint_state(&check.code),
+                        false,
+                        Some(&check.message),
+                        Some(&check.code),
+                    )
+                    .await
+                    .map_err(AppError::internal)?;
+            }
+        }
+        // Prefer the first healthy address in priority order. This also
+        // provides failback when the LAN address recovers.
+        if active.url != mount.base_url {
+            active_url = active.url.clone();
+            active_changed = true;
+            state
+                .db
+                .federation_set_mount_active_url(mount.id, mount.user_id, &active_url)
+                .await
+                .map_err(AppError::internal)?;
+            state.federation_clients.lock().remove(&mount.root_id);
+        }
+        if mount.peer_instance_id.is_empty()
+            && let Ok(client) = client_for_url(state, mount, &active.url).await
+            && let Ok(info) = client.info().await
+            && let Some(instance) = info.get("instance_id").and_then(Value::as_str)
+        {
             let _ = state
                 .db
-                .federation_update_mount_state(mount.id, true, None, None)
+                .federation_set_mount_peer_instance(mount.id, instance)
                 .await;
-            if let Some(grant) = value
-                .get("grants")
-                .and_then(Value::as_array)
-                .and_then(|items| {
-                    items
-                        .iter()
-                        .find(|item| item.get("id").and_then(Value::as_i64) == Some(mount.grant_id))
-                })
-            {
-                let name = grant
-                    .get("owner_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let version = grant
-                    .get("avatar_version")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
+        }
+        if let Some(grants) = &active.grants
+            && let Some(grant) = grant_for(grants, mount.grant_id)
+        {
+            let name = grant
+                .get("owner_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let version = grant
+                .get("avatar_version")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if name != mount.owner_name || version != mount.avatar_version {
+                owner_changed = true;
                 let _ = state
                     .db
                     .federation_update_mount_owner(mount.id, name, version)
@@ -529,37 +888,81 @@ async fn health_check(state: &Arc<AppState>, mount: FederationMount) {
                 prune_avatar_cache(state, mount.id, version);
             }
         }
-        Ok(Err(error)) => {
-            if is_auth_error(&error) {
-                tracing::info!(
-                    mount = mount.id,
-                    code = %error.code,
-                    "remote token is invalid; unmounting"
-                );
-                let _ = remove_mount(state, mount.user_id, &mount, Some(error.code.as_str())).await;
-            } else {
-                let _ = state
-                    .db
-                    .federation_update_mount_state(
-                        mount.id,
-                        false,
-                        Some(&error.message),
-                        Some(&error.code),
-                    )
-                    .await;
-            }
+        state
+            .db
+            .federation_update_mount_state(mount.id, true, None, None)
+            .await
+            .map_err(AppError::internal)?;
+        if active_changed || owner_changed {
+            state.events.publish(
+                "roots.changed",
+                Some(mount.user_id),
+                json!({ "user_id": mount.user_id }),
+            );
         }
-        Err(_) => {
-            let _ = state
-                .db
-                .federation_update_mount_state(
-                    mount.id,
-                    false,
-                    Some("peer check timed out"),
-                    Some("OFFLINE"),
-                )
-                .await;
-        }
+        return Ok(HealthOutcome {
+            online: true,
+            removed: false,
+            code: None,
+            message: None,
+            active_url: Some(active_url),
+            latency_ms: active.latency_ms,
+        });
+    }
+
+    for check in &checks {
+        state
+            .db
+            .federation_update_endpoint_state(
+                mount.id,
+                &check.url,
+                endpoint_state(&check.code),
+                false,
+                Some(&check.message),
+                Some(&check.code),
+            )
+            .await
+            .map_err(AppError::internal)?;
+    }
+    let all_auth = !checks.is_empty() && checks.iter().all(|check| is_auth_code(&check.code));
+    let first = checks.first();
+    let code = first.map(|check| check.code.clone());
+    let message = first.map(|check| check.message.clone());
+    if all_auth {
+        let reason = checks
+            .iter()
+            .find(|check| check.code == "GRANT_REVOKED")
+            .map(|check| check.code.clone())
+            .or_else(|| code.clone())
+            .unwrap_or_else(|| "GRANT_REVOKED".to_owned());
+        let _ = remove_mount(state, mount.user_id, mount, Some(&reason)).await;
+        return Ok(HealthOutcome {
+            online: false,
+            removed: true,
+            code: Some(reason),
+            message,
+            active_url: None,
+            latency_ms: first.map(|check| check.latency_ms).unwrap_or_default(),
+        });
+    }
+    state
+        .db
+        .federation_update_mount_state(mount.id, false, message.as_deref(), code.as_deref())
+        .await
+        .map_err(AppError::internal)?;
+    Ok(HealthOutcome {
+        online: false,
+        removed: false,
+        code,
+        message,
+        active_url: None,
+        latency_ms: first.map(|check| check.latency_ms).unwrap_or_default(),
+    })
+}
+
+async fn health_check(state: &Arc<AppState>, mount: FederationMount) {
+    if let Err(error) = refresh_mount_health(state, &mount).await {
+        tracing::warn!(mount = mount.id, %error, "federation health check failed");
     }
 }
 
@@ -672,11 +1075,30 @@ pub async fn list(
             None if mount.last_error.is_some() => "offline",
             None => "online",
         };
+        let endpoints = state
+            .db
+            .federation_list_endpoints(mount.id)
+            .await
+            .map_err(AppError::internal)?;
+        let addresses: Vec<Value> = endpoints
+            .iter()
+            .map(|endpoint| {
+                json!({
+                    "url": endpoint.url,
+                    "state": endpoint.state,
+                    "last_ok_at": endpoint.last_ok_at,
+                    "last_error": endpoint.last_error,
+                    "last_error_code": endpoint.last_error_code,
+                    "active": endpoint.url == mount.base_url,
+                })
+            })
+            .collect();
         items.push(json!({
             "id": mount.id,
             "root_id": mount.root_id,
             "alias": root.as_ref().map(|root| root.alias.clone()).unwrap_or_default(),
             "base_url": mount.base_url,
+            "addresses": addresses,
             "grant_id": mount.grant_id,
             "grant_label": mount.grant_label,
             "mode": mount.mode,
@@ -789,11 +1211,130 @@ pub(crate) async fn remove_mount(
     Ok(deleted)
 }
 
-fn is_auth_error(error: &crate::federation::client::PeerError) -> bool {
-    matches!(
-        error.code.as_str(),
-        "UNAUTHORIZED" | "TOKEN_REVOKED" | "TOKEN_EXPIRED" | "GRANT_REVOKED"
-    ) || error.status == 401
+#[derive(Debug, Deserialize)]
+pub struct UpdateAddressesRequest {
+    urls: Vec<String>,
+}
+
+pub async fn update_addresses(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<UpdateAddressesRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    require_outbound(&state, &current.user)?;
+    let mount = state
+        .db
+        .federation_mount(id, current.user.id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let urls = requested_urls(None, Some(&request.urls))?;
+    let key = crypto::mount_key(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let token =
+        crypto::decrypt(&key, &mount.token_ciphertext).map_err(|_| AppError::TokenRevoked)?;
+    let own_instance = state
+        .db
+        .federation_instance_id()
+        .await
+        .map_err(AppError::internal)?;
+    let mut working: std::collections::HashMap<String, (Value, Value)> =
+        std::collections::HashMap::new();
+    let mut errors: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut instance: Option<String> = if mount.peer_instance_id.is_empty() {
+        None
+    } else {
+        Some(mount.peer_instance_id.clone())
+    };
+    for url in &urls {
+        match probe_endpoint(&state, &token, url).await {
+            Ok((info, grants)) => {
+                let found = info
+                    .get("instance_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if found.is_empty() || found == own_instance {
+                    errors.insert(
+                        url.clone(),
+                        (
+                            "BAD_REQUEST".to_owned(),
+                            "address does not identify a remote FileHub instance".to_owned(),
+                        ),
+                    );
+                    continue;
+                }
+                if let Some(expected) = instance.as_deref()
+                    && expected != found
+                {
+                    return Err(AppError::bad_request(
+                        "all addresses must point to the same FileHub instance",
+                    ));
+                }
+                instance = Some(found);
+                if grant_for(&grants, mount.grant_id).is_none() {
+                    errors.insert(
+                        url.clone(),
+                        (
+                            "GRANT_REVOKED".to_owned(),
+                            "grant is not available".to_owned(),
+                        ),
+                    );
+                    continue;
+                }
+                working.insert(url.clone(), (info, grants));
+            }
+            Err(error) => {
+                errors.insert(url.clone(), (error.code().to_owned(), error.to_string()));
+            }
+        }
+    }
+    let Some(active) = urls.iter().find(|url| working.contains_key(*url)).cloned() else {
+        let detail = errors
+            .values()
+            .next()
+            .map(|(_, message)| message.clone())
+            .unwrap_or_else(|| "no address is reachable".to_owned());
+        return Err(AppError::bad_request(format!(
+            "no remote address is reachable: {detail}"
+        )));
+    };
+    if let Some(instance) = instance
+        && mount.peer_instance_id.is_empty()
+    {
+        let _ = state
+            .db
+            .federation_set_mount_peer_instance(mount.id, &instance)
+            .await;
+    }
+    state
+        .db
+        .federation_replace_endpoints(mount.id, &urls)
+        .await
+        .map_err(AppError::internal)?;
+    update_endpoint_states(&state, mount.id, &urls, &working, &errors).await;
+    state
+        .db
+        .federation_set_mount_active_url(mount.id, current.user.id, &active)
+        .await
+        .map_err(AppError::internal)?;
+    state
+        .db
+        .federation_update_mount_state(mount.id, true, None, None)
+        .await
+        .map_err(AppError::internal)?;
+    state.federation_clients.lock().remove(&mount.root_id);
+    state.events.publish(
+        "roots.changed",
+        Some(current.user.id),
+        json!({ "user_id": current.user.id }),
+    );
+    Ok(Json(json!({ "ok": true, "active_url": active })))
 }
 
 pub async fn avatar(
@@ -879,72 +1420,35 @@ pub async fn test(
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
-    let started = Instant::now();
-    let client = client_for_mount(&state, &mount).await?;
-    let info = match client.info().await {
-        Ok(info) => info,
-        Err(error) => {
-            state
-                .db
-                .federation_update_mount_state(id, false, Some(&error.message), Some(&error.code))
-                .await
-                .map_err(AppError::internal)?;
-            return Ok(Json(json!({
-                "ok": false,
-                "removed": false,
-                "latency_ms": started.elapsed().as_millis() as i64,
-                "code": error.code,
-                "message": error.message,
-            })));
-        }
-    };
-    let latency = started.elapsed().as_millis() as i64;
-    if let Err(error) = client.grants().await {
-        if is_auth_error(&error) {
-            remove_mount(&state, current.user.id, &mount, Some(error.code.as_str())).await?;
-            return Ok(Json(json!({
-                "ok": false,
-                "removed": true,
-                "latency_ms": latency,
-                "code": error.code,
-                "message": error.message,
-            })));
-        }
-        state
+    let outcome = refresh_mount_health(&state, &mount).await?;
+    let mut server_version = Value::Null;
+    if outcome.online
+        && let Some(active_url) = outcome.active_url.as_deref()
+        && let Ok(client) = client_for_url(&state, &mount, active_url).await
+        && let Ok(info) = client.info().await
+    {
+        server_version = info.get("server_version").cloned().unwrap_or(Value::Null);
+        let capabilities = info
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let _ = state
             .db
-            .federation_update_mount_state(id, false, Some(&error.message), Some(&error.code))
-            .await
-            .map_err(AppError::internal)?;
-        return Ok(Json(json!({
-            "ok": false,
-            "removed": false,
-            "latency_ms": latency,
-            "code": error.code,
-            "message": error.message,
-        })));
+            .federation_update_mount_capabilities(
+                id,
+                current.user.id,
+                &serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".to_owned()),
+            )
+            .await;
     }
-    state
-        .db
-        .federation_update_mount_state(id, true, None, None)
-        .await
-        .map_err(AppError::internal)?;
-    let capabilities = info
-        .get("capabilities")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let _ = state
-        .db
-        .federation_update_mount_capabilities(
-            id,
-            current.user.id,
-            &serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".to_owned()),
-        )
-        .await;
     Ok(Json(json!({
-        "ok": true,
-        "removed": false,
-        "latency_ms": latency,
-        "server_version": info.get("server_version").cloned().unwrap_or(Value::Null),
+        "ok": outcome.online,
+        "removed": outcome.removed,
+        "latency_ms": outcome.latency_ms,
+        "code": outcome.code,
+        "message": outcome.message,
+        "active_url": outcome.active_url,
+        "server_version": server_version,
     })))
 }
 
@@ -967,17 +1471,52 @@ pub async fn reauth(
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)?;
-    let target = target_for(&state, &mount.base_url).await?;
-    let client = PeerClient::new(
-        &mount.base_url,
-        &target.host,
-        target.ip,
-        target.port,
-        Some(&request.token),
-        state.settings().settings.federation.request_timeout_seconds,
-    )
-    .map_err(AppError::internal)?;
-    client.grants().await.map_err(|error| error.into_app())?;
+    let mut urls: Vec<String> = state
+        .db
+        .federation_list_endpoints(mount.id)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .map(|endpoint| endpoint.url)
+        .collect();
+    if urls.is_empty() {
+        urls.push(mount.base_url.clone());
+    }
+    let mut last_error: Option<AppError> = None;
+    let mut verified = false;
+    for url in urls {
+        let target = match target_for(&state, &url).await {
+            Ok(target) => target,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let client = match PeerClient::new(
+            &url,
+            &target.host,
+            target.ip,
+            target.port,
+            Some(&request.token),
+            state.settings().settings.federation.request_timeout_seconds,
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                last_error = Some(AppError::internal(error));
+                continue;
+            }
+        };
+        match client.grants().await {
+            Ok(_) => {
+                verified = true;
+                break;
+            }
+            Err(error) => last_error = Some(error.into_app()),
+        }
+    }
+    if !verified {
+        return Err(last_error.unwrap_or(AppError::TokenRevoked));
+    }
     let key = crypto::mount_key(&state.db)
         .await
         .map_err(AppError::internal)?;
