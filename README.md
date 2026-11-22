@@ -8,6 +8,10 @@ The web UI is a Svelte 5 SPA embedded into the Rust binary. Data lives in SQLite
 
 ![FileHub main interface](docs/assets/filehub-main-v2.png)
 
+## Android app
+
+A native Android client is available in a separate repository: [download the latest APK](https://github.com/Llesue/filehub-android/releases/latest).
+
 ## Why FileHub
 
 Many years ago, on a WD My Cloud, I used FileBrowser for the first time and was amazed by its clean, elegant interface and how quickly it responded on low-powered hardware. Later, I needed multi-user authentication and the ability to manage arbitrary directories on my NAS, and FileBrowser gradually fell short of those needs. Then I was surprised to learn that FileBrowser had announced it was no longer being maintained—and the idea was born: build my own FileBrowser with the help of OpenCode and DeepSeek.
