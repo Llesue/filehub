@@ -13,7 +13,7 @@
 #   ./scripts/build-remote.sh windows   # Windows MSVC
 #
 # Environment overrides:
-#   FILEHUB_BUILD_HOST  SSH alias/host (default: parasite6)
+#   FILEHUB_BUILD_HOST  SSH alias/host (default: .build-host, gitignored)
 #   FILEHUB_BUILD_DIR   remote workspace (default: /root/build/filehub)
 #   FILEHUB_BUILD_JOBS  cargo jobs (default: 6)
 #
@@ -22,10 +22,17 @@
 set -euo pipefail
 
 MODE="${1:-linux}"
-HOST="${FILEHUB_BUILD_HOST:-parasite6}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HOST="${FILEHUB_BUILD_HOST:-}"
+if [[ -z "$HOST" && -f "$ROOT/.build-host" ]]; then
+  HOST="$(tr -d '[:space:]' < "$ROOT/.build-host")"
+fi
+if [[ -z "$HOST" ]]; then
+  echo "set FILEHUB_BUILD_HOST or create .build-host with the SSH alias" >&2
+  exit 2
+fi
 REMOTE_DIR="${FILEHUB_BUILD_DIR:-/root/build/filehub}"
 DEFAULT_JOBS="${FILEHUB_BUILD_JOBS:-}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SSH_CMD="ssh -o BatchMode=yes"
 
 case "$MODE" in

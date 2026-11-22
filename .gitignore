@@ -58,3 +58,4 @@ desktop.ini
 /playwright-report/
 /test-results/
 *.profraw
+.build-host
