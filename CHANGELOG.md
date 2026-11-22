@@ -21,6 +21,7 @@
 - The mobile selection toolbar fits 320px screens.
 - Narrow phone top bars no longer overflow, and the tile view fits 320px screens.
 - Small-screen context menus no longer show sort or view-switch entries; sort remains available from the compact top bar.
+- Restored the tile-view icon after it was accidentally replaced by the thumbnail icon when adding the sort icon.
 - Remote mount dialogs use the dynamic viewport height and respect the bottom safe area.
 
 ## v0.2.0 - 2026-11-21
