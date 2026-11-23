@@ -134,6 +134,8 @@ export interface Root {
   kind?: 'local' | 'remote';
   mount_id?: number | null;
   shared?: boolean;
+  /** Remote roots only: result of the server's last liveness probe. */
+  online?: boolean;
 }
 
 export interface VersionInfo {

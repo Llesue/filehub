@@ -474,10 +474,10 @@
   const localRoots = $derived(roots.filter((root) => root.kind !== 'remote'));
   const remoteRoots = $derived(roots.filter((root) => root.kind === 'remote'));
   const onlineRemoteRoots = $derived(
-    remoteRoots.filter((root) => !remoteStateBadge(root.id)),
+    remoteRoots.filter((root) => !remoteStateBadge(root)),
   );
   const offlineRemoteRoots = $derived(
-    remoteRoots.filter((root) => !!remoteStateBadge(root.id)),
+    remoteRoots.filter((root) => !!remoteStateBadge(root)),
   );
   let offlineOpen = $state(false);
   let remoteCaps = $state<Record<number, string[]>>({});
@@ -504,14 +504,17 @@
     return `hsl(${hash} 45% 52%)`;
   }
 
-  function remoteStateBadge(rootId: number): string | null {
-    const mount = remoteMounts[rootId];
-    if (!mount || mount.state === 'online') return null;
-    return remoteStateLabel(mount.state);
+  function remoteStateBadge(root: Root): string | null {
+    const mount = remoteMounts[root.id];
+    // A specific mount failure (token, grant, unsupported) is more useful than
+    // the generic probe result, so keep it when present.
+    if (mount && mount.state !== 'online') return remoteStateLabel(mount.state);
+    if (root.online === false) return t($language, '离线');
+    return null;
   }
 
   function openRemoteRoot(root: Root): void {
-    const badge = remoteStateBadge(root.id);
+    const badge = remoteStateBadge(root);
     if (badge) {
       showToast(t($language, '远程目录不可用，请在挂载设置中重新连接'));
       mountDialogOpen = true;
@@ -1352,6 +1355,16 @@
     }
   }
 
+  /// Refresh only the sidebar root statuses. Used after a remote failure so
+  /// the badge updates without re-triggering the request that just failed.
+  async function refreshRootStatus(): Promise<void> {
+    try {
+      roots = (await api.roots()).roots;
+    } catch (error) {
+      console.debug('root status refresh failed', error);
+    }
+  }
+
   function cancelThumbScope(
     rootId: number,
     path: string,
@@ -1919,6 +1932,15 @@
         t($language, '远程目录的令牌或授权已失效，请在挂载设置中重新连接。'),
       );
       void refreshRemoteCaps();
+      return;
+    }
+    if (error instanceof ApiError && error.code === 'REMOTE_OFFLINE') {
+      showNotice(
+        t($language, '对端服务器没有响应，请检查网络或对端是否在线。'),
+        'error',
+        t($language, '远程服务器不可达'),
+      );
+      void refreshRootStatus();
       return;
     }
     if (error instanceof ApiError && error.status === 401) {
@@ -4332,12 +4354,12 @@
                   <Icon name="link" size={18} />
                 {/if}
                 <span class="nav-label">{rootLabel(root.alias)}</span>
-                {#if remoteStateBadge(root.id)}
+                {#if remoteStateBadge(root)}
                   <span
                     class="nav-state"
                     role="img"
-                    aria-label={remoteStateBadge(root.id)}
-                    title={remoteStateBadge(root.id)}
+                    aria-label={remoteStateBadge(root)}
+                    title={remoteStateBadge(root)}
                   ></span>
                 {/if}
                 {#if root.read_only}
@@ -4392,8 +4414,8 @@
                   <span
                     class="nav-state"
                     role="img"
-                    aria-label={remoteStateBadge(root.id)}
-                    title={remoteStateBadge(root.id)}
+                    aria-label={remoteStateBadge(root)}
+                    title={remoteStateBadge(root)}
                   ></span>
                 </button>
               {/each}
