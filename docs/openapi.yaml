@@ -596,6 +596,7 @@ paths:
                     type: boolean
                     description: 为 true 表示按该编码解码时出现替换字符；内容仍可编辑。
         '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
   /api/v1/file:
     get:
       tags: [files]
