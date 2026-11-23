@@ -4475,7 +4475,7 @@
             </div>
           </div>
           {#each usage?.disks ?? [] as disk (disk.name)}
-            <div class="quota-row">
+            <div class="quota-row disk-row">
               <div class="quota-label">
                 <span class="disk-name" title={disk.name}>{disk.name}</span>
                 <span class="quota-value">{formatSize(disk.used)} / {formatSize(disk.total)}</span>
@@ -6599,7 +6599,7 @@
     font-weight: 700;
   }
 
-  .quota-row:last-child .quota-value {
+  .quota-row.disk-row .quota-value {
     color: var(--text);
   }
 
