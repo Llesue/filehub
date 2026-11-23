@@ -44,10 +44,28 @@ pub async fn roots(
         .filter(|grant| !grant.revoked)
         .map(|grant| std::path::PathBuf::from(&grant.real_path))
         .collect();
+    // Probe remote roots concurrently with a short, bounded timeout. Local
+    // roots are always online from this server's point of view.
+    let remote_roots: Vec<(usize, i64)> = roots
+        .iter()
+        .enumerate()
+        .filter(|(_, root)| root.is_remote())
+        .map(|(index, root)| (index, root.id))
+        .collect();
+    let probes = futures_util::future::join_all(remote_roots.iter().map(|(_, root_id)| {
+        crate::federation::mounts::remote_root_online(&state, current.user.id, *root_id)
+    }))
+    .await;
+    let mut online = vec![true; roots.len()];
+    for ((index, _), result) in remote_roots.iter().zip(probes) {
+        online[*index] = result;
+    }
     let values: Vec<Value> = roots
         .iter()
-        .map(|root| {
+        .enumerate()
+        .map(|(index, root)| {
             let mut value = root_json(root);
+            value["online"] = json!(online[index]);
             if !root.is_remote()
                 && shared
                     .iter()

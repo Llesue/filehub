@@ -36,7 +36,15 @@ async fn target_for(state: &Arc<AppState>, url: &str) -> Result<ssrf::ResolvedTa
         settings.settings.federation.allow_plaintext_lan,
     )
     .await
-    .map_err(|error| AppError::bad_request(error.message()))
+    .map_err(|error| {
+        // A DNS failure is a transport-level outage, not a bad request from
+        // the caller's point of view. Other SSRF rejections stay 400.
+        if error == ssrf::SsrfError::ResolveFailed {
+            AppError::RemoteOffline
+        } else {
+            AppError::bad_request(error.message())
+        }
+    })
 }
 
 async fn client_for_url(
@@ -88,6 +96,24 @@ pub async fn client_for_root(
         .lock()
         .insert(root_id, Arc::clone(&client));
     Ok((client, mount))
+}
+
+/// Cheap authenticated liveness probe used by `GET /api/v1/roots`.
+///
+/// The whole operation, including SSRF resolution and client construction, is
+/// bounded so a slow or dead peer can never make the roots endpoint hang. Any
+/// failure (transport, auth, revoked grant) reports the root as offline.
+pub async fn remote_root_online(state: &Arc<AppState>, user_id: i64, root_id: i64) -> bool {
+    let probe = async {
+        let (client, mount) = client_for_root(state, user_id, root_id).await.ok()?;
+        let grants = client.grants().await.ok()?;
+        Some(has_grant(&grants, mount.grant_id))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), probe)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize)]

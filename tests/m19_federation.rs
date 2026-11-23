@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
@@ -8,6 +10,7 @@ struct Instance {
     _dir: tempfile::TempDir,
     base: String,
     router: Router,
+    state: Arc<filehub::state::AppState>,
     cookie: String,
     csrf: String,
     root_id: i64,
@@ -86,6 +89,7 @@ async fn start() -> Instance {
         _dir: dir,
         base: format!("http://{addr}"),
         router,
+        state,
         cookie,
         csrf,
         root_id,
@@ -272,6 +276,80 @@ async fn peer_json(response: reqwest::Response) -> Value {
 }
 
 #[tokio::test]
+async fn roots_mark_unreachable_remote_offline_and_list_returns_503() {
+    let app = start().await;
+    let root_id = app
+        .state
+        .db
+        .federation_add_remote_root(1, "Offline", "/__filehub_remote__/offline", true)
+        .await
+        .unwrap();
+    let key = filehub::federation::crypto::mount_key(&app.state.db)
+        .await
+        .unwrap();
+    let ciphertext = filehub::federation::crypto::encrypt(&key, "offline-token").unwrap();
+    let mount_id = app
+        .state
+        .db
+        .federation_create_mount(
+            1,
+            root_id,
+            "http://127.0.0.1:1",
+            1,
+            "Offline",
+            "ro",
+            "",
+            "[]",
+            &ciphertext,
+            "",
+            0,
+            "fake-peer",
+        )
+        .await
+        .unwrap();
+    app.state
+        .db
+        .federation_bind_root(root_id, mount_id)
+        .await
+        .unwrap();
+
+    let roots = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(roots.status(), StatusCode::OK);
+    let roots = json_body(roots).await;
+    let roots = roots["roots"].as_array().unwrap();
+    assert!(
+        roots
+            .iter()
+            .any(|root| root["id"] == app.root_id && root["online"] == true)
+    );
+    assert!(
+        roots
+            .iter()
+            .any(|root| root["id"] == root_id && root["online"] == false),
+        "unreachable remote root should be offline: {roots:?}"
+    );
+
+    let list = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/list?root={root_id}&path="),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(list.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let list = json_body(list).await;
+    assert_eq!(list["error"]["code"], "REMOTE_OFFLINE");
+}
+
+#[tokio::test]
 async fn federation_contract_round_trip() {
     let peer_instance = start().await;
     let mount_instance = start().await;
@@ -320,6 +398,28 @@ async fn federation_contract_round_trip() {
     assert_eq!(mount.status(), StatusCode::OK, "mount failed");
     let mount = json_body(mount).await;
     let remote_root = mount["root_id"].as_i64().unwrap();
+    let roots = send(
+        &mount_instance.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(roots.status(), StatusCode::OK);
+    let roots = json_body(roots).await;
+    let roots = roots["roots"].as_array().unwrap();
+    assert!(
+        roots
+            .iter()
+            .any(|root| root["id"] == mount_instance.root_id && root["online"] == true)
+    );
+    assert!(
+        roots
+            .iter()
+            .any(|root| root["id"] == remote_root && root["online"] == true),
+        "remote root should be online: {roots:?}"
+    );
     let listed = send(
         &mount_instance.router,
         Method::GET,

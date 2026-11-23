@@ -15,11 +15,26 @@ pub struct PeerError {
 }
 
 impl PeerError {
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self {
+            status: 0,
+            code: "PEER_UNREACHABLE".to_owned(),
+            message: message.into(),
+        }
+    }
+
     pub fn into_app(self) -> AppError {
         match self.code.as_str() {
             "TOKEN_REVOKED" | "TOKEN_EXPIRED" => AppError::RemoteTokenInvalid,
             "GRANT_REVOKED" => AppError::RemoteGrantRevoked,
+            "REMOTE_ROOT_UNSUPPORTED" => AppError::RemoteUnsupported,
             _ => match self.status {
+                // Every request that never produced an HTTP response is
+                // mapped to status 0 by the client below: connect/DNS
+                // failures, timeouts, broken connections and reqwest/hyper
+                // transport errors. Those describe an unreachable peer, not
+                // an internal FileHub failure.
+                0 => AppError::RemoteOffline,
                 401 => AppError::RemoteTokenInvalid,
                 403 => AppError::Forbidden,
                 404 => AppError::NotFound,
@@ -72,14 +87,19 @@ impl PeerClient {
     }
 
     async fn json(&self, request: RequestBuilder) -> Result<Value, PeerError> {
-        let response = request.send().await.map_err(|error| PeerError {
-            status: 0,
-            code: "PEER_UNREACHABLE".to_owned(),
-            message: error.to_string(),
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| PeerError::transport(error.to_string()))?;
         let status = response.status();
         let bytes = response.bytes().await.map_err(|error| PeerError {
-            status: status.as_u16(),
+            // A body read failure after a successful status means the
+            // connection broke mid-response: treat it as transport-level.
+            status: if status.is_success() {
+                0
+            } else {
+                status.as_u16()
+            },
             code: "PEER_ERROR".to_owned(),
             message: error.to_string(),
         })?;
@@ -533,5 +553,44 @@ mod tests {
             message: "no".to_owned(),
         };
         assert!(matches!(grant.into_app(), AppError::RemoteGrantRevoked));
+    }
+
+    #[test]
+    fn transport_failures_are_remote_offline() {
+        let refused = PeerError::transport("connection refused");
+        assert!(matches!(refused.into_app(), AppError::RemoteOffline));
+        let timeout = PeerError {
+            status: 0,
+            code: "PEER_ERROR".to_owned(),
+            message: "operation timed out".to_owned(),
+        };
+        assert!(matches!(timeout.into_app(), AppError::RemoteOffline));
+    }
+
+    #[test]
+    fn peer_http_errors_are_not_offline() {
+        let not_found = PeerError {
+            status: 404,
+            code: "NOT_FOUND".to_owned(),
+            message: "missing".to_owned(),
+        };
+        assert!(matches!(not_found.into_app(), AppError::NotFound));
+        // A peer may use its own "unreachable" code in a real HTTP error
+        // response; the HTTP status must win, not the code.
+        let misleading = PeerError {
+            status: 404,
+            code: "PEER_UNREACHABLE".to_owned(),
+            message: "missing".to_owned(),
+        };
+        assert!(matches!(misleading.into_app(), AppError::NotFound));
+        let unsupported = PeerError {
+            status: 403,
+            code: "REMOTE_ROOT_UNSUPPORTED".to_owned(),
+            message: "nested".to_owned(),
+        };
+        assert!(matches!(
+            unsupported.into_app(),
+            AppError::RemoteUnsupported
+        ));
     }
 }

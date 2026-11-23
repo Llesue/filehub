@@ -35,6 +35,8 @@ pub enum AppError {
     RemoteTokenInvalid,
     #[error("remote grant has been revoked")]
     RemoteGrantRevoked,
+    #[error("remote server is unreachable")]
+    RemoteOffline,
     #[error("setup required")]
     SetupRequired,
     #[error("too many requests")]
@@ -111,6 +113,7 @@ impl AppError {
             Self::RemoteUnsupported => "REMOTE_ROOT_UNSUPPORTED",
             Self::RemoteTokenInvalid => "REMOTE_TOKEN_INVALID",
             Self::RemoteGrantRevoked => "REMOTE_GRANT_REVOKED",
+            Self::RemoteOffline => "REMOTE_OFFLINE",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
     }
@@ -228,6 +231,11 @@ impl IntoResponse for AppError {
                 StatusCode::FAILED_DEPENDENCY,
                 "REMOTE_GRANT_REVOKED",
                 "The remote grant has been revoked".to_owned(),
+            ),
+            Self::RemoteOffline => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "REMOTE_OFFLINE",
+                "Remote server is unreachable".to_owned(),
             ),
             Self::Internal(err) => {
                 tracing::error!(error = %err, "internal server error");
