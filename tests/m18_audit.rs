@@ -447,3 +447,41 @@ async fn cookie_secure_is_rejected_without_https() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn explicit_iso_8859_1_keeps_the_requested_label() {
+    let app = setup_app().await;
+    std::fs::write(app.home.join("latin1.txt"), b"caf\xe9 na\xefve").unwrap();
+
+    let read = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/api/v1/file?root={}&path=latin1.txt&encoding=iso-8859-1",
+            app.root_id
+        ),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let body = json_body(read).await;
+    assert_eq!(body["encoding"], "iso-8859-1");
+    assert_eq!(body["content"], "café naïve");
+    assert_eq!(body["bom"], false);
+
+    // An explicit Windows-1252 request must keep its own label.
+    let windows = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/api/v1/file?root={}&path=latin1.txt&encoding=windows-1252",
+            app.root_id
+        ),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(windows.status(), StatusCode::OK);
+    assert_eq!(json_body(windows).await["encoding"], "windows-1252");
+}

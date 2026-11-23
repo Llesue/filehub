@@ -11,6 +11,7 @@
 ### Fixed
 
 - An unreachable remote now returns `503 REMOTE_OFFLINE` instead of `500 INTERNAL_ERROR`. An HTTP 4xx from the peer keeps its original status and is never reported as offline.
+- An explicit `encoding=iso-8859-1` request keeps its label instead of echoing `windows-1252`.
 
 ## v0.2.2 - 2026-11-22
 

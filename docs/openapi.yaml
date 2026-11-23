@@ -605,6 +605,13 @@ paths:
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, required: true, schema: { type: string } }
+        - name: encoding
+          in: query
+          required: false
+          description: 显式指定编码；省略时自动检测。响应里的 `encoding` 回显请求的编码（`iso-8859-1` 不会被替换成 `windows-1252`）。
+          schema:
+            type: string
+            enum: [utf-8, utf-16le, utf-16be, gbk, gb18030, big5, shift_jis, euc-kr, windows-1250, windows-1251, windows-1252, iso-8859-1, iso-8859-15]
       responses:
         '200':
           description: OK

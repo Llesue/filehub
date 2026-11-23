@@ -166,6 +166,17 @@ fn iso_8859_1_representable(content: &str) -> bool {
     content.chars().all(|value| u32::from(value) <= 0xFF)
 }
 
+/// Decode with an explicitly requested label. `encoding_rs` resolves
+/// ISO-8859-1 to Windows-1252, so keep the caller's precise label for the
+/// response while still decoding with the superset codec.
+fn decode_requested<'a>(bytes: &'a [u8], label: &str) -> Result<DecodedText<'a>, AppError> {
+    let encoding = parse_encoding(label)
+        .ok_or_else(|| AppError::bad_request("unknown or unsupported encoding"))?;
+    let mut decoded = decode_with(bytes, encoding);
+    decoded.iso_8859_1 = is_iso_8859_1_label(label);
+    Ok(decoded)
+}
+
 fn decode_with<'a>(bytes: &'a [u8], encoding: &'static Encoding) -> DecodedText<'a> {
     let (start, bom) = match bom_for(encoding) {
         Some(mark) if bytes.starts_with(mark) => (mark.len(), true),
@@ -647,9 +658,7 @@ pub async fn read(
             .await
             .map_err(|error| error.into_app())?;
         let decoded = if let Some(label) = query.encoding.as_deref() {
-            let encoding = parse_encoding(label)
-                .ok_or_else(|| AppError::bad_request("unknown or unsupported encoding"))?;
-            decode_with(&bytes, encoding)
+            decode_requested(&bytes, label)?
         } else {
             decode_text(&bytes)
                 .ok_or_else(|| AppError::UnsupportedMedia("file is not text".to_owned()))?
@@ -687,9 +696,7 @@ pub async fn read(
         .await
         .map_err(fsops::io_error)?;
     let decoded = if let Some(label) = query.encoding.as_deref() {
-        let encoding = parse_encoding(label)
-            .ok_or_else(|| AppError::bad_request("unknown or unsupported encoding"))?;
-        decode_with(&bytes, encoding)
+        decode_requested(&bytes, label)?
     } else {
         decode_text(&bytes)
             .ok_or_else(|| AppError::UnsupportedMedia("file is not text".to_owned()))?
