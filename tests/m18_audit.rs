@@ -249,6 +249,23 @@ async fn gbk_file_round_trips_through_the_editor() {
     let (encoded, _, _) = encoding_rs::GBK.encode("中文");
     std::fs::write(app.home.join("legacy.txt"), encoded.as_ref()).unwrap();
 
+    let probe = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/file/probe?root={}&path=legacy.txt", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(probe.status(), StatusCode::OK);
+    let probe = json_body(probe).await;
+    assert_eq!(probe["is_text"], true);
+    assert_eq!(probe["reason"], "text");
+    assert_eq!(probe["encoding"], "gbk");
+    assert_eq!(probe["bom"], false);
+    assert_eq!(probe["lossy"], false);
+    assert_eq!(probe["size"], 4);
+
     let read = send(
         &app.router,
         Method::GET,
@@ -284,6 +301,99 @@ async fn gbk_file_round_trips_through_the_editor() {
 }
 
 #[tokio::test]
+async fn utf16_bom_file_round_trips_through_the_editor() {
+    let app = setup_app().await;
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(
+        "hello 中文\r\nsecond"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes()),
+    );
+    std::fs::write(app.home.join("utf16.txt"), &bytes).unwrap();
+
+    let read = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/file?root={}&path=utf16.txt", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let body = json_body(read).await;
+    assert_eq!(body["encoding"], "utf-16le");
+    assert_eq!(body["bom"], true);
+    let etag = body["etag"].as_str().unwrap().to_owned();
+
+    let saved = send_json_if_match(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/file?root={}&path=utf16.txt", app.root_id),
+        &app.cookie,
+        &app.csrf,
+        &etag,
+        json!({"content":"hello 中文改\r\nsecond", "encoding":"utf-16le", "bom": true}),
+    )
+    .await;
+    assert_eq!(
+        saved.status(),
+        StatusCode::OK,
+        "{:?}",
+        json_body(saved).await
+    );
+
+    let bytes = std::fs::read(app.home.join("utf16.txt")).unwrap();
+    assert!(bytes.starts_with(&[0xFF, 0xFE]));
+    let (decoded, errors) = encoding_rs::UTF_16LE.decode_without_bom_handling(&bytes[2..]);
+    assert!(!errors);
+    assert_eq!(&*decoded, "hello 中文改\r\nsecond");
+}
+
+#[tokio::test]
+async fn lossy_utf16_file_is_probed_and_read() {
+    let app = setup_app().await;
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend("hello ".encode_utf16().flat_map(|unit| unit.to_le_bytes()));
+    bytes.extend([0x00, 0xD8]);
+    std::fs::write(app.home.join("lossy.txt"), &bytes).unwrap();
+
+    let probe = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/file/probe?root={}&path=lossy.txt", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(probe.status(), StatusCode::OK);
+    let probe = json_body(probe).await;
+    assert_eq!(probe["is_text"], true);
+    assert_eq!(probe["reason"], "lossy");
+    assert_eq!(probe["encoding"], "utf-16le");
+    assert_eq!(probe["bom"], true);
+    assert_eq!(probe["lossy"], true);
+
+    let read = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/file?root={}&path=lossy.txt", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = json_body(read).await;
+    assert_eq!(read["encoding"], "utf-16le");
+    assert_eq!(read["bom"], true);
+    assert_eq!(read["lossy"], true);
+    assert!(
+        read["content"]
+            .as_str()
+            .is_some_and(|content| content.contains('\u{FFFD}'))
+    );
+}
+
+#[tokio::test]
 async fn binary_signatures_are_not_editable() {
     let app = setup_app().await;
     std::fs::write(
@@ -303,6 +413,9 @@ async fn binary_signatures_are_not_editable() {
     let body = json_body(probe).await;
     assert_eq!(body["is_text"], false);
     assert_eq!(body["reason"], "binary");
+    assert!(body["encoding"].is_null());
+    assert_eq!(body["bom"], false);
+    assert_eq!(body["lossy"], false);
 }
 
 #[tokio::test]
