@@ -174,7 +174,27 @@ paths:
       tags: [files]
       summary: 当前用户授权根
       responses:
-        '200': { description: OK }
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roots:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer, format: int64 }
+                        alias: { type: string }
+                        read_only: { type: boolean }
+                        kind: { type: string, enum: [local, remote] }
+                        mount_id: { type: integer, format: int64, nullable: true }
+                        shared: { type: boolean }
+                        online:
+                          type: boolean
+                          description: 远程根为最近一次探测结果；本地根始终为 true。探测失败、超时、token 或 grant 失效均为 false。
   /api/v1/branding:
     get:
       tags: [branding]
@@ -209,6 +229,7 @@ paths:
       description: |
         响应包含 `read_only` 与 `read_only_reason`。`read_only_reason` 为 `policy`（root 或可信链接配置只读）或 `filesystem`（服务进程没有当前目录的写权限），两者皆无时为 `null`。写入只读目录返回 `403 PERMISSION_DENIED`（文件系统）或 `403 FORBIDDEN`（策略）。
         传入 `focus` 时按当前排序定位该名称，返回目标所在页，并附带 `focus_index`、`focus_offset`、`total`；目标不存在返回 `404`。`focus` 不能与 `cursor` 同时使用。
+        远程根不可达时返回 `503 REMOTE_OFFLINE`；对端返回的 4xx 保持原状态码，不转换为 503。
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, schema: { type: string, default: '' } }
@@ -220,6 +241,7 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
   /api/v1/fs/image-info:
     get:
       tags: [files]
@@ -561,8 +583,18 @@ paths:
                 type: object
                 properties:
                   is_text: { type: boolean }
-                  reason: { type: string }
+                  reason:
+                    type: string
+                    enum: [text, lossy, binary, empty, too_large]
                   size: { type: integer, format: int64 }
+                  encoding:
+                    type: string
+                    nullable: true
+                    description: 探测到的编码；非文本或超限时为 null。
+                  bom: { type: boolean }
+                  lossy:
+                    type: boolean
+                    description: 为 true 表示按该编码解码时出现替换字符；内容仍可编辑。
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/file:
     get:
@@ -588,15 +620,23 @@ paths:
                   line_ending: { type: string, enum: [lf, crlf, mixed] }
                   writable: { type: boolean }
                   read_only_reason: { type: string, nullable: true, enum: [file, directory, null] }
+                  encoding: { type: string }
+                  bom: { type: boolean }
+                  lossy: { type: boolean }
         '403': { $ref: '#/components/responses/Error' }
         '415': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
     put:
       tags: [files]
       summary: 保存文本文件（If-Match）
       parameters:
         - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
         - { name: path, in: query, required: true, schema: { type: string } }
-        - { name: If-Match, in: header, required: true, schema: { type: string } }
+        - name: If-Match
+          in: header
+          required: false
+          description: 正常保存必须携带并匹配当前 etag；`force=true` 时可省略。
+          schema: { type: string }
       requestBody:
         required: true
         content:
@@ -606,9 +646,25 @@ paths:
               required: [content]
               properties:
                 content: { type: string }
+                encoding:
+                  type: string
+                  default: utf-8
+                  description: 目标编码；未知或不支持返回 400。
+                bom: { type: boolean, default: false }
+                force:
+                  type: boolean
+                  default: false
+                  description: 显式覆盖已被他人修改的文件；跳过 If-Match 校验。
       responses:
         '200': { description: OK }
         '412': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422':
+          description: 所选编码无法表示内容（ENCODING_UNREPRESENTABLE）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/Error' }
 
   /api/v1/terminal/ws:
     get:

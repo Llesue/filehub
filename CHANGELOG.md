@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.3 - 2026-11-23
+
+### Added
+
+- `GET /api/v1/roots` reports an `online` flag for remote roots. An unreachable peer or a revoked token no longer looks like a server error.
+- The sidebar marks remote roots offline, and a failed request shows a readable notification instead of a generic failure.
+- The editor detects UTF-16 without a BOM, GBK/GB18030, Big5, Shift-JIS, EUC-KR, Windows code pages and ISO-8859-1/15. Binary files are refused instead of being re-encoded on save.
+
+### Fixed
+
+- An unreachable remote now returns `503 REMOTE_OFFLINE` instead of `500 INTERNAL_ERROR`. An HTTP 4xx from the peer keeps its original status and is never reported as offline.
+
 ## v0.2.2 - 2026-11-22
 
 ### Fixed
