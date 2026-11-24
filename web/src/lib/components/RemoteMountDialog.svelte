@@ -19,6 +19,7 @@
   let view = $state<'list' | 'wizard' | 'grants'>('list');
   let mounts = $state<RemoteMount[]>([]);
   let busy = $state(false);
+  let backdropPressed = $state(false);
   let error = $state('');
   let reconnectId = $state<number | null>(null);
   let reconnectToken = $state('');
@@ -356,8 +357,10 @@
     <div
       class="backdrop"
       role="presentation"
+      onpointerdown={(event) => (backdropPressed = event.target === event.currentTarget)}
       onclick={(event) => {
-        if (event.target === event.currentTarget) view = 'list';
+        if (backdropPressed && event.target === event.currentTarget) view = 'list';
+        backdropPressed = false;
       }}
     >
       <div class="dialog grants-dialog" role="dialog" aria-modal="true" aria-label={t($language, '令牌目录')}>
@@ -466,8 +469,10 @@
     <div
       class="backdrop"
       role="presentation"
+      onpointerdown={(event) => (backdropPressed = event.target === event.currentTarget)}
       onclick={(event) => {
-        if (event.target === event.currentTarget) close();
+        if (backdropPressed && event.target === event.currentTarget) close();
+        backdropPressed = false;
       }}
     >
       <div class="dialog" role="dialog" aria-modal="true" aria-label={t($language, '远程目录')}>

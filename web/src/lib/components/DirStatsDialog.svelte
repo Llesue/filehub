@@ -4,6 +4,7 @@
   import { classifyFile } from '../fileKind';
   import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
+  import { overlayGuard } from '../overlayGuard';
 
   let {
     rootId,
@@ -100,7 +101,7 @@
   }}
 />
 
-<div class="overlay" role="presentation" onclick={onClose}>
+<div class="overlay" role="presentation" use:overlayGuard={onClose}>
   <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <section

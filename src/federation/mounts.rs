@@ -98,18 +98,40 @@ pub async fn client_for_root(
     Ok((client, mount))
 }
 
-/// Cheap authenticated liveness probe used by `GET /api/v1/roots`.
+/// Liveness state for `GET /api/v1/roots`.
 ///
-/// The whole operation, including SSRF resolution and client construction, is
-/// bounded so a slow or dead peer can never make the roots endpoint hang. Any
-/// failure (transport, auth, revoked grant) reports the root as offline.
+/// The background health loop already checks every mount, so a recent success
+/// is trusted without another round trip. Only stale or never-checked mounts
+/// are probed here, with a timeout that respects the configured request
+/// timeout (bounded so the roots endpoint cannot hang).
 pub async fn remote_root_online(state: &Arc<AppState>, user_id: i64, root_id: i64) -> bool {
+    let Ok(Some(mount)) = state.db.federation_mount_by_root(root_id, user_id).await else {
+        return false;
+    };
+    if mount.last_error_code.is_some() {
+        return false;
+    }
+    let now = crate::db::unix_now();
+    if mount
+        .last_ok_at
+        .is_some_and(|at| now.saturating_sub(at) <= 120)
+    {
+        return true;
+    }
+    let timeout = std::time::Duration::from_secs(
+        state
+            .settings()
+            .settings
+            .federation
+            .request_timeout_seconds
+            .clamp(3, 8),
+    );
     let probe = async {
         let (client, mount) = client_for_root(state, user_id, root_id).await.ok()?;
         let grants = client.grants().await.ok()?;
         Some(has_grant(&grants, mount.grant_id))
     };
-    tokio::time::timeout(std::time::Duration::from_secs(2), probe)
+    tokio::time::timeout(timeout, probe)
         .await
         .ok()
         .flatten()
@@ -693,7 +715,6 @@ pub async fn attach_grant(
 
 pub(crate) async fn health_loop(state: Arc<AppState>) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let mounts = match state.db.federation_all_mounts().await {
             Ok(mounts) => mounts,
             Err(error) => {
@@ -710,6 +731,7 @@ pub(crate) async fn health_loop(state: Arc<AppState>) {
                 }
             })
             .await;
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }
 }
 
@@ -919,11 +941,12 @@ async fn refresh_mount_health(
             .federation_update_mount_state(mount.id, true, None, None)
             .await
             .map_err(AppError::internal)?;
-        if active_changed || owner_changed {
+        let recovered = mount.last_error_code.is_some();
+        if active_changed || owner_changed || recovered {
             state.events.publish(
                 "roots.changed",
                 Some(mount.user_id),
-                json!({ "user_id": mount.user_id }),
+                json!({ "user_id": mount.user_id, "root_id": mount.root_id }),
             );
         }
         return Ok(HealthOutcome {
@@ -976,6 +999,13 @@ async fn refresh_mount_health(
         .federation_update_mount_state(mount.id, false, message.as_deref(), code.as_deref())
         .await
         .map_err(AppError::internal)?;
+    if mount.last_error_code.is_none() && mount.last_ok_at.is_some() {
+        state.events.publish(
+            "roots.changed",
+            Some(mount.user_id),
+            json!({ "user_id": mount.user_id, "root_id": mount.root_id }),
+        );
+    }
     Ok(HealthOutcome {
         online: false,
         removed: false,

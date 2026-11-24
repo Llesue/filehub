@@ -3,6 +3,7 @@
   import type { ShareInfo } from '../api';
   import { language, t } from '../i18n';
   import Icon from './Icon.svelte';
+  import { overlayGuard } from '../overlayGuard';
   let {
     share,
     onClose,
@@ -30,7 +31,7 @@
   }
 </script>
 
-<div class="dialog-overlay" role="presentation" onclick={onClose}>
+<div class="dialog-overlay" role="presentation" use:overlayGuard={onClose}>
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <form

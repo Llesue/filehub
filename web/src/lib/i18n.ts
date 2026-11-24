@@ -76,8 +76,8 @@ const en: Record<string, string> = {
   '远程目录不可用，请在挂载设置中重新连接': 'Remote directory unavailable; reconnect from mount settings',
   '远程目录不可用': 'Remote directory unavailable',
   '远程目录已离线': 'Remote directory is offline',
-  '当前显示的是缓存列表。目标目录恢复连接前无法修改。':
-    'Showing the cached list. Changes are disabled until the target directory is reachable.',
+  '目标目录恢复连接前无法浏览或修改。':
+    'Browsing and changes are disabled until the target directory is reachable.',
   '离线目录': 'Offline directories',
   '从未连接': 'Never connected',
   '上次在线': 'Last seen',
@@ -92,6 +92,11 @@ const en: Record<string, string> = {
   '没有更多目录': 'No more folders',
   '远程目录的令牌或授权已失效，请在挂载设置中重新连接。': 'The remote token or grant is no longer valid. Reconnect it from mount settings.',
   '远程服务器不可达': 'Remote server unreachable',
+  '远程目录离线，无法操作': 'The remote directory is offline; changes are disabled',
+  '离线（只读）': 'Offline (read-only)',
+  '保存分享卡片': 'Save share card',
+  '自托管文件管理器': 'Self-hosted file manager',
+  '扫码打开': 'Scan to open',
   '对端服务器没有响应，请检查网络或对端是否在线。':
     'The remote server did not respond. Check the network or whether the peer is online.',
   '启用远程目录挂载': 'Enable remote directory mounts',

@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Form, Path as AxumPath, Query, State};
+use axum::body::Bytes;
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -1591,12 +1592,49 @@ pub async fn zip(
     .await
 }
 
+fn form_value(raw: &str) -> String {
+    percent_encoding::percent_decode_str(&raw.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// Browsers serialize repeated form fields as repeated keys. `serde_urlencoded`
+/// cannot turn those into a `Vec`, so parse the pairs directly.
+fn parse_zip_form(body: &[u8]) -> Result<PublicZipForm, AppError> {
+    let text = std::str::from_utf8(body).map_err(|_| AppError::bad_request("invalid form body"))?;
+    let mut form = PublicZipForm {
+        path: None,
+        paths: Vec::new(),
+        item_ids: Vec::new(),
+        ticket: None,
+    };
+    for pair in text.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = form_value(key);
+        let value = form_value(value);
+        match key.as_str() {
+            "path" => form.path = Some(value),
+            "paths" => form.paths.push(value),
+            "item_ids" => {
+                let id = value
+                    .parse::<i64>()
+                    .map_err(|_| AppError::bad_request("invalid item id"))?;
+                form.item_ids.push(id);
+            }
+            "ticket" if !value.is_empty() => form.ticket = Some(value),
+            _ => {}
+        }
+    }
+    Ok(form)
+}
+
 pub async fn zip_form(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
-    Form(request): Form<PublicZipForm>,
+    body: Bytes,
 ) -> Result<Response, AppError> {
+    let request = parse_zip_form(&body)?;
     public_zip_response(
         state,
         &headers,

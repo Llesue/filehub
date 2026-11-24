@@ -981,3 +981,32 @@ async fn public_share_zip_respects_owner_feature_toggle() {
     .await;
     assert_eq!(json_body(meta).await["zip_allowed"], false);
 }
+
+#[tokio::test]
+async fn public_share_zip_form_accepts_repeated_paths() {
+    let app = setup_app().await;
+    let token = create_share(&app, "pub", true, None).await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/public/shares/{token}/zip/form"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("path=&paths=a.txt&paths=b.txt"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/zip"
+    );
+    let body = to_bytes(response.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(body.starts_with(b"PK"));
+}

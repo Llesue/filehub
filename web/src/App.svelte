@@ -113,7 +113,8 @@
   let activeRootId = $state<number | null>(null);
   let currentPath = $state('');
   let currentReadOnly = $state(false);
-  let currentReadOnlyReason = $state<'policy' | 'filesystem' | null>(null);
+  let editorOverlayPressed = $state(false);
+  let currentReadOnlyReason = $state<'policy' | 'filesystem' | 'offline' | null>(null);
   let viewRootId = $state<number | null>(null);
   let viewPath = $state('');
   let pathBarEl = $state<HTMLElement | null>(null);
@@ -528,11 +529,13 @@
   function openOfflineRoot(root: Root): void {
     appView = 'files';
     activeRootId = root.id;
+    currentReadOnly = true;
+    currentReadOnlyReason = 'offline';
     void (async () => {
       await loadList(root.id, '');
       confirmState = {
         title: t($language, '远程目录已离线'),
-        message: t($language, '当前显示的是缓存列表。目标目录恢复连接前无法修改。'),
+        message: t($language, '目标目录恢复连接前无法浏览或修改。'),
         requireText: null,
         action: () => {
           confirmState = null;
@@ -714,7 +717,7 @@
     const unsubscribeEvents = realtimeEvent.subscribe((event) => {
       if (!event) return;
       if (event.type === 'roots.changed') {
-        scheduleRootsRefresh();
+        scheduleRootStatusRefresh();
         return;
       }
       if (event.type === 'remote.unmounted') {
@@ -1304,6 +1307,15 @@
 
   /// Refresh the sidebar roots after an admin change without resetting the
   /// current browse position unless the root disappeared.
+  let rootStatusTimer: number | null = null;
+  function scheduleRootStatusRefresh(): void {
+    if (rootStatusTimer !== null) window.clearTimeout(rootStatusTimer);
+    rootStatusTimer = window.setTimeout(() => {
+      rootStatusTimer = null;
+      void refreshRootState();
+    }, 150);
+  }
+
   function scheduleRootsRefresh(): void {
     if (rootsRefreshTimer !== null) window.clearTimeout(rootsRefreshTimer);
     rootsRefreshTimer = window.setTimeout(() => {
@@ -1352,6 +1364,28 @@
       filesLoading = false;
       filesLoadedOnce = false;
       handleFilesError(error);
+    }
+  }
+
+  function rootIsOffline(rootId: number): boolean {
+    const root = roots.find((item) => item.id === rootId);
+    if (!root || root.kind !== 'remote') return false;
+    if (root.online === false) return true;
+    const mount = remoteMounts[rootId];
+    return Boolean(mount && mount.state !== 'online');
+  }
+
+  /// Refresh roots and mount state without reloading the current directory.
+  /// Used for `roots.changed` so an offline root cannot trigger a 503 loop.
+  async function refreshRootState(): Promise<void> {
+    try {
+      roots = (await api.roots()).roots;
+      void refreshRemoteCaps();
+      if (activeRootId !== null && !roots.some((root) => root.id === activeRootId)) {
+        await refreshRoots();
+      }
+    } catch (error) {
+      console.debug('root state refresh failed', error);
     }
   }
 
@@ -1418,6 +1452,16 @@
     }
     const refreshing =
       viewRootId === rootId && viewPath === path && entries.length > 0;
+    if (viewRootId !== rootId) {
+      // Never show another root's entries while the new root is loading, and
+      // treat an offline remote as read-only before its request fails.
+      entries = [];
+      selected = [];
+      if (rootIsOffline(rootId)) {
+        currentReadOnly = true;
+        currentReadOnlyReason = 'offline';
+      }
+    }
     filesLoading = !refreshing;
     if (!refreshing) filesLoadedOnce = false;
     filesRefreshing = refreshing;
@@ -1462,10 +1506,12 @@
       currentPath = result.path;
       viewRootId = result.root.id;
       viewPath = result.path;
-      currentReadOnly = result.read_only;
+      currentReadOnly = result.read_only || rootIsOffline(result.root.id);
       currentReadOnlyReason = result.read_only
         ? (result.read_only_reason ?? 'policy')
-        : null;
+        : rootIsOffline(result.root.id)
+          ? 'offline'
+          : null;
       currentStale = result.stale === true;
       entries = result.entries;
       filesLoadedOnce = true;
@@ -1916,6 +1962,9 @@
   }
 
   function readOnlyMessage(): string {
+    if (currentReadOnlyReason === 'offline') {
+      return t($language, '远程目录离线，无法操作');
+    }
     return currentReadOnlyReason === 'filesystem'
       ? t($language, '当前目录只读（文件系统权限不足）')
       : t($language, '当前目录只读');
@@ -4553,10 +4602,14 @@
                     class="readonly-tag"
                     title={currentReadOnlyReason === 'filesystem'
                       ? t($language, '服务进程没有文件系统写入权限')
-                      : t($language, '目录已设为只读')}
+                      : currentReadOnlyReason === 'offline'
+                        ? t($language, '远程目录离线，无法操作')
+                        : t($language, '目录已设为只读')}
                     >{currentReadOnlyReason === 'filesystem'
                       ? t($language, '只读（系统）')
-                      : t($language, '只读')}</span
+                      : currentReadOnlyReason === 'offline'
+                        ? t($language, '离线（只读）')
+                        : t($language, '只读')}</span
                   >
                 {/if}
               </div>
@@ -6095,7 +6148,15 @@
   {/if}
 
   {#if editorOpen}
-    <div class="editor-overlay" role="presentation" onclick={() => closeEditor()}>
+    <div
+      class="editor-overlay"
+      role="presentation"
+      onpointerdown={(event) => (editorOverlayPressed = event.target === event.currentTarget)}
+      onclick={(event) => {
+        if (editorOverlayPressed && event.target === event.currentTarget) closeEditor();
+        editorOverlayPressed = false;
+      }}
+    >
       <dialog
         open
         class="editor-panel"

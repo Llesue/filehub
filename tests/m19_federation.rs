@@ -1198,3 +1198,68 @@ async fn federation_security_and_idempotency() {
     .await;
     assert_eq!(revoked.status(), StatusCode::GONE);
 }
+
+#[tokio::test]
+async fn roots_trust_a_recent_health_success() {
+    let app = start().await;
+    let root_id = app
+        .state
+        .db
+        .federation_add_remote_root(1, "Recent", "/__filehub_remote__/recent", true)
+        .await
+        .unwrap();
+    let key = filehub::federation::crypto::mount_key(&app.state.db)
+        .await
+        .unwrap();
+    let ciphertext = filehub::federation::crypto::encrypt(&key, "recent-token").unwrap();
+    let mount_id = app
+        .state
+        .db
+        .federation_create_mount(
+            1,
+            root_id,
+            "http://127.0.0.1:1",
+            1,
+            "Recent",
+            "ro",
+            "",
+            "[]",
+            &ciphertext,
+            "",
+            0,
+            "fake-peer",
+        )
+        .await
+        .unwrap();
+    app.state
+        .db
+        .federation_bind_root(root_id, mount_id)
+        .await
+        .unwrap();
+    // Simulate a successful health check just now. roots must not probe the
+    // dead address again, otherwise a slow link shows as offline.
+    app.state
+        .db
+        .federation_update_mount_state(mount_id, true, None, None)
+        .await
+        .unwrap();
+
+    let roots = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(roots.status(), StatusCode::OK);
+    let roots = json_body(roots).await;
+    assert!(
+        roots["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root["id"] == root_id && root["online"] == true),
+        "recent health success should be trusted: {roots:?}"
+    );
+}

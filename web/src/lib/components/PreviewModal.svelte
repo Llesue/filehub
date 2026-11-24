@@ -502,15 +502,66 @@
 
   let touchStartX = 0;
   let touchStartY = 0;
+  let pinching = false;
+  let pinchStartDistance = 0;
+  let pinchStartZoom = 1;
+  let pinchStartOffsetX = 0;
+  let pinchStartOffsetY = 0;
+  let pinchStartMidX = 0;
+  let pinchStartMidY = 0;
+
+  function pinchMetrics(touches: TouchList): { distance: number; midX: number; midY: number } {
+    const a = touches[0];
+    const b = touches[1];
+    if (!a || !b) return { distance: 0, midX: 0, midY: 0 };
+    return {
+      distance: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY),
+      midX: (a.clientX + b.clientX) / 2,
+      midY: (a.clientY + b.clientY) / 2,
+    };
+  }
 
   function onTouchStart(event: TouchEvent): void {
+    if (event.touches.length === 2) {
+      const metrics = pinchMetrics(event.touches);
+      pinching = true;
+      dragging = false;
+      pinchStartDistance = Math.max(1, metrics.distance);
+      pinchStartZoom = zoom;
+      pinchStartOffsetX = offsetX;
+      pinchStartOffsetY = offsetY;
+      pinchStartMidX = metrics.midX;
+      pinchStartMidY = metrics.midY;
+      return;
+    }
     const touch = event.touches[0];
-    if (!touch) return;
+    if (!touch || pinching) return;
     touchStartX = touch.clientX;
     touchStartY = touch.clientY;
   }
 
+  function onTouchMove(event: TouchEvent): void {
+    if (!pinching || event.touches.length !== 2) return;
+    event.preventDefault();
+    const metrics = pinchMetrics(event.touches);
+    const target = Math.min(
+      8,
+      Math.max(0.2, pinchStartZoom * (metrics.distance / pinchStartDistance)),
+    );
+    const ratio = target / pinchStartZoom;
+    zoom = target;
+    offsetX = metrics.midX - (pinchStartMidX - pinchStartOffsetX) * ratio;
+    offsetY = metrics.midY - (pinchStartMidY - pinchStartOffsetY) * ratio;
+  }
+
   function onTouchEnd(event: TouchEvent): void {
+    if (pinching) {
+      if (event.touches.length < 2) {
+        pinching = false;
+        dragged = true;
+      }
+      return;
+    }
     const touch = event.changedTouches[0];
     if (!touch) return;
     const dx = touch.clientX - touchStartX;
@@ -625,10 +676,12 @@
   <div
     class="lightbox-stage"
     ontouchstart={onTouchStart}
+    ontouchmove={onTouchMove}
     ontouchend={onTouchEnd}
+    ontouchcancel={onTouchEnd}
     role="presentation"
     onclick={() => {
-      if (dragged) {
+      if (dragged || pinching) {
         dragged = false;
         return;
       }

@@ -8,6 +8,7 @@
     type Root,
   } from '../api';
   import { language, t } from '../i18n';
+  import { overlayGuard } from '../overlayGuard';
 
   let {
     csrf,
@@ -297,13 +298,7 @@
 </script>
 
 {#if open}
-  <div
-    class="backdrop"
-    role="presentation"
-    onclick={(event) => {
-      if (event.target === event.currentTarget) onClose();
-    }}
-  >
+  <div class="backdrop" role="presentation" use:overlayGuard={onClose}>
   <div class="pref-card dialog" role="dialog" aria-modal="true" aria-label={t($language, '远程共享')}>
   <header>
     <h2>{t($language, '远程共享')}</h2>
