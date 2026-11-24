@@ -103,16 +103,40 @@ async fn authenticate(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Peer
 
 /// Live presence socket. The mounting side holds this open and treats a
 /// disconnect as "peer offline", which is faster than the health loop.
+#[derive(Debug, Deserialize)]
+pub struct PresenceQuery {
+    grant: Option<i64>,
+}
+
 async fn presence(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<PresenceQuery>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
-    authenticate(&state, &headers).await?;
-    Ok(upgrade.on_upgrade(presence_session))
+    let auth = authenticate(&state, &headers).await?;
+    if let Some(grant) = query.grant
+        && !auth
+            .grants
+            .iter()
+            .any(|item| item.id == grant && !item.revoked)
+    {
+        return Err(AppError::Forbidden);
+    }
+    let token_id = auth.token.id;
+    let user_id = auth.token.user_id;
+    let grant_id = query.grant;
+    Ok(upgrade
+        .on_upgrade(move |socket| presence_session(state, token_id, user_id, grant_id, socket)))
 }
 
-async fn presence_session(mut socket: WebSocket) {
+async fn presence_session(
+    state: Arc<AppState>,
+    token_id: i64,
+    user_id: i64,
+    grant_id: Option<i64>,
+    mut socket: WebSocket,
+) {
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = Instant::now();
@@ -120,6 +144,20 @@ async fn presence_session(mut socket: WebSocket) {
         tokio::select! {
             _ = ticker.tick() => {
                 if last_seen.elapsed() >= Duration::from_secs(45) {
+                    break;
+                }
+                if !state.db.federation_token_alive(token_id).await.unwrap_or(false) {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                if let Some(grant) = grant_id
+                    && state
+                        .db
+                        .federation_grant_revoked(grant, user_id)
+                        .await
+                        .unwrap_or(true)
+                {
+                    let _ = socket.send(Message::Close(None)).await;
                     break;
                 }
                 if socket

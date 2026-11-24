@@ -93,6 +93,22 @@ impl Db {
         .await
     }
 
+    pub async fn federation_token_alive(&self, id: i64) -> anyhow::Result<bool> {
+        self.call(move |connection| {
+            let row: Option<(i64, Option<i64>)> = connection
+                .query_row(
+                    "SELECT revoked, expires_at FROM federation_tokens WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(row.is_some_and(|(revoked, expires)| {
+                revoked == 0 && expires.is_none_or(|value| value > unix_now())
+            }))
+        })
+        .await
+    }
+
     pub async fn federation_token_grants(
         &self,
         token_id: i64,

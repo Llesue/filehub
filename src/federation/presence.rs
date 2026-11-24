@@ -125,7 +125,16 @@ async fn run_mount(state: Arc<AppState>, mount: super::db::FederationMount) {
                 backoff = 1;
             }
             Err(PresenceError::Auth) => {
-                mark(&state, &current, false, None, Some("UNAUTHORIZED")).await;
+                // The peer rejected the token. Remove the mount so a revoked
+                // directory disappears instead of sitting there as offline.
+                let _ = mark(&state, &current, false, None, Some("UNAUTHORIZED")).await;
+                let _ = crate::federation::mounts::remove_mount(
+                    &state,
+                    current.user_id,
+                    &current,
+                    Some("TOKEN_REVOKED"),
+                )
+                .await;
                 return;
             }
             Err(PresenceError::Unsupported) => {
@@ -158,7 +167,7 @@ async fn run_once(
             .map_err(|_| PresenceError::Auth)?;
         crypto::decrypt(&key, &mount.token_ciphertext).map_err(|_| PresenceError::Auth)?
     };
-    let url = presence_url(&mount.base_url).ok_or(PresenceError::Unsupported)?;
+    let url = presence_url(&mount.base_url, mount.grant_id).ok_or(PresenceError::Unsupported)?;
     // TLS verification uses the original host. Unlike the HTTP client this
     // connection is not pinned to a resolved IP, but it only carries presence
     // pings and never reads peer data.
@@ -277,7 +286,7 @@ async fn mark(
     true
 }
 
-fn presence_url(base: &str) -> Option<String> {
+fn presence_url(base: &str, grant_id: i64) -> Option<String> {
     let trimmed = base.trim_end_matches('/');
     let ws = trimmed
         .strip_prefix("https://")
@@ -287,7 +296,7 @@ fn presence_url(base: &str) -> Option<String> {
                 .strip_prefix("http://")
                 .map(|rest| format!("ws://{rest}"))
         })?;
-    Some(format!("{ws}/api/federation/v1/presence"))
+    Some(format!("{ws}/api/federation/v1/presence?grant={grant_id}"))
 }
 
 fn jitter(seconds: u64) -> Duration {
@@ -307,14 +316,14 @@ mod tests {
     #[test]
     fn build_presence_url_for_both_schemes() {
         assert_eq!(
-            presence_url("https://files.example.com").as_deref(),
-            Some("wss://files.example.com/api/federation/v1/presence")
+            presence_url("https://files.example.com", 7).as_deref(),
+            Some("wss://files.example.com/api/federation/v1/presence?grant=7")
         );
         assert_eq!(
-            presence_url("http://192.0.2.1:8080/").as_deref(),
-            Some("ws://192.0.2.1:8080/api/federation/v1/presence")
+            presence_url("http://192.0.2.1:8080/", 3).as_deref(),
+            Some("ws://192.0.2.1:8080/api/federation/v1/presence?grant=3")
         );
-        assert!(presence_url("ftp://example.com").is_none());
+        assert!(presence_url("ftp://example.com", 1).is_none());
     }
 
     #[test]
