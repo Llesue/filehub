@@ -801,17 +801,24 @@ pub async fn zip(
 ) -> Result<Response, AppError> {
     let current = auth::current_user(&state, &headers).await?;
     crate::capabilities::require_zip(&state, &current.user).await?;
-    let root = load_root(&state, current.user.id, request.root).await?;
-    if request.paths.is_empty() || request.paths.len() > 1000 {
+    zip_for_paths(&state, &current.user, request.root, request.paths).await
+}
+
+async fn zip_for_paths(
+    state: &Arc<AppState>,
+    user: &crate::db::User,
+    root_id: i64,
+    paths: Vec<String>,
+) -> Result<Response, AppError> {
+    if paths.is_empty() || paths.len() > 1000 {
         return Err(AppError::bad_request("select between 1 and 1000 paths"));
     }
+    let root = load_root(state, user.id, root_id).await?;
     if root.is_remote() {
-        return crate::federation::proxy::zip_files(&state, current.user.id, &root, request.paths)
-            .await;
+        return crate::federation::proxy::zip_files(state, user.id, &root, paths).await;
     }
 
-    let selected =
-        authz::resolve_many(&state, current.user.id, root.id, request.paths, false).await?;
+    let selected = authz::resolve_many(state, user.id, root.id, paths, false).await?;
 
     let settings = state.settings();
     let max_bytes = settings.settings.downloads.zip_max_bytes;
@@ -822,7 +829,61 @@ pub async fn zip(
             .map_err(|err| {
                 AppError::internal(anyhow::anyhow!("zip preparation failed: {err}"))
             })??;
-    zip_response(&state, entries, "filehub.zip")
+    zip_response(state, entries, "filehub.zip")
+}
+
+struct ZipForm {
+    root: i64,
+    paths: Vec<String>,
+    csrf: Option<String>,
+}
+
+fn form_component(raw: &str) -> String {
+    percent_encoding::percent_decode_str(&raw.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+fn parse_zip_form(body: &[u8]) -> Result<ZipForm, AppError> {
+    let text = std::str::from_utf8(body).map_err(|_| AppError::bad_request("invalid form body"))?;
+    let mut root: Option<i64> = None;
+    let mut paths = Vec::new();
+    let mut csrf = None;
+    for pair in text.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = form_component(value);
+        match form_component(key).as_str() {
+            "root" => {
+                root = Some(
+                    value
+                        .parse()
+                        .map_err(|_| AppError::bad_request("invalid root"))?,
+                )
+            }
+            "paths" => paths.push(value),
+            "csrf" if !value.is_empty() => csrf = Some(value),
+            _ => {}
+        }
+    }
+    Ok(ZipForm {
+        root: root.ok_or_else(|| AppError::bad_request("missing root"))?,
+        paths,
+        csrf,
+    })
+}
+
+/// Browser form variant of `zip`: it streams straight to the download shelf
+/// instead of buffering the whole archive in JavaScript.
+pub async fn zip_form(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    let request = parse_zip_form(&body)?;
+    auth::require_csrf_value(&current, request.csrf.as_deref())?;
+    crate::capabilities::require_zip(&state, &current.user).await?;
+    zip_for_paths(&state, &current.user, request.root, request.paths).await
 }
 
 fn zip_options(name: &str) -> SimpleFileOptions {

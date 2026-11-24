@@ -95,6 +95,11 @@ const en: Record<string, string> = {
   '远程目录离线，无法操作': 'The remote directory is offline; changes are disabled',
   '离线（只读）': 'Offline (read-only)',
   '保存分享卡片': 'Save share card',
+  '分享卡片': 'Share card',
+  '下载分享图片': 'Download share image',
+  '{brand} 给你分享了文件': '{brand} shared a file with you',
+  '有效期至': 'Expires',
+  '长期有效': 'No expiry',
   '自托管文件管理器': 'Self-hosted file manager',
   '扫码打开': 'Scan to open',
   '对端服务器没有响应，请检查网络或对端是否在线。':

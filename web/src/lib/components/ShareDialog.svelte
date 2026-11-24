@@ -29,7 +29,7 @@
   const readOnly = $derived(readOnlyOverride ?? (isDir || paths.length > 1));
   let error = $state('');
   let busy = $state(false);
-  let created = $state<{ url: string; token: string } | null>(null);
+  let created = $state<{ url: string; token: string; expiresAt: number | null } | null>(null);
   let qrOpen = $state(false);
 
   async function create(): Promise<void> {
@@ -49,7 +49,7 @@
         },
         csrf,
       );
-      created = { url: result.url, token: result.token };
+      created = { url: result.url, token: result.token, expiresAt: expires_at };
     } catch (err) {
       error = err instanceof ApiError ? err.message : t($language, '创建分享失败');
     } finally {
@@ -139,7 +139,9 @@
 {#if created && qrOpen}
   <ShareQrDialog
     url={`${window.location.origin}${created.url}`}
-    title={t($language, '分享二维码')}
+    title={name}
+    expiresAt={created.expiresAt}
+    isDir={isDir || paths.length > 1}
     onClose={() => (qrOpen = false)}
   />
 {/if}

@@ -19,7 +19,13 @@
   let sentinel = $state<HTMLElement | null>(null);
   let deleteTarget = $state<ShareInfo | null>(null);
   let resetTarget = $state<ShareInfo | null>(null);
-  let qrTarget = $state<{ url: string; title: string } | null>(null);
+  let qrTarget = $state<{
+    url: string;
+    title: string;
+    expiresAt: number | null;
+    isDir: boolean;
+    isCollection: boolean;
+  } | null>(null);
   let passwordEditId = $state<number | null>(null);
   let passwordDraft = $state('');
   let refreshing = $state(false);
@@ -158,6 +164,9 @@
       qrTarget = {
         url: `${window.location.origin}${result.url}`,
         title: shareLabel(share),
+        expiresAt: share.expires_at,
+        isDir: share.is_dir,
+        isCollection: share.kind === 'collection',
       };
     } catch (error) {
       showNotice(error instanceof Error ? error.message : t($language, '生成分享地址失败'));
@@ -314,6 +323,9 @@
   <ShareQrDialog
     url={qrTarget.url}
     title={qrTarget.title}
+    expiresAt={qrTarget.expiresAt}
+    isDir={qrTarget.isDir}
+    isCollection={qrTarget.isCollection}
     onClose={() => (qrTarget = null)}
   />
 {/if}

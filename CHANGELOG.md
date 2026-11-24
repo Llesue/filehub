@@ -4,7 +4,7 @@
 
 ### Added
 
-- The share QR dialog can save a 1080x1440 card with the link title, QR code and URL.
+- The share QR dialog shows the generated card: file type, file name, a square QR code and the expiry date. The card can be downloaded or its link copied with a short message.
 - The share page image preview supports two-finger pinch zoom and panning.
 
 ### Fixed
@@ -13,6 +13,8 @@
 - Remote health checks run every 20 seconds and publish `roots.changed` when a mount comes back or drops, so the sidebar updates without a reload.
 - Opening an offline remote root clears the previous root's list and forces read-only mode; upload, delete, rename and drag-and-drop are disabled.
 - Multi-file download from a share works again: repeated form fields are parsed as a list instead of failing deserialization.
+- Browser downloads stream through a form endpoint, so selecting several files starts the ZIP immediately instead of buffering it in memory.
+- On phones the share selection bar puts the count and size above the buttons, and tapping blank space clears the selection.
 - Dragging a text selection out of the editor or another dialog no longer closes it.
 
 ## v0.2.3 - 2026-11-23

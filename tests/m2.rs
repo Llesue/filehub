@@ -648,3 +648,34 @@ async fn mkdir_reports_existing_directories_and_file_conflicts() {
     .await;
     assert_eq!(missing_parent.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn zip_form_accepts_repeated_paths_and_csrf() {
+    let app = setup_app().await;
+    let body = format!(
+        "root={}&csrf={}&paths=hello.txt&paths=sub%2Fnested.txt",
+        app.root_id, app.csrf
+    );
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/download/zip/form")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, &app.cookie)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(bytes.starts_with(b"PK"));
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    assert!(archive.by_name("hello.txt").is_ok());
+    assert_eq!(archive.len(), 2, "both selected paths should be zipped");
+}

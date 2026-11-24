@@ -417,6 +417,29 @@ paths:
       responses:
         '200': { description: application/zip }
         '413': { $ref: '#/components/responses/Error' }
+  /api/v1/download/zip/form:
+    post:
+      tags: [transfer]
+      summary: 表单 ZIP 下载（浏览器）
+      description: 浏览器表单提交；重复的 `paths` 字段按顺序收集，`csrf` 为会话 CSRF token，响应流式返回 ZIP。
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [root, csrf, paths]
+              properties:
+                root: { type: integer, format: int64 }
+                csrf: { type: string }
+                paths:
+                  type: array
+                  maxItems: 1000
+                  items: { type: string }
+      responses:
+        '200': { description: application/zip }
+        '403': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
   /api/v1/uploads:
     post:
       tags: [transfer]

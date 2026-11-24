@@ -192,6 +192,15 @@ pub fn require_admin(user: &CurrentUser) -> Result<(), AppError> {
 }
 
 pub fn require_csrf(user: &CurrentUser, headers: &HeaderMap) -> Result<(), AppError> {
+    let provided = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok());
+    require_csrf_value(user, provided)
+}
+
+/// Validate a CSRF token that arrived somewhere other than a header, such as
+/// a hidden field in a browser form submission.
+pub fn require_csrf_value(user: &CurrentUser, provided: Option<&str>) -> Result<(), AppError> {
     if user.auth_kind == AuthKind::Token {
         return if user.scope.as_deref() == Some("write") {
             Ok(())
@@ -201,10 +210,7 @@ pub fn require_csrf(user: &CurrentUser, headers: &HeaderMap) -> Result<(), AppEr
     }
 
     let expected = user.csrf_token.as_deref().ok_or(AppError::Forbidden)?;
-    let provided = headers
-        .get("x-csrf-token")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(AppError::Forbidden)?;
+    let provided = provided.ok_or(AppError::Forbidden)?;
 
     if constant_time_eq(expected, provided) {
         Ok(())

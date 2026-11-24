@@ -4038,21 +4038,38 @@
     await downloadZipEntries(entries.filter((entry) => selected.includes(entry.name)));
   }
 
+  function submitZipForm(paths: string[]): void {
+    if (activeRootId === null || paths.length === 0) return;
+    const frameName = 'filehub-zip-download';
+    if (!document.querySelector(`iframe[name="${frameName}"]`)) {
+      const frame = document.createElement('iframe');
+      frame.name = frameName;
+      frame.style.display = 'none';
+      document.body.appendChild(frame);
+    }
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = api.zipFormUrl();
+    form.target = frameName;
+    form.style.display = 'none';
+    const add = (name: string, value: string): void => {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = name;
+      input.value = value;
+      form.appendChild(input);
+    };
+    add('root', String(activeRootId));
+    add('csrf', csrf);
+    for (const path of paths) add('paths', path);
+    document.body.appendChild(form);
+    form.submit();
+    form.remove();
+  }
+
   async function downloadZipEntries(items: Entry[]): Promise<void> {
     if (activeRootId === null || items.length === 0) return;
-
-    try {
-      const paths = items.map((entry) => joinPath(currentPath, entry.name));
-      const blob = await api.downloadZip(activeRootId, paths, csrf);
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = 'filehub.zip';
-      anchor.click();
-      URL.revokeObjectURL(url);
-    } catch (error) {
-      handleFilesError(error);
-    }
+    submitZipForm(items.map((entry) => joinPath(currentPath, entry.name)));
   }
 
   function formatSize(size: number): string {

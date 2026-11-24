@@ -149,6 +149,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/properties", get(crate::properties::properties))
         .route("/download", get(crate::files::download))
         .route("/download/zip", post(crate::files::zip))
+        .route("/download/zip/form", post(crate::files::zip_form))
         .route("/media/audio-info", get(crate::media::audio_info))
         .route("/media/transcode", post(crate::media::transcode))
         .route("/media/transcoded", get(crate::media::transcoded))

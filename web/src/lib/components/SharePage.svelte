@@ -572,7 +572,22 @@
   <title>{$branding.name} · {t($language, '分享')}</title>
 </svelte:head>
 
-<main class="share-shell">
+<main
+  class="share-shell"
+  role="presentation"
+  onclick={(event) => {
+    if (selectedCount === 0) return;
+    const target = event.target as HTMLElement | null;
+    if (
+      target?.closest(
+        '.share-card-item, .entry, button, a, input, label, .selection-bar, .zip-hint, .upload-queue',
+      )
+    ) {
+      return;
+    }
+    clearSelection();
+  }}
+>
   <section class="share-card">
     <header class="share-header">
       <div class="brand">
@@ -683,7 +698,13 @@
         {/if}
 
         {#if view === 'grid'}
-          <div class="share-grid">
+          <div
+            class="share-grid"
+            role="presentation"
+            onclick={(event) => {
+              if (event.target === event.currentTarget) clearSelection();
+            }}
+          >
             {#each entries as entry (entry.name)}
               {@const thumbId = entryThumbKey(entry)}
               <div
@@ -751,7 +772,13 @@
             {/if}
           </div>
         {:else}
-          <div class="entries">
+          <div
+            class="entries"
+            role="presentation"
+            onclick={(event) => {
+              if (event.target === event.currentTarget) clearSelection();
+            }}
+          >
             {#each entries as entry (entry.name)}
               <div
                 class="entry"
@@ -1108,6 +1135,22 @@
   .selection-actions {
     display: flex;
     gap: 6px;
+  }
+
+  @media (max-width: 640px) {
+    .selection-bar {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 8px;
+    }
+
+    .selection-actions {
+      flex-wrap: wrap;
+    }
+
+    .selection-actions button {
+      flex: 1 1 auto;
+    }
   }
 
   .selection-actions button,

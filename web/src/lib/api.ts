@@ -1852,6 +1852,10 @@ export const api = {
     );
   },
 
+  zipFormUrl(): string {
+    return `${BASE}/download/zip/form`;
+  },
+
   async downloadZip(root: number, paths: string[], csrf: string): Promise<Blob> {
     const response = await fetch(`${BASE}/download/zip`, {
       method: 'POST',
