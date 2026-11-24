@@ -80,6 +80,15 @@ pub fn notify_grant(state: &Arc<AppState>, user_id: i64, grant_id: i64, event: &
     }
 }
 
+pub fn notify_user(state: &Arc<AppState>, user_id: i64, event: &str, data: Value) {
+    let peers = state.presence_peers.lock();
+    for peer in peers.values() {
+        if peer.user_id == user_id {
+            send_to(peer, event, data.clone());
+        }
+    }
+}
+
 pub fn notify_token(state: &Arc<AppState>, token_id: i64, event: &str, data: Value) {
     let peers = state.presence_peers.lock();
     for peer in peers.values() {
@@ -235,6 +244,31 @@ async fn run_mount(state: Arc<AppState>, mount: super::db::FederationMount) {
     }
 }
 
+async fn apply_owner(state: &Arc<AppState>, mount: &super::db::FederationMount, value: &Value) {
+    let Some(name) = value.get("owner_name").and_then(Value::as_str) else {
+        return;
+    };
+    let version = value
+        .get("avatar_version")
+        .and_then(Value::as_i64)
+        .unwrap_or(mount.avatar_version);
+    if name == mount.owner_name && version == mount.avatar_version {
+        return;
+    }
+    let _ = state
+        .db
+        .federation_update_mount_owner(mount.id, name, version)
+        .await;
+    state.events.publish(
+        "roots.changed",
+        Some(mount.user_id),
+        serde_json::json!({
+            "user_id": mount.user_id,
+            "root_id": mount.root_id,
+        }),
+    );
+}
+
 async fn run_once(
     state: &Arc<AppState>,
     mount: &super::db::FederationMount,
@@ -348,6 +382,7 @@ async fn run_once(
                                 {
                                     baseline_prefix = Some(prefix.to_owned());
                                 }
+                                apply_owner(state, mount, &value).await;
                                 let instance = value
                                     .get("instance_id")
                                     .and_then(Value::as_str)
@@ -381,6 +416,9 @@ async fn run_once(
                             }
                             "capabilities.changed" => {
                                 crate::federation::mounts::refresh_capabilities_now(state, mount);
+                            }
+                            "owner.changed" => {
+                                apply_owner(state, mount, &value).await;
                             }
                             "grant.updated" => {
                                 let label = value.get("label").and_then(Value::as_str);

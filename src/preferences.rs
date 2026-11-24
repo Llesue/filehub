@@ -199,6 +199,15 @@ pub async fn upload_avatar(
         .save_user_preferences(current.user.id, &preferences)
         .await
         .map_err(AppError::internal)?;
+    crate::federation::presence::notify_user(
+        &state,
+        current.user.id,
+        "owner.changed",
+        json!({
+            "owner_name": current.user.username,
+            "avatar_version": preferences.avatar_version,
+        }),
+    );
     Ok(Json(json!({
         "preferences": preferences_json(&preferences),
         "system": system_json(&state),
@@ -235,5 +244,14 @@ pub async fn delete_avatar(
         .save_user_preferences(current.user.id, &preferences)
         .await
         .map_err(AppError::internal)?;
+    crate::federation::presence::notify_user(
+        &state,
+        current.user.id,
+        "owner.changed",
+        json!({
+            "owner_name": current.user.username,
+            "avatar_version": preferences.avatar_version,
+        }),
+    );
     Ok(StatusCode::NO_CONTENT)
 }

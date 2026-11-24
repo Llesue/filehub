@@ -1317,6 +1317,12 @@ async fn presence_websocket_authenticates_and_pushes_events() {
             .as_str()
             .is_some_and(|value| !value.is_empty())
     );
+    assert!(
+        welcome["owner_name"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(welcome["avatar_version"].as_i64().is_some());
 
     filehub::federation::presence::notify_grant(
         &app.state,

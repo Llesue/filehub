@@ -1734,18 +1734,54 @@ impl Db {
         .await
     }
 
-    pub async fn reorder_roots(&self, user_id: i64, ids: &[i64]) -> anyhow::Result<()> {
+    /// Reorder only the submitted roots by permuting the `sort_order` slots
+    /// they already occupy. Roots in other groups keep their positions, so a
+    /// temporary offline root does not jump when it comes back.
+    pub async fn reorder_roots(&self, user_id: i64, ids: &[i64]) -> anyhow::Result<bool> {
         let ids = ids.to_vec();
         self.call(move |connection| {
             let transaction = connection.transaction()?;
-            for (index, id) in ids.iter().enumerate() {
+            let roots: Vec<i64> = {
+                let mut statement = transaction.prepare(
+                    "SELECT id FROM user_roots WHERE user_id = ?1 ORDER BY sort_order, id",
+                )?;
+                statement
+                    .query_map(params![user_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?
+            };
+            if ids.is_empty() || ids.len() > roots.len() {
+                return Ok(false);
+            }
+            let mut position = std::collections::HashMap::new();
+            for (index, id) in roots.iter().enumerate() {
+                position.insert(*id, index as i64);
+                transaction.execute(
+                    "UPDATE user_roots SET sort_order = ?1 WHERE id = ?2",
+                    params![index as i64, id],
+                )?;
+            }
+            let mut slots = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let Some(value) = position.get(id) else {
+                    return Ok(false);
+                };
+                slots.push(*value);
+            }
+            let mut unique = slots.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if unique.len() != slots.len() {
+                return Ok(false);
+            }
+            slots.sort_unstable();
+            for (slot, id) in slots.iter().zip(ids.iter()) {
                 transaction.execute(
                     "UPDATE user_roots SET sort_order = ?1 WHERE id = ?2 AND user_id = ?3",
-                    params![index as i64, id, user_id],
+                    params![slot, id, user_id],
                 )?;
             }
             transaction.commit()?;
-            Ok(())
+            Ok(true)
         })
         .await
     }

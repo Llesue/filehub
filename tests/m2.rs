@@ -681,22 +681,35 @@ async fn zip_form_accepts_repeated_paths_and_csrf() {
 }
 
 #[tokio::test]
-async fn root_order_can_be_reordered_and_rejects_partial_sets() {
+async fn root_order_permutes_only_the_submitted_slots() {
     let app = setup_app().await;
-    let extra = app
+    let first = app
         .state
         .db
-        .ensure_root(1, app.home.join("extra").to_str().unwrap(), "Extra", false)
+        .ensure_root(1, app.home.join("first").to_str().unwrap(), "First", false)
+        .await
+        .unwrap();
+    let second = app
+        .state
+        .db
+        .ensure_root(
+            1,
+            app.home.join("second").to_str().unwrap(),
+            "Second",
+            false,
+        )
         .await
         .unwrap();
 
+    // Current order: root, first, second. Reorder only second + root; the
+    // middle slot stays with `first`.
     let reordered = send_json(
         &app.router,
         Method::PUT,
         "/api/v1/roots/order",
         Some(&app.cookie),
         Some(&app.csrf),
-        json!({ "ids": [extra, app.root_id] }),
+        json!({ "ids": [second, app.root_id] }),
     )
     .await;
     assert_eq!(reordered.status(), StatusCode::OK);
@@ -716,16 +729,28 @@ async fn root_order_can_be_reordered_and_rejects_partial_sets() {
         .iter()
         .map(|root| root["id"].as_i64().unwrap())
         .collect();
-    assert_eq!(ids, vec![extra, app.root_id]);
+    assert_eq!(ids, vec![second, first, app.root_id]);
 
-    let partial = send_json(
+    // A single id is a valid no-op.
+    let single = send_json(
         &app.router,
         Method::PUT,
         "/api/v1/roots/order",
         Some(&app.cookie),
         Some(&app.csrf),
-        json!({ "ids": [app.root_id] }),
+        json!({ "ids": [first] }),
     )
     .await;
-    assert_eq!(partial.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(single.status(), StatusCode::OK);
+
+    let unknown = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/roots/order",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({ "ids": [9999] }),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
 }

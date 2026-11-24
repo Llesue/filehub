@@ -99,23 +99,26 @@ pub async fn reorder_roots(
         .list_roots(current.user.id)
         .await
         .map_err(AppError::internal)?;
-    if request.ids.len() != roots.len() || request.ids.len() > 500 {
-        return Err(AppError::bad_request(
-            "root order must list every root once",
-        ));
+    if request.ids.is_empty() || request.ids.len() > roots.len() || request.ids.len() > 500 {
+        return Err(AppError::bad_request("root order must list existing roots"));
     }
     let existing: std::collections::HashSet<i64> = roots.iter().map(|root| root.id).collect();
     let submitted: std::collections::HashSet<i64> = request.ids.iter().copied().collect();
-    if submitted.len() != request.ids.len() || submitted != existing {
+    if submitted.len() != request.ids.len() || !submitted.is_subset(&existing) {
         return Err(AppError::bad_request(
             "root order does not match the current roots",
         ));
     }
-    state
+    let changed = state
         .db
         .reorder_roots(current.user.id, &request.ids)
         .await
         .map_err(AppError::internal)?;
+    if !changed {
+        return Err(AppError::bad_request(
+            "root order does not match the current roots",
+        ));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 

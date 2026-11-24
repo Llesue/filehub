@@ -1309,16 +1309,22 @@
   let dragOverRootId = $state<number | null>(null);
   let reorderingRoots = $state(false);
 
-  function onRootDragStart(event: DragEvent, root: Root): void {
+  type RootGroup = 'local' | 'online' | 'offline';
+  let draggingGroup = $state<RootGroup | null>(null);
+
+  function onRootDragStart(event: DragEvent, root: Root, group: RootGroup): void {
     draggingRootId = root.id;
+    draggingGroup = group;
     if (event.dataTransfer) {
       event.dataTransfer.effectAllowed = 'move';
       event.dataTransfer.setData('text/plain', String(root.id));
     }
   }
 
-  function onRootDragOver(event: DragEvent, root: Root): void {
-    if (draggingRootId === null || draggingRootId === root.id) return;
+  function onRootDragOver(event: DragEvent, root: Root, group: RootGroup): void {
+    if (draggingRootId === null || draggingRootId === root.id || draggingGroup !== group) {
+      return;
+    }
     event.preventDefault();
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
     dragOverRootId = root.id;
@@ -1327,33 +1333,50 @@
   function onRootDragEnd(): void {
     draggingRootId = null;
     dragOverRootId = null;
+    draggingGroup = null;
   }
 
-  function onRootDrop(event: DragEvent, target: Root): void {
+  function onRootDrop(event: DragEvent, target: Root, group: Root[]): void {
     event.preventDefault();
     const fromId = draggingRootId;
     draggingRootId = null;
     dragOverRootId = null;
+    draggingGroup = null;
     if (fromId === null || fromId === target.id) return;
-    void moveRoot(fromId, target.id);
+    void moveRootInGroup(fromId, target.id, group);
   }
 
-  async function moveRoot(fromId: number, toId: number): Promise<void> {
-    const from = roots.findIndex((root) => root.id === fromId);
-    const to = roots.findIndex((root) => root.id === toId);
+  /// Move one root inside its own group and persist only that group's order.
+  /// The server permutes the slots those roots already occupy, so roots in
+  /// other groups (including offline ones) keep their positions.
+  async function moveRootInGroup(fromId: number, toId: number, group: Root[]): Promise<void> {
+    const ids = group.map((root) => root.id);
+    const from = ids.indexOf(fromId);
+    const to = ids.indexOf(toId);
     if (from < 0 || to < 0 || from === to) return;
+    const nextIds = [...ids];
+    const [moved] = nextIds.splice(from, 1);
+    if (moved === undefined) return;
+    nextIds.splice(to, 0, moved);
+
+    const byId = new Map(group.map((root) => [root.id, root]));
+    const nextGroup = nextIds
+      .map((id) => byId.get(id))
+      .filter((root): root is Root => root !== undefined);
+    const positions: number[] = [];
+    roots.forEach((root, index) => {
+      if (byId.has(root.id)) positions.push(index);
+    });
     const previous = roots;
-    const next = [...roots];
-    const [moved] = next.splice(from, 1);
-    if (!moved) return;
-    next.splice(to, 0, moved);
-    roots = next;
+    const nextRoots = [...roots];
+    positions.forEach((position, index) => {
+      const root = nextGroup[index];
+      if (root) nextRoots[position] = root;
+    });
+    roots = nextRoots;
     reorderingRoots = true;
     try {
-      await api.reorderRoots(
-        next.map((root) => root.id),
-        csrf,
-      );
+      await api.reorderRoots(nextIds, csrf);
     } catch (error) {
       roots = previous;
       showToast(t($language, '排序保存失败'));
@@ -1362,6 +1385,7 @@
       reorderingRoots = false;
     }
   }
+
   let rootStatusTimer: number | null = null;
   function scheduleRootStatusRefresh(): void {
     if (rootStatusTimer !== null) window.clearTimeout(rootStatusTimer);
@@ -4414,12 +4438,22 @@
               type="button"
               class:active={appView === 'files' && root.id === activeRootId}
               class="nav-item"
+              class:dragging={draggingRootId === root.id}
+              class:drag-over={dragOverRootId === root.id}
+              draggable={!reorderingRoots}
               title={rootLabel(root.alias)}
               onclick={() => {
                 appView = 'files';
                 activeRootId = root.id;
                 void loadList(root.id, '');
               }}
+              ondragstart={(event) => onRootDragStart(event, root, 'local')}
+              ondragover={(event) => onRootDragOver(event, root, 'local')}
+              ondragleave={() => {
+                if (dragOverRootId === root.id) dragOverRootId = null;
+              }}
+              ondrop={(event) => onRootDrop(event, root, localRoots)}
+              ondragend={onRootDragEnd}
             >
               <Icon name="folder" size={18} />
               <span class="nav-label">{rootLabel(root.alias)}</span>
@@ -4446,8 +4480,18 @@
                 type="button"
                 class:active={appView === 'files' && root.id === activeRootId}
                 class="nav-item"
+                class:dragging={draggingRootId === root.id}
+                class:drag-over={dragOverRootId === root.id}
+                draggable={!reorderingRoots}
                 title={remoteTitle(root.id, rootLabel(root.alias))}
                 onclick={() => openRemoteRoot(root)}
+                ondragstart={(event) => onRootDragStart(event, root, 'online')}
+                ondragover={(event) => onRootDragOver(event, root, 'online')}
+                ondragleave={() => {
+                  if (dragOverRootId === root.id) dragOverRootId = null;
+                }}
+                ondrop={(event) => onRootDrop(event, root, onlineRemoteRoots)}
+                ondragend={onRootDragEnd}
               >
                 {#if remote?.avatar_version && !avatarFailures[`${root.id}:${remote?.avatar_version ?? 0}`]}
                   <img
@@ -4509,12 +4553,12 @@
                   class:drag-over={dragOverRootId === root.id}
                   draggable={!reorderingRoots}
                   title={remoteTitle(root.id, rootLabel(root.alias))}
-                  ondragstart={(event) => onRootDragStart(event, root)}
-                  ondragover={(event) => onRootDragOver(event, root)}
+                  ondragstart={(event) => onRootDragStart(event, root, 'offline')}
+                  ondragover={(event) => onRootDragOver(event, root, 'offline')}
                   ondragleave={() => {
                     if (dragOverRootId === root.id) dragOverRootId = null;
                   }}
-                  ondrop={(event) => onRootDrop(event, root)}
+                  ondrop={(event) => onRootDrop(event, root, offlineRemoteRoots)}
                   ondragend={onRootDragEnd}
                 >
                   {#if remote?.avatar_version && !avatarFailures[`${root.id}:${remote?.avatar_version ?? 0}`]}
@@ -6663,16 +6707,16 @@
     cursor: not-allowed;
   }
 
-  .nav-item.offline.dragging {
+  .nav-item.dragging {
     opacity: 0.35;
   }
 
-  .nav-item.offline.drag-over {
+  .nav-item.drag-over {
     outline: 2px dashed var(--accent);
     outline-offset: -2px;
   }
 
-  .nav-item.offline[draggable='true'] {
+  .nav-item[draggable='true'] {
     cursor: grab;
   }
 

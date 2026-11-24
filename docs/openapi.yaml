@@ -199,7 +199,7 @@ paths:
     put:
       tags: [files]
       summary: 保存侧栏根目录顺序
-      description: 必须提交当前用户全部可见 root 的 id，各一次；按提交顺序写入 sort_order。
+      description: 提交同一分组内的 root id，按新顺序重排它们已占用的 `sort_order` 槽位；其他 root 的位置不变。
       requestBody:
         required: true
         content:

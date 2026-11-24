@@ -10,7 +10,8 @@
 - Health checks run per mount with a 10 second budget, so unreachable peers cannot starve a healthy mount.
 - Federation requests enforce `federation.enabled_inbound`, the share feature and the user's disabled flag.
 - The sidebar shows a toast when a remote directory goes online or offline.
-- Offline remote roots can be reordered by dragging; the order is stored in `user_roots.sort_order`.
+- Every sidebar group can be reordered by dragging, not just offline roots. Only the dragged group's slots are permuted, so a root that goes offline keeps its position when it returns.
+- Avatar and display-name changes push `owner.changed`; `welcome` carries the owner name and avatar version so reconnects align immediately.
 - Mobile image previews use a blurred full-screen backdrop, tap to toggle the chrome, and double-tap to zoom to 150% without leaving fullscreen.
 
 ### Fixed

@@ -149,11 +149,24 @@ async fn presence(
         .map_err(AppError::internal)?;
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let connection = crate::federation::presence::register(&state, token_id, user_id, grant_id, tx);
+    let owner = state
+        .db
+        .find_user_by_id(user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::Unauthorized)?;
+    let preferences = state
+        .db
+        .get_user_preferences(user_id)
+        .await
+        .map_err(AppError::internal)?;
     let welcome = json!({
         "type": "welcome",
         "instance_id": instance_id,
         "server_version": env!("CARGO_PKG_VERSION"),
         "token_prefix": token_prefix,
+        "owner_name": owner.username,
+        "avatar_version": preferences.avatar_version,
     });
     Ok(upgrade.on_upgrade(move |socket| async move {
         presence_session(
