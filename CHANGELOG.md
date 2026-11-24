@@ -17,6 +17,7 @@
 - Pinch zoom keeps the image anchored under the fingers.
 - Offline remote roots are no longer clickable and no longer open a blocking dialog.
 - A revoked token removes the mount as soon as the peer answers 401/403.
+- Revoking a grant, or deleting the shared directory, now removes the mount instead of leaving it looking online while every browse fails.
 
 ## v0.2.4 - 2026-11-24
 

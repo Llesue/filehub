@@ -868,6 +868,25 @@ async fn refresh_mount_health(
     }
     let working_check = checks.iter().find(|check| check.grants.is_some());
     if let Some(active) = working_check {
+        // The token authenticated but no longer lists this grant: it was
+        // revoked, or the shared directory disappeared. Keeping the mount
+        // online would make every browse fail with GRANT_REVOKED.
+        if active
+            .grants
+            .as_ref()
+            .and_then(|grants| grant_for(grants, mount.grant_id))
+            .is_none()
+        {
+            let _ = remove_mount(state, mount.user_id, mount, Some("GRANT_REVOKED")).await;
+            return Ok(HealthOutcome {
+                online: false,
+                removed: true,
+                code: Some("GRANT_REVOKED".to_owned()),
+                message: Some("the shared grant is no longer available".to_owned()),
+                active_url: None,
+                latency_ms: active.latency_ms,
+            });
+        }
         let mut active_url = mount.base_url.clone();
         let mut active_changed = false;
         let mut owner_changed = false;

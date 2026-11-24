@@ -95,6 +95,7 @@ const en: Record<string, string> = {
   '远程目录「{alias}」已上线': 'Remote directory "{alias}" is online',
   '远程目录「{alias}」已离线': 'Remote directory "{alias}" is offline',
   '远程目录离线，暂时无法访问': 'The remote directory is offline and cannot be opened',
+  '远程目录的令牌或授权已失效，正在卸载': 'The remote token or grant is no longer valid; unmounting',
   '远程目录已离线，暂时无法访问': 'The remote directory went offline and cannot be opened',
   '排序保存失败': 'Could not save the order',
   '远程目录离线，无法操作': 'The remote directory is offline; changes are disabled',

@@ -2030,12 +2030,9 @@
       error instanceof ApiError &&
       (error.code === 'REMOTE_TOKEN_INVALID' || error.code === 'REMOTE_GRANT_REVOKED')
     ) {
-      showNotice(
-        t($language, '远程目录不可用'),
-        'error',
-        t($language, '远程目录的令牌或授权已失效，请在挂载设置中重新连接。'),
-      );
+      showToast(t($language, '远程目录的令牌或授权已失效，正在卸载'));
       void refreshRemoteCaps();
+      void refreshRootStatus();
       return;
     }
     if (error instanceof ApiError && error.code === 'REMOTE_OFFLINE') {

@@ -1442,3 +1442,85 @@ async fn presence_marks_the_mount_offline_when_the_socket_closes() {
         "closed presence socket should mark the mount offline"
     );
 }
+
+#[tokio::test]
+async fn revoked_grant_removes_the_mount_on_the_next_health_check() {
+    let peer = start().await;
+    let mount_instance = start().await;
+
+    let grant = send_json(
+        &peer.router,
+        Method::POST,
+        "/api/v1/remote/grants",
+        Some(&peer.cookie),
+        Some(&peer.csrf),
+        json!({"root": peer.root_id, "path": "shared", "label": "Shared", "mode": "rw"}),
+    )
+    .await;
+    let grant_id = json_body(grant).await["id"].as_i64().unwrap();
+
+    let token = send_json(
+        &peer.router,
+        Method::POST,
+        "/api/v1/remote/tokens",
+        Some(&peer.cookie),
+        Some(&peer.csrf),
+        json!({"name": "revoked", "grant_ids": [grant_id]}),
+    )
+    .await;
+    let token = json_body(token).await["token"].as_str().unwrap().to_owned();
+
+    let mounted = send_json(
+        &mount_instance.router,
+        Method::POST,
+        "/api/v1/remote/mounts",
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({
+            "urls": [peer.base],
+            "token": token,
+            "grant_id": grant_id,
+            "alias": "peer",
+        }),
+    )
+    .await;
+    assert_eq!(mounted.status(), StatusCode::OK);
+    let mounted = json_body(mounted).await;
+    let mount_id = mounted["id"].as_i64().unwrap();
+    let root_id = mounted["root_id"].as_i64().unwrap();
+
+    peer.state
+        .db
+        .federation_revoke_grant(grant_id, 1)
+        .await
+        .unwrap();
+
+    let tested = send_json(
+        &mount_instance.router,
+        Method::POST,
+        &format!("/api/v1/remote/mounts/{mount_id}/test"),
+        Some(&mount_instance.cookie),
+        Some(&mount_instance.csrf),
+        json!({}),
+    )
+    .await;
+    assert_eq!(tested.status(), StatusCode::OK);
+
+    let roots = send(
+        &mount_instance.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    let roots = json_body(roots).await;
+    assert!(
+        !roots["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root["id"] == root_id),
+        "revoked grant should remove its remote root: {roots:?}"
+    );
+}
