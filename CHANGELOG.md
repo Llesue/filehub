@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.5 - 2026-11-24
+
+### Added
+
+- Remote mounts keep a WebSocket presence channel. A dropped socket marks the mount offline immediately; reconnects use exponential backoff with jitter, and older peers fall back to the health loop.
+- The sidebar shows a toast when a remote directory goes online or offline.
+
+### Fixed
+
+- EXIF make, model and lens values from Android camera uploads no longer show trailing padding bytes.
+- Exposure and f-number are formatted as `1/101 s` and `f/1.6` instead of long floating point values.
+
 ## v0.2.4 - 2026-11-24
 
 ### Added
