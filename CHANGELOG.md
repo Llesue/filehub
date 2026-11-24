@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.4 - 2026-11-24
+
+### Added
+
+- The share QR dialog can save a 1080x1440 card with the link title, QR code and URL.
+- The share page image preview supports two-finger pinch zoom and panning.
+
+### Fixed
+
+- `GET /api/v1/roots` no longer reports a reachable remote as offline. A health check from the last two minutes is trusted; only stale mounts are probed, with a 3-8 second budget.
+- Remote health checks run every 20 seconds and publish `roots.changed` when a mount comes back or drops, so the sidebar updates without a reload.
+- Opening an offline remote root clears the previous root's list and forces read-only mode; upload, delete, rename and drag-and-drop are disabled.
+- Multi-file download from a share works again: repeated form fields are parsed as a list instead of failing deserialization.
+- Dragging a text selection out of the editor or another dialog no longer closes it.
+
 ## v0.2.3 - 2026-11-23
 
 ### Added
