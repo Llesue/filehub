@@ -1094,6 +1094,7 @@ fn notify_settings_changed(state: &Arc<AppState>, keys: &[String]) {
         "settings.changed",
         json!({ "keys": keys, "at": crate::db::unix_now() }),
     );
+    crate::federation::presence::notify_all(state, "capabilities.changed", json!({ "keys": keys }));
 }
 
 fn request_is_https(headers: &HeaderMap) -> bool {

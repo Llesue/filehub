@@ -5,6 +5,7 @@
 ### Added
 
 - Remote mounts keep a WebSocket presence channel. A dropped socket marks the mount offline immediately; reconnects use exponential backoff with jitter, and older peers fall back to the health loop.
+- The channel also pushes `grant.revoked`, `token.revoked`, `capabilities.changed`, `welcome` (instance identity) and `shutdown` events; unknown events are ignored by older clients.
 - The sidebar shows a toast when a remote directory goes online or offline.
 - Offline remote roots can be reordered by dragging; the order is stored in `user_roots.sort_order`.
 - Mobile image previews use a blurred full-screen backdrop, tap to toggle the chrome, and double-tap to zoom to 150% without leaving fullscreen.

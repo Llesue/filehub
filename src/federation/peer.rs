@@ -126,8 +126,31 @@ async fn presence(
     let token_id = auth.token.id;
     let user_id = auth.token.user_id;
     let grant_id = query.grant;
-    Ok(upgrade
-        .on_upgrade(move |socket| presence_session(state, token_id, user_id, grant_id, socket)))
+    let instance_id = state
+        .db
+        .federation_instance_id()
+        .await
+        .map_err(AppError::internal)?;
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let connection = crate::federation::presence::register(&state, token_id, user_id, grant_id, tx);
+    let welcome = json!({
+        "type": "welcome",
+        "instance_id": instance_id,
+        "server_version": env!("CARGO_PKG_VERSION"),
+    });
+    Ok(upgrade.on_upgrade(move |socket| async move {
+        presence_session(
+            Arc::clone(&state),
+            token_id,
+            user_id,
+            grant_id,
+            socket,
+            rx,
+            welcome,
+        )
+        .await;
+        crate::federation::presence::unregister(&state, connection);
+    }))
 }
 
 async fn presence_session(
@@ -136,27 +159,64 @@ async fn presence_session(
     user_id: i64,
     grant_id: Option<i64>,
     mut socket: WebSocket,
+    mut events: tokio::sync::mpsc::Receiver<Value>,
+    welcome: Value,
 ) {
+    if socket
+        .send(Message::Text(welcome.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = Instant::now();
     loop {
         tokio::select! {
+            event = events.recv() => {
+                let Some(event) = event else { break };
+                let shutdown = event.get("type").and_then(Value::as_str) == Some("shutdown");
+                if socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if shutdown {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
             _ = ticker.tick() => {
                 if last_seen.elapsed() >= Duration::from_secs(45) {
                     break;
                 }
-                if !state.db.federation_token_alive(token_id).await.unwrap_or(false) {
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
-                }
-                if let Some(grant) = grant_id
-                    && state
+                let token_alive = state.db.federation_token_alive(token_id).await.unwrap_or(false);
+                let grant_revoked = match grant_id {
+                    Some(grant) => state
                         .db
                         .federation_grant_revoked(grant, user_id)
                         .await
-                        .unwrap_or(true)
-                {
+                        .unwrap_or(true),
+                    None => false,
+                };
+                if !token_alive {
+                    let _ = socket
+                        .send(Message::Text(
+                            json!({"type": "token.revoked", "token": token_id}).to_string().into(),
+                        ))
+                        .await;
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                if grant_revoked {
+                    let _ = socket
+                        .send(Message::Text(
+                            json!({"type": "grant.revoked", "grant": grant_id}).to_string().into(),
+                        ))
+                        .await;
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }

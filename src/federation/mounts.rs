@@ -1078,6 +1078,12 @@ fn schedule_capability_refresh(state: &Arc<AppState>, mount: &FederationMount) {
         }
         seen.insert(mount.id, now);
     }
+    refresh_capabilities_now(state, mount);
+}
+
+/// Fetch the peer capability list without the periodic throttle. Used when the
+/// peer tells us its capabilities changed.
+pub(crate) fn refresh_capabilities_now(state: &Arc<AppState>, mount: &FederationMount) {
     let state = Arc::clone(state);
     let mount = mount.clone();
     tokio::spawn(async move {
@@ -1096,6 +1102,11 @@ fn schedule_capability_refresh(state: &Arc<AppState>, mount: &FederationMount) {
             .db
             .federation_update_mount_capabilities(mount.id, mount.user_id, &encoded)
             .await;
+        state.events.publish(
+            "roots.changed",
+            Some(mount.user_id),
+            json!({ "user_id": mount.user_id, "root_id": mount.root_id }),
+        );
     });
 }
 

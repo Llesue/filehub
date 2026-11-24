@@ -6,6 +6,7 @@
 //! loop, so the feature degrades cleanly.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -22,6 +23,83 @@ const READ_TIMEOUT: Duration = Duration::from_secs(45);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_BACKOFF_SECS: u64 = 60;
+
+/// One server-side presence connection. Events produced elsewhere are sent
+/// through the channel so the socket itself stays owned by its session task.
+pub struct PresencePeer {
+    pub token_id: i64,
+    pub user_id: i64,
+    pub grant_id: Option<i64>,
+    pub tx: tokio::sync::mpsc::Sender<Value>,
+}
+
+static NEXT_CONNECTION: AtomicI64 = AtomicI64::new(1);
+
+pub fn register(
+    state: &Arc<AppState>,
+    token_id: i64,
+    user_id: i64,
+    grant_id: Option<i64>,
+    tx: tokio::sync::mpsc::Sender<Value>,
+) -> i64 {
+    let id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+    state.presence_peers.lock().insert(
+        id,
+        PresencePeer {
+            token_id,
+            user_id,
+            grant_id,
+            tx,
+        },
+    );
+    id
+}
+
+pub fn unregister(state: &Arc<AppState>, id: i64) {
+    state.presence_peers.lock().remove(&id);
+}
+
+fn envelope(event: &str, data: Value) -> Value {
+    let mut value = data;
+    if let Value::Object(ref mut map) = value {
+        map.insert("type".to_owned(), Value::String(event.to_owned()));
+    }
+    value
+}
+
+fn send_to(peer: &PresencePeer, event: &str, data: Value) {
+    let _ = peer.tx.try_send(envelope(event, data));
+}
+
+pub fn notify_grant(state: &Arc<AppState>, user_id: i64, grant_id: i64, event: &str, data: Value) {
+    let peers = state.presence_peers.lock();
+    for peer in peers.values() {
+        if peer.user_id == user_id && peer.grant_id == Some(grant_id) {
+            send_to(peer, event, data.clone());
+        }
+    }
+}
+
+pub fn notify_token(state: &Arc<AppState>, token_id: i64, event: &str, data: Value) {
+    let peers = state.presence_peers.lock();
+    for peer in peers.values() {
+        if peer.token_id == token_id {
+            send_to(peer, event, data.clone());
+        }
+    }
+}
+
+pub fn notify_all(state: &Arc<AppState>, event: &str, data: Value) {
+    let peers = state.presence_peers.lock();
+    for peer in peers.values() {
+        send_to(peer, event, data.clone());
+    }
+}
+
+pub async fn broadcast_shutdown(state: &Arc<AppState>) {
+    notify_all(state, "shutdown", serde_json::json!({}));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+}
 
 enum PresenceError {
     /// The peer answered the upgrade but rejected the token. Retrying cannot
@@ -232,14 +310,56 @@ async fn run_once(
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         last_seen = Instant::now();
-                        if let Ok(value) = serde_json::from_str::<Value>(&text)
-                            && value.get("type").and_then(Value::as_str) == Some("ping")
-                            && socket
-                                .send(Message::Text("{\"type\":\"pong\"}".into()))
-                                .await
-                                .is_err()
-                        {
-                            return Err(lost());
+                        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        match value.get("type").and_then(Value::as_str).unwrap_or_default() {
+                            "ping" => {
+                                if socket
+                                    .send(Message::Text("{\"type\":\"pong\"}".into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return Err(lost());
+                                }
+                            }
+                            "welcome" => {
+                                let instance = value
+                                    .get("instance_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if !instance.is_empty() && instance != mount.peer_instance_id {
+                                    let _ = state
+                                        .db
+                                        .federation_set_mount_peer_instance(mount.id, instance)
+                                        .await;
+                                    state.federation_clients.lock().remove(&mount.root_id);
+                                    state.events.publish(
+                                        "roots.changed",
+                                        Some(mount.user_id),
+                                        serde_json::json!({
+                                            "user_id": mount.user_id,
+                                            "root_id": mount.root_id,
+                                        }),
+                                    );
+                                }
+                                crate::federation::mounts::refresh_capabilities_now(state, mount);
+                            }
+                            "grant.revoked" | "token.revoked" => {
+                                let _ = crate::federation::mounts::remove_mount(
+                                    state,
+                                    mount.user_id,
+                                    mount,
+                                    Some("TOKEN_REVOKED"),
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                            "capabilities.changed" => {
+                                crate::federation::mounts::refresh_capabilities_now(state, mount);
+                            }
+                            "shutdown" => return Ok(()),
+                            _ => {}
                         }
                     }
                     Some(Ok(Message::Ping(_))) => {

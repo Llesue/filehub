@@ -199,6 +199,11 @@ pub async fn run_until(
     );
     state.start_background_tasks();
     let serve_state = Arc::clone(&state);
+    let shutdown_state = Arc::clone(&state);
+    let shutdown = async move {
+        shutdown.await;
+        crate::federation::presence::broadcast_shutdown(&shutdown_state).await;
+    };
     axum::serve(
         listener,
         router(serve_state).into_make_service_with_connect_info::<SocketAddr>(),

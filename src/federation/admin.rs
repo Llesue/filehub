@@ -142,6 +142,13 @@ pub async fn revoke_grant(
     if !changed {
         return Err(AppError::NotFound);
     }
+    crate::federation::presence::notify_grant(
+        &state,
+        current.user.id,
+        id,
+        "grant.revoked",
+        json!({ "grant": id }),
+    );
     state.events.publish(
         "roots.changed",
         Some(current.user.id),
@@ -302,6 +309,7 @@ pub async fn revoke_token(
     if !changed {
         return Err(AppError::NotFound);
     }
+    crate::federation::presence::notify_token(&state, id, "token.revoked", json!({ "token": id }));
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

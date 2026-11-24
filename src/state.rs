@@ -149,6 +149,7 @@ pub struct AppState {
     pub federation_read_counts: Mutex<HashMap<(i64, i64, i64, String), i64>>,
     pub presence_tasks: Mutex<HashMap<i64, tokio::task::JoinHandle<()>>>,
     pub presence_unsupported: Mutex<std::collections::HashSet<i64>>,
+    pub presence_peers: Mutex<HashMap<i64, crate::federation::presence::PresencePeer>>,
 }
 
 fn path_chain(target: &Path) -> Vec<String> {
@@ -289,6 +290,7 @@ impl AppState {
             federation_read_counts: Mutex::new(HashMap::new()),
             presence_tasks: Mutex::new(HashMap::new()),
             presence_unsupported: Mutex::new(std::collections::HashSet::new()),
+            presence_peers: Mutex::new(HashMap::new()),
         });
         tokio::spawn(crate::federation::mounts::health_loop(Arc::clone(&state)));
         crate::federation::presence::start(Arc::clone(&state));

@@ -1268,13 +1268,28 @@ async fn roots_trust_a_recent_health_success() {
 }
 
 #[tokio::test]
-async fn presence_websocket_rejects_missing_and_accepts_valid_tokens() {
+async fn presence_websocket_authenticates_and_pushes_events() {
+    use futures_util::StreamExt;
+
     let app = start().await;
+    let grant_id = app
+        .state
+        .db
+        .federation_create_grant(1, app.root_id, "/tmp/presence", "Presence", "ro")
+        .await
+        .unwrap();
+    let raw = "fhfed_presence_test_token";
+    let hash = filehub::auth::sha256_hex(raw);
+    app.state
+        .db
+        .federation_create_token(1, "presence", &hash, raw, None, &[grant_id])
+        .await
+        .unwrap();
+
     let ws_url = format!(
-        "{}/api/federation/v1/presence",
+        "{}/api/federation/v1/presence?grant={grant_id}",
         app.base.replace("http://", "ws://")
     );
-
     let missing = tokio_tungstenite::connect_async(ws_url.clone()).await;
     match missing {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
@@ -1283,20 +1298,40 @@ async fn presence_websocket_rejects_missing_and_accepts_valid_tokens() {
         other => panic!("expected 401, got {other:?}"),
     }
 
-    let raw = "fhfed_presence_test_token";
-    let hash = filehub::auth::sha256_hex(raw);
-    app.state
-        .db
-        .federation_create_token(1, "presence", &hash, raw, None, &[])
-        .await
-        .unwrap();
-    let mut request = ws_url.clone().into_client_request().expect("request");
+    let mut request = ws_url.into_client_request().expect("request");
     request
         .headers_mut()
         .insert("authorization", format!("Bearer {raw}").parse().unwrap());
     let (mut socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("authorized upgrade");
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("welcome timeout")
+        .expect("welcome frame")
+        .expect("welcome ok");
+    let welcome: serde_json::Value = serde_json::from_str(welcome.to_text().unwrap()).unwrap();
+    assert_eq!(welcome["type"], "welcome");
+    assert!(
+        welcome["instance_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    filehub::federation::presence::notify_grant(
+        &app.state,
+        1,
+        grant_id,
+        "grant.revoked",
+        json!({ "grant": grant_id }),
+    );
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("event timeout")
+        .expect("event frame")
+        .expect("event ok");
+    let event: serde_json::Value = serde_json::from_str(event.to_text().unwrap()).unwrap();
+    assert_eq!(event["type"], "grant.revoked");
     socket.close(None).await.unwrap();
 }
 
