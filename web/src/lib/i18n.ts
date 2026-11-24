@@ -316,6 +316,8 @@ const en: Record<string, string> = {
   // Shared actions, states and errors
   '请求失败，请稍后重试': 'Request failed, please try again later',
   已复制到剪贴板: 'Copied to clipboard',
+  '切换预览（Ctrl/⌘+Shift+P）': 'Toggle preview (Ctrl/Cmd+Shift+P)',
+  '保存（Ctrl/⌘+S）': 'Save (Ctrl/Cmd+S)',
   '浏览器没有授予剪贴板权限，无法复制。':
     'The browser did not grant clipboard permission, so copying failed.',
   复制失败: 'Copy failed',

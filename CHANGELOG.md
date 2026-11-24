@@ -12,6 +12,7 @@
 - The sidebar shows a toast when a remote directory goes online or offline.
 - Every sidebar group can be reordered by dragging, not just offline roots. Only the dragged group's slots are permuted, so a root that goes offline keeps its position when it returns.
 - Avatar and display-name changes push `owner.changed`; `welcome` carries the owner name and avatar version so reconnects align immediately.
+- The Markdown editor toggles preview and editing with `Ctrl/Cmd+Shift+P`, and `Ctrl/Cmd+S` saves without closing the editor.
 - Mobile image previews use a blurred full-screen backdrop, tap to toggle the chrome, and double-tap to zoom to 150% without leaving fullscreen.
 
 ### Fixed

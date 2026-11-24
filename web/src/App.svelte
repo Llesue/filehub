@@ -677,7 +677,18 @@
       }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's' && editorOpen) {
         event.preventDefault();
-        void saveEditor();
+        void saveEditor(false, false, false);
+        return;
+      }
+      if (
+        (event.metaKey || event.ctrlKey) &&
+        event.shiftKey &&
+        event.key.toLowerCase() === 'p' &&
+        editorOpen &&
+        isMarkdown(editorName)
+      ) {
+        event.preventDefault();
+        toggleEditorPreview();
         return;
       }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a' && !typing) {
@@ -4042,7 +4053,11 @@
     return editorContent.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
   }
 
-  async function saveEditor(auto = false, force = false): Promise<void> {
+  async function saveEditor(
+    auto = false,
+    force = false,
+    closeAfter = true,
+  ): Promise<void> {
     if (activeRootId === null || !editorOpen || editorReadOnly || currentReadOnly) return;
     editorSaving = true;
     editorError = '';
@@ -4059,7 +4074,8 @@
       );
       editorEtag = saved.etag;
       editorOriginalContent = editorContent;
-      if (!auto) closeEditor(true);
+      if (!auto && closeAfter) closeEditor(true);
+      if (!auto && !closeAfter) showToast(t($language, '已保存'));
       clearDirSizeCache();
       await loadList(activeRootId, currentPath);
     } catch (error) {
@@ -6304,7 +6320,13 @@
           {/if}
           <div class="editor-actions">
             {#if isMarkdown(editorName)}
-              <button type="button" class="ghost" onclick={() => toggleEditorPreview()}>
+              <button
+                type="button"
+                class="ghost"
+                title={t($language, '切换预览（Ctrl/⌘+Shift+P）')}
+                aria-keyshortcuts="Control+Shift+P Meta+Shift+P"
+                onclick={() => toggleEditorPreview()}
+              >
                 {editorPreview ? t($language, '编辑') : t($language, '预览')}
               </button>
             {/if}
@@ -6387,7 +6409,9 @@
                 type="button"
                 class="primary"
                 disabled={editorSaving}
-                onclick={() => void saveEditor()}
+                title={t($language, '保存（Ctrl/⌘+S）')}
+                aria-keyshortcuts="Control+S Meta+S"
+                onclick={() => void saveEditor(false, false, false)}
               >
                 {editorSaving ? t($language, '保存中…') : t($language, '保存')}
               </button>
