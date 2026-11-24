@@ -170,28 +170,107 @@ fn image_info(path: &Path) -> Option<Value> {
     Some(image)
 }
 
+fn clean_ascii(bytes: &[u8]) -> String {
+    // Camera firmware often pads ASCII fields with NUL or 0xFF. The exif
+    // crate prints those padding bytes, which surfaced as trailing garbage.
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0 || *byte == 0xFF)
+        .unwrap_or(bytes.len());
+    let mut slice = &bytes[..end];
+    while matches!(slice.last(), Some(b' ') | Some(b'\t')) {
+        slice = &slice[..slice.len() - 1];
+    }
+    String::from_utf8_lossy(slice).trim().to_owned()
+}
+
+fn ascii_field(field: &exif::Field) -> Option<String> {
+    match &field.value {
+        exif::Value::Ascii(parts) => {
+            let text = clean_ascii(parts.first()?);
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn rational_field(field: &exif::Field) -> Option<f64> {
+    match &field.value {
+        exif::Value::Rational(values) => values
+            .first()
+            .filter(|value| value.denom != 0)
+            .map(|value| f64::from(value.num) / f64::from(value.denom)),
+        _ => None,
+    }
+}
+
+fn trim_decimal(value: f64, digits: usize) -> String {
+    let text = format!("{value:.digits$}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+fn format_exposure(seconds: f64) -> String {
+    if seconds <= 0.0 {
+        return String::new();
+    }
+    if seconds < 1.0 {
+        format!("1/{} s", (1.0 / seconds).round() as u64)
+    } else {
+        format!("{} s", trim_decimal(seconds, 2))
+    }
+}
+
 fn exif_info(path: &Path) -> Option<Value> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
     let mut info = serde_json::Map::new();
-    let fields = [
+
+    for (key, tag) in [
         ("make", exif::Tag::Make),
         ("model", exif::Tag::Model),
         ("lens", exif::Tag::LensModel),
         ("taken_at", exif::Tag::DateTimeOriginal),
-        ("exposure", exif::Tag::ExposureTime),
-        ("f_number", exif::Tag::FNumber),
-        ("iso", exif::Tag::PhotographicSensitivity),
-        ("focal_length", exif::Tag::FocalLength),
-    ];
-    for (key, tag) in fields {
-        if let Some(field) = exif.get_field(tag, exif::In::PRIMARY) {
-            info.insert(
-                key.to_owned(),
-                Value::String(field.display_value().with_unit(&exif).to_string()),
-            );
+    ] {
+        if let Some(field) = exif.get_field(tag, exif::In::PRIMARY)
+            && let Some(text) = ascii_field(field)
+        {
+            info.insert(key.to_owned(), Value::String(text));
         }
+    }
+    if let Some(field) = exif.get_field(exif::Tag::ExposureTime, exif::In::PRIMARY)
+        && let Some(seconds) = rational_field(field)
+    {
+        info.insert(
+            "exposure".to_owned(),
+            Value::String(format_exposure(seconds)),
+        );
+    }
+    if let Some(field) = exif.get_field(exif::Tag::FNumber, exif::In::PRIMARY)
+        && let Some(value) = rational_field(field)
+    {
+        info.insert(
+            "f_number".to_owned(),
+            Value::String(format!("f/{}", trim_decimal(value, 1))),
+        );
+    }
+    if let Some(field) = exif.get_field(exif::Tag::PhotographicSensitivity, exif::In::PRIMARY) {
+        let value = field
+            .value
+            .get_uint(0)
+            .map(|value| Value::String(value.to_string()))
+            .or_else(|| ascii_field(field).map(Value::String));
+        if let Some(value) = value {
+            info.insert("iso".to_owned(), value);
+        }
+    }
+    if let Some(field) = exif.get_field(exif::Tag::FocalLength, exif::In::PRIMARY)
+        && let Some(value) = rational_field(field)
+    {
+        info.insert(
+            "focal_length".to_owned(),
+            Value::String(format!("{} mm", trim_decimal(value, 1))),
+        );
     }
     if let Some(field) = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         && let Some(value) = field.value.get_uint(0)
@@ -223,5 +302,33 @@ fn io_error(error: std::io::Error) -> AppError {
         std::io::ErrorKind::NotFound => AppError::NotFound,
         std::io::ErrorKind::PermissionDenied => AppError::Forbidden,
         _ => AppError::internal(anyhow::Error::from(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_fields_stop_at_padding_bytes() {
+        assert_eq!(clean_ascii(b"Xiaomi\xff\xff\xff"), "Xiaomi");
+        assert_eq!(clean_ascii(b"24094RAD4C\0\0"), "24094RAD4C");
+        assert_eq!(clean_ascii(b"  Pixel 9  \0"), "Pixel 9");
+        assert_eq!(clean_ascii(b"\0\0\0"), "");
+    }
+
+    #[test]
+    fn exposure_is_printed_as_a_handheld_shutter_speed() {
+        assert_eq!(format_exposure(1.0 / 101.0101), "1/101 s");
+        assert_eq!(format_exposure(0.5), "1/2 s");
+        assert_eq!(format_exposure(2.0), "2 s");
+        assert_eq!(format_exposure(1.6), "1.6 s");
+    }
+
+    #[test]
+    fn decimals_do_not_keep_trailing_zeros() {
+        assert_eq!(trim_decimal(1.590000, 1), "1.6");
+        assert_eq!(trim_decimal(4.0, 1), "4");
+        assert_eq!(trim_decimal(4.94, 1), "4.9");
     }
 }
