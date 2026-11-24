@@ -1734,6 +1734,22 @@ impl Db {
         .await
     }
 
+    pub async fn reorder_roots(&self, user_id: i64, ids: &[i64]) -> anyhow::Result<()> {
+        let ids = ids.to_vec();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            for (index, id) in ids.iter().enumerate() {
+                transaction.execute(
+                    "UPDATE user_roots SET sort_order = ?1 WHERE id = ?2 AND user_id = ?3",
+                    params![index as i64, id, user_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn update_root(
         &self,
         id: i64,

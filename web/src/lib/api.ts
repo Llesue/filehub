@@ -1856,6 +1856,14 @@ export const api = {
     return `${BASE}/download/zip/form`;
   },
 
+  async reorderRoots(ids: number[], csrf: string): Promise<void> {
+    await request<{ ok: boolean }>(
+      '/roots/order',
+      { method: 'PUT', body: JSON.stringify({ ids }) },
+      csrf,
+    );
+  },
+
   async downloadZip(root: number, paths: string[], csrf: string): Promise<Blob> {
     const response = await fetch(`${BASE}/download/zip`, {
       method: 'POST',

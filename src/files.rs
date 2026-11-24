@@ -81,6 +81,45 @@ pub async fn roots(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RootOrderRequest {
+    ids: Vec<i64>,
+}
+
+/// Persist the sidebar order. The request must list every visible root once so
+/// a stale client cannot silently drop or duplicate one.
+pub async fn reorder_roots(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<RootOrderRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    let roots = state
+        .db
+        .list_roots(current.user.id)
+        .await
+        .map_err(AppError::internal)?;
+    if request.ids.len() != roots.len() || request.ids.len() > 500 {
+        return Err(AppError::bad_request(
+            "root order must list every root once",
+        ));
+    }
+    let existing: std::collections::HashSet<i64> = roots.iter().map(|root| root.id).collect();
+    let submitted: std::collections::HashSet<i64> = request.ids.iter().copied().collect();
+    if submitted.len() != request.ids.len() || submitted != existing {
+        return Err(AppError::bad_request(
+            "root order does not match the current roots",
+        ));
+    }
+    state
+        .db
+        .reorder_roots(current.user.id, &request.ids)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ListQuery {
     root: i64,
     path: Option<String>,

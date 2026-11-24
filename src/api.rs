@@ -144,6 +144,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             put(crate::branding::put_custom_css).delete(crate::branding::delete_custom_css),
         )
         .route("/roots", get(crate::files::roots))
+        .route("/roots/order", put(crate::files::reorder_roots))
         .route("/list", get(crate::files::list))
         .route("/fs/dir-size", get(crate::files::dir_size))
         .route("/properties", get(crate::properties::properties))

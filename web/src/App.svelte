@@ -526,29 +526,6 @@
     void loadList(root.id, '');
   }
 
-  function openOfflineRoot(root: Root): void {
-    appView = 'files';
-    activeRootId = root.id;
-    currentReadOnly = true;
-    currentReadOnlyReason = 'offline';
-    void (async () => {
-      await loadList(root.id, '');
-      confirmState = {
-        title: t($language, '远程目录已离线'),
-        message: t($language, '目标目录恢复连接前无法浏览或修改。'),
-        requireText: null,
-        action: () => {
-          confirmState = null;
-          const fallback = localRoots[0];
-          if (fallback) {
-            activeRootId = fallback.id;
-            void loadList(fallback.id, '');
-          }
-        },
-      };
-    })();
-  }
-
   function remoteTitle(rootId: number, fallback: string): string {
     const mount = remoteMounts[rootId];
     if (!mount) return fallback;
@@ -1328,6 +1305,63 @@
   /// Refresh the sidebar roots after an admin change without resetting the
   /// current browse position unless the root disappeared.
   const rootNoticeAt: Record<string, number> = {};
+  let draggingRootId = $state<number | null>(null);
+  let dragOverRootId = $state<number | null>(null);
+  let reorderingRoots = $state(false);
+
+  function onRootDragStart(event: DragEvent, root: Root): void {
+    draggingRootId = root.id;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', String(root.id));
+    }
+  }
+
+  function onRootDragOver(event: DragEvent, root: Root): void {
+    if (draggingRootId === null || draggingRootId === root.id) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    dragOverRootId = root.id;
+  }
+
+  function onRootDragEnd(): void {
+    draggingRootId = null;
+    dragOverRootId = null;
+  }
+
+  function onRootDrop(event: DragEvent, target: Root): void {
+    event.preventDefault();
+    const fromId = draggingRootId;
+    draggingRootId = null;
+    dragOverRootId = null;
+    if (fromId === null || fromId === target.id) return;
+    void moveRoot(fromId, target.id);
+  }
+
+  async function moveRoot(fromId: number, toId: number): Promise<void> {
+    const from = roots.findIndex((root) => root.id === fromId);
+    const to = roots.findIndex((root) => root.id === toId);
+    if (from < 0 || to < 0 || from === to) return;
+    const previous = roots;
+    const next = [...roots];
+    const [moved] = next.splice(from, 1);
+    if (!moved) return;
+    next.splice(to, 0, moved);
+    roots = next;
+    reorderingRoots = true;
+    try {
+      await api.reorderRoots(
+        next.map((root) => root.id),
+        csrf,
+      );
+    } catch (error) {
+      roots = previous;
+      showToast(t($language, '排序保存失败'));
+      console.warn('root reorder failed', error);
+    } finally {
+      reorderingRoots = false;
+    }
+  }
   let rootStatusTimer: number | null = null;
   function scheduleRootStatusRefresh(): void {
     if (rootStatusTimer !== null) window.clearTimeout(rootStatusTimer);
@@ -2005,11 +2039,7 @@
       return;
     }
     if (error instanceof ApiError && error.code === 'REMOTE_OFFLINE') {
-      showNotice(
-        t($language, '对端服务器没有响应，请检查网络或对端是否在线。'),
-        'error',
-        t($language, '远程服务器不可达'),
-      );
+      showToast(t($language, '远程目录已离线，暂时无法访问'));
       void refreshRootStatus();
       return;
     }
@@ -4473,11 +4503,22 @@
             {#if offlineOpen}
               {#each offlineRemoteRoots as root (root.id)}
                 {@const remote = remoteMounts[root.id]}
-                <button
-                  type="button"
+                <div
                   class="nav-item offline"
+                  role="button"
+                  aria-disabled="true"
+                  tabindex="-1"
+                  class:dragging={draggingRootId === root.id}
+                  class:drag-over={dragOverRootId === root.id}
+                  draggable={!reorderingRoots}
                   title={remoteTitle(root.id, rootLabel(root.alias))}
-                  onclick={() => openOfflineRoot(root)}
+                  ondragstart={(event) => onRootDragStart(event, root)}
+                  ondragover={(event) => onRootDragOver(event, root)}
+                  ondragleave={() => {
+                    if (dragOverRootId === root.id) dragOverRootId = null;
+                  }}
+                  ondrop={(event) => onRootDrop(event, root)}
+                  ondragend={onRootDragEnd}
                 >
                   {#if remote?.avatar_version && !avatarFailures[`${root.id}:${remote?.avatar_version ?? 0}`]}
                     <img
@@ -4504,7 +4545,7 @@
                     aria-label={remoteStateBadge(root)}
                     title={remoteStateBadge(root)}
                   ></span>
-                </button>
+                </div>
               {/each}
             {/if}
           {/if}
@@ -6622,6 +6663,20 @@
 
   .nav-item.offline {
     opacity: 0.65;
+    cursor: not-allowed;
+  }
+
+  .nav-item.offline.dragging {
+    opacity: 0.35;
+  }
+
+  .nav-item.offline.drag-over {
+    outline: 2px dashed var(--accent);
+    outline-offset: -2px;
+  }
+
+  .nav-item.offline[draggable='true'] {
+    cursor: grab;
   }
 
   .nav-state {

@@ -679,3 +679,53 @@ async fn zip_form_accepts_repeated_paths_and_csrf() {
     assert!(archive.by_name("hello.txt").is_ok());
     assert_eq!(archive.len(), 2, "both selected paths should be zipped");
 }
+
+#[tokio::test]
+async fn root_order_can_be_reordered_and_rejects_partial_sets() {
+    let app = setup_app().await;
+    let extra = app
+        .state
+        .db
+        .ensure_root(1, app.home.join("extra").to_str().unwrap(), "Extra", false)
+        .await
+        .unwrap();
+
+    let reordered = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/roots/order",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({ "ids": [extra, app.root_id] }),
+    )
+    .await;
+    assert_eq!(reordered.status(), StatusCode::OK);
+
+    let roots = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    let roots = json_body(roots).await;
+    let ids: Vec<i64> = roots["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| root["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![extra, app.root_id]);
+
+    let partial = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/roots/order",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({ "ids": [app.root_id] }),
+    )
+    .await;
+    assert_eq!(partial.status(), StatusCode::BAD_REQUEST);
+}
