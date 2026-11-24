@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { api, type Entry } from '../api';
   import { audioState, setAudioPlaying } from '../audio';
   import Icon from './Icon.svelte';
@@ -502,6 +502,13 @@
 
   let touchStartX = 0;
   let touchStartY = 0;
+  let mobile = $state(false);
+  let chromeHidden = $state(false);
+  let tapTimer: number | null = null;
+  let lastTap = 0;
+  let frameEl = $state<HTMLElement | null>(null);
+  let pinchCenterX = 0;
+  let pinchCenterY = 0;
   let pinching = false;
   let pinchStartDistance = 0;
   let pinchStartZoom = 1;
@@ -521,9 +528,55 @@
     };
   }
 
+  onMount(() => {
+    mobile = window.matchMedia('(pointer: coarse)').matches;
+  });
+
+  function onStageClick(): void {
+    if (!mobile) {
+      if (dragged) {
+        dragged = false;
+        return;
+      }
+      onClose();
+      return;
+    }
+    if (dragged || pinching) {
+      dragged = false;
+      return;
+    }
+    const now = Date.now();
+    if (now - lastTap <= 300) {
+      if (tapTimer) {
+        window.clearTimeout(tapTimer);
+        tapTimer = null;
+      }
+      lastTap = 0;
+      chromeHidden = true;
+      zoom = zoom > 1.01 ? 1 : 1.5;
+      offsetX = 0;
+      offsetY = 0;
+      return;
+    }
+    lastTap = now;
+    if (tapTimer) window.clearTimeout(tapTimer);
+    tapTimer = window.setTimeout(() => {
+      tapTimer = null;
+      lastTap = 0;
+      chromeHidden = !chromeHidden;
+    }, 280);
+  }
+
   function onTouchStart(event: TouchEvent): void {
     if (event.touches.length === 2) {
       const metrics = pinchMetrics(event.touches);
+      const rect = frameEl?.getBoundingClientRect();
+      pinchCenterX = rect ? rect.left + rect.width / 2 : window.innerWidth / 2;
+      pinchCenterY = rect ? rect.top + rect.height / 2 : window.innerHeight / 2;
+      if (tapTimer) {
+        window.clearTimeout(tapTimer);
+        tapTimer = null;
+      }
       pinching = true;
       dragging = false;
       pinchStartDistance = Math.max(1, metrics.distance);
@@ -550,8 +603,8 @@
     );
     const ratio = target / pinchStartZoom;
     zoom = target;
-    offsetX = metrics.midX - (pinchStartMidX - pinchStartOffsetX) * ratio;
-    offsetY = metrics.midY - (pinchStartMidY - pinchStartOffsetY) * ratio;
+    offsetX = metrics.midX - pinchCenterX - (pinchStartMidX - pinchCenterX - pinchStartOffsetX) * ratio;
+    offsetY = metrics.midY - pinchCenterY - (pinchStartMidY - pinchCenterY - pinchStartOffsetY) * ratio;
   }
 
   function onTouchEnd(event: TouchEvent): void {
@@ -588,15 +641,18 @@
   function startDrag(event: PointerEvent): void {
     event.preventDefault();
     dragging = true;
-    dragged = true;
+    dragged = false;
     dragStart = { x: event.clientX, y: event.clientY, offsetX, offsetY };
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
   }
 
   function drag(event: PointerEvent): void {
     if (!dragging) return;
-    offsetX = dragStart.offsetX + event.clientX - dragStart.x;
-    offsetY = dragStart.offsetY + event.clientY - dragStart.y;
+    const dx = event.clientX - dragStart.x;
+    const dy = event.clientY - dragStart.y;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) dragged = true;
+    offsetX = dragStart.offsetX + dx;
+    offsetY = dragStart.offsetY + dy;
   }
 
   function endDrag(): void {
@@ -650,7 +706,20 @@
 
 <svelte:window onkeydown={onKeydown} onpointermove={drag} onpointerup={endDrag} />
 
-<div class="lightbox" role="presentation" onclick={onClose}>
+<div
+  class="lightbox"
+  class:mobile
+  class:chrome-hidden={chromeHidden}
+  role="presentation"
+  onclick={onClose}
+>
+  {#if mobile && current}
+    <div
+      class="lightbox-blur"
+      style={`background-image:url("${thumbSrcFor?.(current) ?? previewSrc}")`}
+      aria-hidden="true"
+    ></div>
+  {/if}
   <header class="lightbox-bar" role="presentation" onclick={(event) => event.stopPropagation()}>
     <strong><FileName name={current?.name ?? ''} /></strong>
     <div class="lightbox-actions">
@@ -680,12 +749,9 @@
     ontouchend={onTouchEnd}
     ontouchcancel={onTouchEnd}
     role="presentation"
-    onclick={() => {
-      if (dragged || pinching) {
-        dragged = false;
-        return;
-      }
-      onClose();
+    onclick={(event) => {
+      event.stopPropagation();
+      onStageClick();
     }}
     onwheel={zoomBy}
   >
@@ -730,6 +796,7 @@
       {:else}
         <div
           class="preview-frame"
+          bind:this={frameEl}
           class:ready={frameReady}
           class:natural={naturalWidth > 0 && !isSvgPreview}
           style={`--ratio:${frameRatio};--natural:${naturalWidth}px;transform:translate(${offsetX}px, ${offsetY}px) scale(${zoom})`}
@@ -751,8 +818,9 @@
               src={previewSrc}
               alt={current.name}
               onclick={(event) => {
-                if (dragged) dragged = false;
                 event.stopPropagation();
+                if (mobile) onStageClick();
+                else if (dragged) dragged = false;
               }}
               onpointerdown={startDrag}
               onpointerup={endDrag}
@@ -863,6 +931,53 @@
     flex-direction: column;
     background: var(--scrim-strong);
     color: var(--lightbox-fg);
+  }
+
+  .lightbox-blur {
+    position: absolute;
+    inset: -12%;
+    z-index: 0;
+    background-position: center;
+    background-size: cover;
+    filter: blur(32px) brightness(0.55);
+    transform: scale(1.08);
+    pointer-events: none;
+  }
+
+  .lightbox-bar,
+  .lightbox-stage,
+  .lightbox-footer {
+    position: relative;
+    z-index: 1;
+  }
+
+  .lightbox-bar,
+  .lightbox-footer {
+    transition: opacity 0.18s ease;
+  }
+
+  .lightbox.chrome-hidden .lightbox-bar,
+  .lightbox.chrome-hidden .lightbox-footer {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .lightbox.mobile .lightbox-stage {
+    padding: 0;
+  }
+
+  .lightbox.mobile .preview-frame {
+    width: 100vw;
+    max-width: none;
+    max-height: none;
+    border-radius: 0;
+  }
+
+  .lightbox.mobile .preview-frame .preview-hi {
+    width: 100%;
+    max-width: none;
+    max-height: none;
+    height: auto;
   }
 
   .lightbox-bar,
