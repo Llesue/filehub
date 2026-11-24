@@ -1,8 +1,9 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -98,6 +99,48 @@ async fn authenticate(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Peer
         .map_err(AppError::internal)?;
     let _ = state.db.federation_touch_token(token.id).await;
     Ok(PeerAuth { token, grants })
+}
+
+/// Live presence socket. The mounting side holds this open and treats a
+/// disconnect as "peer offline", which is faster than the health loop.
+async fn presence(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, AppError> {
+    authenticate(&state, &headers).await?;
+    Ok(upgrade.on_upgrade(presence_session))
+}
+
+async fn presence_session(mut socket: WebSocket) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_seen = Instant::now();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if last_seen.elapsed() >= Duration::from_secs(45) {
+                    break;
+                }
+                if socket
+                    .send(Message::Text("{\"type\":\"ping\"}".into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Text(_)))
+                    | Some(Ok(Message::Ping(_)))
+                    | Some(Ok(Message::Pong(_))) => last_seen = Instant::now(),
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
@@ -297,6 +340,7 @@ pub fn router() -> axum::Router<Arc<AppState>> {
     use axum::routing::{get, post, put};
     axum::Router::new()
         .route("/info", get(info))
+        .route("/presence", get(presence))
         .route("/grants", get(grants))
         .route("/avatar", get(avatar))
         .route("/list", get(list))

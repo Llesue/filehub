@@ -717,6 +717,26 @@
     const unsubscribeEvents = realtimeEvent.subscribe((event) => {
       if (!event) return;
       if (event.type === 'roots.changed') {
+        const rootId = Number(event.data.root_id ?? 0);
+        const online = event.data.online;
+        if (rootId && typeof online === 'boolean') {
+          const root = roots.find((item) => item.id === rootId);
+          const key = `${rootId}:${online}`;
+          const now = Date.now();
+          if (
+            root &&
+            root.online !== undefined &&
+            root.online !== online &&
+            now - (rootNoticeAt[key] ?? 0) > 5_000
+          ) {
+            rootNoticeAt[key] = now;
+            showToast(
+              online
+                ? t($language, '远程目录「{alias}」已上线', { alias: rootLabel(root.alias) })
+                : t($language, '远程目录「{alias}」已离线', { alias: rootLabel(root.alias) }),
+            );
+          }
+        }
         scheduleRootStatusRefresh();
         return;
       }
@@ -1307,6 +1327,7 @@
 
   /// Refresh the sidebar roots after an admin change without resetting the
   /// current browse position unless the root disappeared.
+  const rootNoticeAt: Record<string, number> = {};
   let rootStatusTimer: number | null = null;
   function scheduleRootStatusRefresh(): void {
     if (rootStatusTimer !== null) window.clearTimeout(rootStatusTimer);

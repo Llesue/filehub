@@ -147,6 +147,8 @@ pub struct AppState {
     pub federation_cache: FederationCache,
     pub federation_streams: Mutex<HashMap<i64, Arc<Semaphore>>>,
     pub federation_read_counts: Mutex<HashMap<(i64, i64, i64, String), i64>>,
+    pub presence_tasks: Mutex<HashMap<i64, tokio::task::JoinHandle<()>>>,
+    pub presence_unsupported: Mutex<std::collections::HashSet<i64>>,
 }
 
 fn path_chain(target: &Path) -> Vec<String> {
@@ -285,8 +287,11 @@ impl AppState {
             federation_cache: Mutex::new(HashMap::new()),
             federation_streams: Mutex::new(HashMap::new()),
             federation_read_counts: Mutex::new(HashMap::new()),
+            presence_tasks: Mutex::new(HashMap::new()),
+            presence_unsupported: Mutex::new(std::collections::HashSet::new()),
         });
         tokio::spawn(crate::federation::mounts::health_loop(Arc::clone(&state)));
+        crate::federation::presence::start(Arc::clone(&state));
         tokio::spawn(crate::federation::peer::read_flush_loop(Arc::clone(&state)));
         state.updates.start_loop(Arc::clone(&state));
         state.schedule_directory_size_counts_refresh();

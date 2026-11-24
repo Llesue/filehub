@@ -92,6 +92,8 @@ const en: Record<string, string> = {
   '没有更多目录': 'No more folders',
   '远程目录的令牌或授权已失效，请在挂载设置中重新连接。': 'The remote token or grant is no longer valid. Reconnect it from mount settings.',
   '远程服务器不可达': 'Remote server unreachable',
+  '远程目录「{alias}」已上线': 'Remote directory "{alias}" is online',
+  '远程目录「{alias}」已离线': 'Remote directory "{alias}" is offline',
   '远程目录离线，无法操作': 'The remote directory is offline; changes are disabled',
   '离线（只读）': 'Offline (read-only)',
   '保存分享卡片': 'Save share card',

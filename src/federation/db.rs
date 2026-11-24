@@ -785,6 +785,23 @@ impl Db {
         .await
     }
 
+    pub async fn federation_mount_any(&self, id: i64) -> anyhow::Result<Option<FederationMount>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, user_id, root_id, base_url, grant_id, grant_label, mode, \
+                            peer_version, capabilities, token_ciphertext, created_at, \
+                            last_ok_at, last_error, last_error_code, owner_name, avatar_version, \
+                            peer_instance_id \
+                     FROM federation_mounts WHERE id = ?1",
+                    params![id],
+                    mount_from_row,
+                )
+                .optional()
+        })
+        .await
+    }
+
     pub async fn federation_delete_mount(&self, id: i64, user_id: i64) -> anyhow::Result<bool> {
         self.call(move |connection| {
             let root_id: Option<i64> = connection

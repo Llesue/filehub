@@ -4,6 +4,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 
 struct Instance {
@@ -14,6 +15,7 @@ struct Instance {
     cookie: String,
     csrf: String,
     root_id: i64,
+    _server: tokio::task::JoinHandle<()>,
 }
 
 async fn start() -> Instance {
@@ -25,7 +27,7 @@ async fn start() -> Instance {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let served = router.clone();
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         let _ = axum::serve(listener, served).await;
     });
 
@@ -93,6 +95,7 @@ async fn start() -> Instance {
         cookie,
         csrf,
         root_id,
+        _server: server,
     }
 }
 
@@ -1261,5 +1264,119 @@ async fn roots_trust_a_recent_health_success() {
             .iter()
             .any(|root| root["id"] == root_id && root["online"] == true),
         "recent health success should be trusted: {roots:?}"
+    );
+}
+
+#[tokio::test]
+async fn presence_websocket_rejects_missing_and_accepts_valid_tokens() {
+    let app = start().await;
+    let ws_url = format!(
+        "{}/api/federation/v1/presence",
+        app.base.replace("http://", "ws://")
+    );
+
+    let missing = tokio_tungstenite::connect_async(ws_url.clone()).await;
+    match missing {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED)
+        }
+        other => panic!("expected 401, got {other:?}"),
+    }
+
+    let raw = "fhfed_presence_test_token";
+    let hash = filehub::auth::sha256_hex(raw);
+    app.state
+        .db
+        .federation_create_token(1, "presence", &hash, raw, None, &[])
+        .await
+        .unwrap();
+    let mut request = ws_url.clone().into_client_request().expect("request");
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {raw}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("authorized upgrade");
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn presence_marks_the_mount_offline_when_the_socket_closes() {
+    let app = start().await;
+    // Minimal peer that accepts the upgrade and immediately drops the socket.
+    let peer = axum::Router::new().route(
+        "/api/federation/v1/presence",
+        axum::routing::get(|upgrade: axum::extract::ws::WebSocketUpgrade| async move {
+            upgrade.on_upgrade(|_socket| async {})
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, peer).await;
+    });
+
+    let root_id = app
+        .state
+        .db
+        .federation_add_remote_root(1, "Presence", "/__filehub_remote__/presence", true)
+        .await
+        .unwrap();
+    let key = filehub::federation::crypto::mount_key(&app.state.db)
+        .await
+        .unwrap();
+    let ciphertext = filehub::federation::crypto::encrypt(&key, "presence-token").unwrap();
+    let mount_id = app
+        .state
+        .db
+        .federation_create_mount(
+            1,
+            root_id,
+            &format!("http://{addr}"),
+            1,
+            "Presence",
+            "ro",
+            "",
+            "[]",
+            &ciphertext,
+            "",
+            0,
+            "presence-peer",
+        )
+        .await
+        .unwrap();
+    app.state
+        .db
+        .federation_bind_root(root_id, mount_id)
+        .await
+        .unwrap();
+
+    let mut events = app.state.events.subscribe();
+    filehub::federation::presence::ensure(&app.state, mount_id);
+    let offline = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Ok(event) = events.recv().await {
+            if event.event == "roots.changed"
+                && event
+                    .data
+                    .get("root_id")
+                    .and_then(serde_json::Value::as_i64)
+                    == Some(root_id)
+                && event
+                    .data
+                    .get("online")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    server.abort();
+    assert!(
+        offline,
+        "closed presence socket should mark the mount offline"
     );
 }

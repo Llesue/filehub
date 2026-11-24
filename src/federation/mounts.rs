@@ -570,6 +570,7 @@ async fn mount_inner(
         .db
         .federation_update_mount_state(mount_id, true, None, None)
         .await;
+    crate::federation::presence::ensure(state, mount_id);
     Ok((mount_id, root_id, alias, mode))
 }
 
@@ -946,7 +947,7 @@ async fn refresh_mount_health(
             state.events.publish(
                 "roots.changed",
                 Some(mount.user_id),
-                json!({ "user_id": mount.user_id, "root_id": mount.root_id }),
+                json!({ "user_id": mount.user_id, "root_id": mount.root_id, "online": true }),
             );
         }
         return Ok(HealthOutcome {
@@ -1003,7 +1004,7 @@ async fn refresh_mount_health(
         state.events.publish(
             "roots.changed",
             Some(mount.user_id),
-            json!({ "user_id": mount.user_id, "root_id": mount.root_id }),
+            json!({ "user_id": mount.user_id, "root_id": mount.root_id, "online": false }),
         );
     }
     Ok(HealthOutcome {
@@ -1209,6 +1210,7 @@ pub(crate) async fn remove_mount(
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
+    crate::federation::presence::stop(state, mount.id);
     let deleted = state
         .db
         .federation_delete_mount(mount.id, user_id)
@@ -1497,6 +1499,9 @@ pub async fn test(
             )
             .await;
     }
+    if outcome.online {
+        crate::federation::presence::ensure(&state, id);
+    }
     Ok(Json(json!({
         "ok": outcome.online,
         "removed": outcome.removed,
@@ -1583,6 +1588,7 @@ pub async fn reauth(
         .await
         .map_err(AppError::internal)?;
     state.federation_clients.lock().remove(&mount.root_id);
+    crate::federation::presence::ensure(&state, id);
     Ok(Json(json!({ "ok": true })))
 }
 

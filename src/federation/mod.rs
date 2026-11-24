@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod db;
 pub mod mounts;
 pub mod peer;
+pub mod presence;
 pub mod proxy;
 pub mod ssrf;
 
