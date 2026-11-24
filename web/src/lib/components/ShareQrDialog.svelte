@@ -6,6 +6,7 @@
   import { language, t } from '../i18n';
   import { overlayGuard } from '../overlayGuard';
   import Icon from './Icon.svelte';
+  import FileTypeIcon from './FileTypeIcon.svelte';
 
   let {
     url,
@@ -25,6 +26,9 @@
 
   let cardUrl = $state('');
   let failed = $state(false);
+  let iconHost: HTMLElement | null = $state(null);
+  const kind = $derived(isCollection ? 'folder' : isDir ? 'folder' : classifyFile(title));
+  const tile = $derived(tileStyle(kind, title));
 
   function roundRect(
     ctx: CanvasRenderingContext2D,
@@ -129,42 +133,46 @@
     ctx.font = `400 22px ${font}`;
     ctx.fillText(t($language, '自托管文件管理器'), 206, 180);
 
-    const kind: FileKind = isCollection
-      ? 'folder'
-      : isDir
-        ? 'folder'
-        : classifyFile(title);
-    const tile = tileStyle(kind, title);
     roundRect(ctx, 96, 280, 108, 108, 26);
     ctx.fillStyle = tile.background;
     ctx.fill();
-    ctx.strokeStyle = tile.foreground;
-    ctx.fillStyle = tile.foreground;
-    ctx.lineWidth = 5;
-    if (kind === 'folder' || isCollection) {
-      roundRect(ctx, 122, 306, 34, 16, 6);
-      ctx.fill();
-      roundRect(ctx, 118, 316, 64, 44, 10);
-      ctx.fill();
-    } else {
-      ctx.beginPath();
-      ctx.moveTo(128, 294);
-      ctx.lineTo(158, 294);
-      ctx.lineTo(178, 314);
-      ctx.lineTo(178, 344);
-      ctx.lineTo(128, 344);
-      ctx.closePath();
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(158, 294);
-      ctx.lineTo(158, 314);
-      ctx.lineTo(178, 314);
-      ctx.stroke();
+
+    const source = iconHost?.querySelector('svg');
+    let iconDrawn = false;
+    if (source) {
+      const clone = source.cloneNode(true) as SVGElement;
+      clone.style.color = tile.foreground;
+      clone.setAttribute('width', '64');
+      clone.setAttribute('height', '64');
+      const markup = new XMLSerializer().serializeToString(clone);
+      const icon = new Image();
+      icon.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(markup)}`;
+      try {
+        await icon.decode();
+        const iconSize = kind === 'folder' || isCollection ? 64 : 58;
+        const iconY = kind === 'folder' || isCollection ? 302 : 294;
+        ctx.drawImage(icon, 150 - iconSize / 2, iconY, iconSize, iconSize);
+        iconDrawn = true;
+      } catch (error) {
+        console.warn('share card icon failed', error);
+      }
+    }
+    if (!iconDrawn) {
+      ctx.strokeStyle = tile.foreground;
+      ctx.fillStyle = tile.foreground;
+      ctx.lineWidth = 5;
+      if (kind === 'folder' || isCollection) {
+        roundRect(ctx, 122, 306, 34, 16, 6);
+        ctx.fill();
+        roundRect(ctx, 118, 316, 64, 44, 10);
+        ctx.fill();
+      }
     }
     if (kind !== 'folder' && !isCollection) {
+      ctx.fillStyle = tile.foreground;
       ctx.font = `700 ${tile.label.length > 3 ? 18 : 21}px ${font}`;
       ctx.textAlign = 'center';
-      ctx.fillText(tile.label, 150, 374);
+      ctx.fillText(tile.label, 150, 380);
       ctx.textAlign = 'left';
     }
 
@@ -276,6 +284,14 @@
       <p class="qr-message">{t($language, '生成中…')}</p>
     {/if}
   </section>
+  <span
+    class="icon-source"
+    bind:this={iconHost}
+    style={`color:${tile.foreground}`}
+    aria-hidden="true"
+  >
+    <FileTypeIcon name={title} isDir={isDir || isCollection} size={64} />
+  </span>
 </div>
 
 <style>
@@ -364,6 +380,14 @@
     border: 1px solid var(--border);
     background: var(--surface);
     color: var(--text);
+  }
+
+  .icon-source {
+    position: absolute;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+    pointer-events: none;
   }
 
   .qr-message {
