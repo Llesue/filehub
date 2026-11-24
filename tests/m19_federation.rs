@@ -1298,7 +1298,7 @@ async fn presence_websocket_authenticates_and_pushes_events() {
         other => panic!("expected 401, got {other:?}"),
     }
 
-    let mut request = ws_url.into_client_request().expect("request");
+    let mut request = ws_url.clone().into_client_request().expect("request");
     request
         .headers_mut()
         .insert("authorization", format!("Bearer {raw}").parse().unwrap());
@@ -1332,6 +1332,33 @@ async fn presence_websocket_authenticates_and_pushes_events() {
         .expect("event ok");
     let event: serde_json::Value = serde_json::from_str(event.to_text().unwrap()).unwrap();
     assert_eq!(event["type"], "grant.revoked");
+
+    // Auth events close the socket, so use a fresh connection for the next one.
+    let mut request = ws_url.into_client_request().expect("request");
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {raw}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("second upgrade");
+    let _welcome = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("second welcome timeout")
+        .expect("second welcome frame")
+        .expect("second welcome ok");
+    filehub::federation::presence::notify_token(
+        &app.state,
+        1,
+        "token.rotated",
+        json!({ "token": 1 }),
+    );
+    let rotated = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("rotate timeout")
+        .expect("rotate frame")
+        .expect("rotate ok");
+    let rotated: serde_json::Value = serde_json::from_str(rotated.to_text().unwrap()).unwrap();
+    assert_eq!(rotated["type"], "token.rotated");
     socket.close(None).await.unwrap();
 }
 

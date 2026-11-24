@@ -176,7 +176,10 @@ async fn presence_session(
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
-                let shutdown = event.get("type").and_then(Value::as_str) == Some("shutdown");
+                let close = matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("shutdown" | "token.revoked" | "token.rotated" | "grant.revoked")
+                );
                 if socket
                     .send(Message::Text(event.to_string().into()))
                     .await
@@ -184,7 +187,7 @@ async fn presence_session(
                 {
                     break;
                 }
-                if shutdown {
+                if close {
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }

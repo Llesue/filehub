@@ -345,7 +345,7 @@ async fn run_once(
                                 }
                                 crate::federation::mounts::refresh_capabilities_now(state, mount);
                             }
-                            "grant.revoked" | "token.revoked" => {
+                            "grant.revoked" | "token.revoked" | "token.rotated" => {
                                 let _ = crate::federation::mounts::remove_mount(
                                     state,
                                     mount.user_id,

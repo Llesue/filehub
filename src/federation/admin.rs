@@ -332,5 +332,8 @@ pub async fn rotate_token(
     if !changed {
         return Err(AppError::NotFound);
     }
+    // The stored ciphertext on every mount still holds the old token. Push
+    // the change and close those sockets so clients do not keep using it.
+    crate::federation::presence::notify_token(&state, id, "token.rotated", json!({ "token": id }));
     Ok(Json(json!({ "id": id, "token": raw, "prefix": prefix })))
 }
