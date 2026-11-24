@@ -6,11 +6,16 @@
 
 - Remote mounts keep a WebSocket presence channel. A dropped socket marks the mount offline immediately; reconnects use exponential backoff with jitter, and older peers fall back to the health loop.
 - The sidebar shows a toast when a remote directory goes online or offline.
+- Offline remote roots can be reordered by dragging; the order is stored in `user_roots.sort_order`.
+- Mobile image previews use a blurred full-screen backdrop, tap to toggle the chrome, and double-tap to zoom to 150% without leaving fullscreen.
 
 ### Fixed
 
 - EXIF make, model and lens values from Android camera uploads no longer show trailing padding bytes.
 - Exposure and f-number are formatted as `1/101 s` and `f/1.6` instead of long floating point values.
+- Pinch zoom keeps the image anchored under the fingers.
+- Offline remote roots are no longer clickable and no longer open a blocking dialog.
+- A revoked token removes the mount as soon as the peer answers 401/403.
 
 ## v0.2.4 - 2026-11-24
 

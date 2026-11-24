@@ -195,6 +195,26 @@ paths:
                         online:
                           type: boolean
                           description: 远程根为最近一次探测结果；本地根始终为 true。探测失败、超时、token 或 grant 失效均为 false。
+  /api/v1/roots/order:
+    put:
+      tags: [files]
+      summary: 保存侧栏根目录顺序
+      description: 必须提交当前用户全部可见 root 的 id，各一次；按提交顺序写入 sort_order。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  maxItems: 500
+                  items: { type: integer, format: int64 }
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
   /api/v1/branding:
     get:
       tags: [branding]
