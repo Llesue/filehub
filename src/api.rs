@@ -37,7 +37,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route(
             "/remote/grants/{id}",
-            axum::routing::delete(crate::federation::admin::revoke_grant),
+            put(crate::federation::admin::update_grant)
+                .delete(crate::federation::admin::revoke_grant),
         )
         .route(
             "/remote/tokens",

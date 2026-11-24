@@ -1524,3 +1524,100 @@ async fn revoked_grant_removes_the_mount_on_the_next_health_check() {
         "revoked grant should remove its remote root: {roots:?}"
     );
 }
+
+#[tokio::test]
+async fn grant_update_changes_label_and_mode() {
+    let app = start().await;
+    let grant = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/remote/grants",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "shared", "label": "Shared", "mode": "rw"}),
+    )
+    .await;
+    let grant_id = json_body(grant).await["id"].as_i64().unwrap();
+
+    let updated = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/remote/grants/{grant_id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"label": "Renamed", "mode": "ro"}),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+
+    let list = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/remote/grants",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    let list = json_body(list).await;
+    let grant = list["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == grant_id)
+        .unwrap();
+    assert_eq!(grant["label"], "Renamed");
+    assert_eq!(grant["mode"], "ro");
+}
+
+#[tokio::test]
+async fn disabling_inbound_rejects_federation_requests() {
+    let app = start().await;
+    let grant = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/remote/grants",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "shared", "label": "Shared", "mode": "rw"}),
+    )
+    .await;
+    let grant_id = json_body(grant).await["id"].as_i64().unwrap();
+    let token = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/remote/tokens",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"name": "inbound", "grant_ids": [grant_id]}),
+    )
+    .await;
+    let token = json_body(token).await["token"].as_str().unwrap().to_owned();
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/federation/v1/grants")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let ok = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    app.state
+        .db
+        .upsert_settings_batch(vec![(
+            "federation.enabled_inbound".to_owned(),
+            "false".to_owned(),
+        )])
+        .await
+        .unwrap();
+    app.state.reload_settings(true).await.unwrap();
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/federation/v1/grants")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let blocked = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+}

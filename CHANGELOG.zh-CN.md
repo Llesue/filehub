@@ -6,6 +6,9 @@
 
 - 远程挂载之间保持 WebSocket 在线通道。连接断开立即标记离线；重连使用带抖动的指数退避；旧版本对端自动退回健康轮询。
 - 通道同时推送 `grant.revoked`、`token.revoked`、`capabilities.changed`、`welcome`（实例身份）和 `shutdown` 事件；旧客户端忽略未知事件。
+- `grant.updated` 推送别名/模式变化；`welcome` 和每次心跳携带 token 前缀，事件丢失也能在心跳周期内发现轮换。
+- 健康检查改为每个挂载独立任务、10 秒预算，不可达对端不会拖住正常挂载。
+- 联邦请求会校验 `federation.enabled_inbound`、共享功能开关和用户禁用状态。
 - 远程目录上线或离线时，侧栏弹出 toast 提醒。
 - 离线远程目录支持拖动排序，顺序保存到 `user_roots.sort_order`。
 - 手机图片预览改为模糊全屏背景；单击切换界面元素，双击放大到 150% 且保持全屏。

@@ -92,6 +92,21 @@ async fn authenticate(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Peer
     {
         return Err(AppError::TooManyRequests);
     }
+    if !state.settings().settings.federation.enabled_inbound {
+        return Err(AppError::Forbidden);
+    }
+    let user = state
+        .db
+        .find_user_by_id(token.user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::Unauthorized)?;
+    if user.disabled {
+        return Err(AppError::Unauthorized);
+    }
+    if !user.feature_federation_share {
+        return Err(AppError::Forbidden);
+    }
     let grants = state
         .db
         .federation_token_grants(token.id)
@@ -125,6 +140,7 @@ async fn presence(
     }
     let token_id = auth.token.id;
     let user_id = auth.token.user_id;
+    let token_prefix = auth.token.prefix.clone();
     let grant_id = query.grant;
     let instance_id = state
         .db
@@ -137,13 +153,17 @@ async fn presence(
         "type": "welcome",
         "instance_id": instance_id,
         "server_version": env!("CARGO_PKG_VERSION"),
+        "token_prefix": token_prefix,
     });
     Ok(upgrade.on_upgrade(move |socket| async move {
         presence_session(
             Arc::clone(&state),
-            token_id,
-            user_id,
-            grant_id,
+            PresenceIdentity {
+                token_id,
+                user_id,
+                grant_id,
+                token_prefix,
+            },
             socket,
             rx,
             welcome,
@@ -153,15 +173,26 @@ async fn presence(
     }))
 }
 
-async fn presence_session(
-    state: Arc<AppState>,
+struct PresenceIdentity {
     token_id: i64,
     user_id: i64,
     grant_id: Option<i64>,
+    token_prefix: String,
+}
+
+async fn presence_session(
+    state: Arc<AppState>,
+    identity: PresenceIdentity,
     mut socket: WebSocket,
     mut events: tokio::sync::mpsc::Receiver<Value>,
     welcome: Value,
 ) {
+    let PresenceIdentity {
+        token_id,
+        user_id,
+        grant_id,
+        token_prefix,
+    } = identity;
     if socket
         .send(Message::Text(welcome.to_string().into()))
         .await
@@ -197,6 +228,21 @@ async fn presence_session(
                     break;
                 }
                 let token_alive = state.db.federation_token_alive(token_id).await.unwrap_or(false);
+                let current_prefix = state
+                    .db
+                    .federation_token_prefix(token_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let inbound = state.settings().settings.federation.enabled_inbound;
+                let user_ok = state
+                    .db
+                    .find_user_by_id(user_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|user| !user.disabled && user.feature_federation_share);
                 let grant_revoked = match grant_id {
                     Some(grant) => state
                         .db
@@ -205,10 +251,19 @@ async fn presence_session(
                         .unwrap_or(true),
                     None => false,
                 };
-                if !token_alive {
+                if !token_alive || !inbound || !user_ok {
                     let _ = socket
                         .send(Message::Text(
                             json!({"type": "token.revoked", "token": token_id}).to_string().into(),
+                        ))
+                        .await;
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                if current_prefix != token_prefix {
+                    let _ = socket
+                        .send(Message::Text(
+                            json!({"type": "token.rotated", "token": token_id}).to_string().into(),
                         ))
                         .await;
                     let _ = socket.send(Message::Close(None)).await;
@@ -223,8 +278,12 @@ async fn presence_session(
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }
+                let ping = json!({
+                    "type": "ping",
+                    "token_prefix": token_prefix,
+                });
                 if socket
-                    .send(Message::Text("{\"type\":\"ping\"}".into()))
+                    .send(Message::Text(ping.to_string().into()))
                     .await
                     .is_err()
                 {

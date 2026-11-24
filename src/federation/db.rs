@@ -93,6 +93,40 @@ impl Db {
         .await
     }
 
+    pub async fn federation_update_mount_grant(
+        &self,
+        id: i64,
+        user_id: i64,
+        label: Option<&str>,
+        mode: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let label = label.map(str::to_owned);
+        let mode = mode.map(str::to_owned);
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE federation_mounts SET grant_label = COALESCE(?1, grant_label), \
+                        mode = COALESCE(?2, mode) \
+                 WHERE id = ?3 AND user_id = ?4",
+                params![label, mode, id, user_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn federation_token_prefix(&self, id: i64) -> anyhow::Result<Option<String>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT prefix FROM federation_tokens WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .await
+    }
+
     pub async fn federation_token_alive(&self, id: i64) -> anyhow::Result<bool> {
         self.call(move |connection| {
             let row: Option<(i64, Option<i64>)> = connection
@@ -174,6 +208,27 @@ impl Db {
                 params![user_id, root_id, real_path, label, mode, unix_now()],
             )?;
             Ok(connection.last_insert_rowid())
+        })
+        .await
+    }
+
+    pub async fn federation_update_grant(
+        &self,
+        id: i64,
+        user_id: i64,
+        label: Option<&str>,
+        mode: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let label = label.map(str::to_owned);
+        let mode = mode.map(str::to_owned);
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "UPDATE federation_grants SET label = COALESCE(?1, label), \
+                        mode = COALESCE(?2, mode) \
+                 WHERE id = ?3 AND user_id = ?4 AND revoked = 0",
+                params![label, mode, id, user_id],
+            )?;
+            Ok(changed > 0)
         })
         .await
     }

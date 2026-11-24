@@ -289,6 +289,7 @@ async fn run_once(
     let lost = || PresenceError::Transport { connected: true };
     tracing::debug!(mount = mount.id, "presence websocket connected");
 
+    let mut baseline_prefix: Option<String> = None;
     let mut ticker = tokio::time::interval(PING_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = Instant::now();
@@ -315,6 +316,24 @@ async fn run_once(
                         };
                         match value.get("type").and_then(Value::as_str).unwrap_or_default() {
                             "ping" => {
+                                if let Some(prefix) =
+                                    value.get("token_prefix").and_then(Value::as_str)
+                                {
+                                    match &baseline_prefix {
+                                        Some(current) if current != prefix => {
+                                            let _ = crate::federation::mounts::remove_mount(
+                                                state,
+                                                mount.user_id,
+                                                mount,
+                                                Some("TOKEN_ROTATED"),
+                                            )
+                                            .await;
+                                            return Ok(());
+                                        }
+                                        Some(_) => {}
+                                        None => baseline_prefix = Some(prefix.to_owned()),
+                                    }
+                                }
                                 if socket
                                     .send(Message::Text("{\"type\":\"pong\"}".into()))
                                     .await
@@ -324,6 +343,11 @@ async fn run_once(
                                 }
                             }
                             "welcome" => {
+                                if let Some(prefix) =
+                                    value.get("token_prefix").and_then(Value::as_str)
+                                {
+                                    baseline_prefix = Some(prefix.to_owned());
+                                }
                                 let instance = value
                                     .get("instance_id")
                                     .and_then(Value::as_str)
@@ -357,6 +381,27 @@ async fn run_once(
                             }
                             "capabilities.changed" => {
                                 crate::federation::mounts::refresh_capabilities_now(state, mount);
+                            }
+                            "grant.updated" => {
+                                let label = value.get("label").and_then(Value::as_str);
+                                let mode = value.get("mode").and_then(Value::as_str);
+                                let _ = state
+                                    .db
+                                    .federation_update_mount_grant(
+                                        mount.id,
+                                        mount.user_id,
+                                        label,
+                                        mode,
+                                    )
+                                    .await;
+                                state.events.publish(
+                                    "roots.changed",
+                                    Some(mount.user_id),
+                                    serde_json::json!({
+                                        "user_id": mount.user_id,
+                                        "root_id": mount.root_id,
+                                    }),
+                                );
                             }
                             "shutdown" => return Ok(()),
                             _ => {}

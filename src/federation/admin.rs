@@ -126,6 +126,52 @@ pub async fn list_grants(
     Ok(Json(json!({ "grants": items })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateGrantRequest {
+    label: Option<String>,
+    mode: Option<String>,
+}
+
+pub async fn update_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<UpdateGrantRequest>,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    require_share(&state, &current.user)?;
+    let mode = match request.mode.as_deref() {
+        None => None,
+        Some("ro" | "rw") => request.mode.as_deref(),
+        Some(_) => return Err(AppError::bad_request("mode must be ro or rw")),
+    };
+    let label = request
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if label.is_none() && mode.is_none() {
+        return Err(AppError::bad_request("nothing to update"));
+    }
+    let changed = state
+        .db
+        .federation_update_grant(id, current.user.id, label, mode)
+        .await
+        .map_err(AppError::internal)?;
+    if !changed {
+        return Err(AppError::NotFound);
+    }
+    crate::federation::presence::notify_grant(
+        &state,
+        current.user.id,
+        id,
+        "grant.updated",
+        json!({ "grant": id, "label": label, "mode": mode }),
+    );
+    Ok(Json(json!({ "id": id, "label": label, "mode": mode })))
+}
+
 pub async fn revoke_grant(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

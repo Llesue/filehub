@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use futures_util::StreamExt;
 use std::time::Instant;
 
 use axum::Json;
@@ -723,15 +722,53 @@ pub(crate) async fn health_loop(state: Arc<AppState>) {
                 continue;
             }
         };
-        let check_state = Arc::clone(&state);
-        futures_util::stream::iter(mounts)
-            .for_each_concurrent(4, move |mount| {
-                let state = Arc::clone(&check_state);
-                async move {
-                    health_check(&state, mount).await;
+        // Every mount gets its own task and a hard per-mount budget. A dead
+        // peer must not hold a shared slot while a healthy mount waits.
+        let mut tasks = Vec::with_capacity(mounts.len());
+        for mount in mounts {
+            let state = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                let id = mount.id;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    refresh_mount_health(&state, &mount),
+                )
+                .await
+                {
+                    Ok(Ok(_outcome)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(mount = id, %error, "federation health check failed");
+                    }
+                    Err(_) => {
+                        tracing::warn!(mount = id, "federation health check timed out");
+                        let previous = state.db.federation_mount_any(id).await.ok().flatten();
+                        let _ = state
+                            .db
+                            .federation_update_mount_state(
+                                id,
+                                false,
+                                Some("health check timed out"),
+                                Some("TIMEOUT"),
+                            )
+                            .await;
+                        if let Some(mount) = previous {
+                            state.events.publish(
+                                "roots.changed",
+                                Some(mount.user_id),
+                                json!({
+                                    "user_id": mount.user_id,
+                                    "root_id": mount.root_id,
+                                    "online": false,
+                                }),
+                            );
+                        }
+                    }
                 }
-            })
-            .await;
+            }));
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }
 }
@@ -1034,12 +1071,6 @@ async fn refresh_mount_health(
         active_url: None,
         latency_ms: first.map(|check| check.latency_ms).unwrap_or_default(),
     })
-}
-
-async fn health_check(state: &Arc<AppState>, mount: FederationMount) {
-    if let Err(error) = refresh_mount_health(state, &mount).await {
-        tracing::warn!(mount = mount.id, %error, "federation health check failed");
-    }
 }
 
 fn prune_avatar_cache(state: &Arc<AppState>, mount_id: i64, keep_version: i64) {
