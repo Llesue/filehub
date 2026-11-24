@@ -698,14 +698,12 @@
         const online = event.data.online;
         if (rootId && typeof online === 'boolean') {
           const root = roots.find((item) => item.id === rootId);
+          const previous = rootOnlineSeen[rootId];
+          rootOnlineSeen[rootId] = online;
+          const changed = previous === undefined ? !online : previous !== online;
           const key = `${rootId}:${online}`;
           const now = Date.now();
-          if (
-            root &&
-            root.online !== undefined &&
-            root.online !== online &&
-            now - (rootNoticeAt[key] ?? 0) > 5_000
-          ) {
+          if (root && changed && now - (rootNoticeAt[key] ?? 0) > 5_000) {
             rootNoticeAt[key] = now;
             showToast(
               online
@@ -1305,6 +1303,7 @@
   /// Refresh the sidebar roots after an admin change without resetting the
   /// current browse position unless the root disappeared.
   const rootNoticeAt: Record<string, number> = {};
+  const rootOnlineSeen: Record<number, boolean> = {};
   let draggingRootId = $state<number | null>(null);
   let dragOverRootId = $state<number | null>(null);
   let reorderingRoots = $state(false);

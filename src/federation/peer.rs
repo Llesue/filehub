@@ -147,6 +147,12 @@ async fn presence(
         .federation_instance_id()
         .await
         .map_err(AppError::internal)?;
+    tracing::info!(
+        token = token_id,
+        user = user_id,
+        grant = grant_id,
+        "presence client connected"
+    );
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let connection = crate::federation::presence::register(&state, token_id, user_id, grant_id, tx);
     let owner = state
@@ -183,6 +189,11 @@ async fn presence(
         )
         .await;
         crate::federation::presence::unregister(&state, connection);
+        tracing::info!(
+            token = token_id,
+            grant = grant_id,
+            "presence client disconnected"
+        );
     }))
 }
 

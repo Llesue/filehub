@@ -19,6 +19,7 @@
 - EXIF make, model and lens values from Android camera uploads no longer show trailing padding bytes.
 - Exposure and f-number are formatted as `1/101 s` and `f/1.6` instead of long floating point values.
 - Pinch zoom keeps the image anchored under the fingers.
+- Online/offline toasts now follow the event stream, so a parallel health refresh cannot swallow the transition.
 - Offline remote roots are no longer clickable and no longer open a blocking dialog.
 - A revoked token removes the mount as soon as the peer answers 401/403.
 - Revoking a grant, or deleting the shared directory, now removes the mount instead of leaving it looking online while every browse fails.

@@ -208,10 +208,12 @@ async fn run_mount(state: Arc<AppState>, mount: super::db::FederationMount) {
         };
         match run_once(&state, &current).await {
             Ok(()) => {
+                tracing::info!(mount = current.id, "presence closed");
                 mark(&state, &current, false, Some("presence_closed"), None).await;
                 backoff = 1;
             }
             Err(PresenceError::Auth) => {
+                tracing::warn!(mount = current.id, "presence rejected the token");
                 // The peer rejected the token. Remove the mount so a revoked
                 // directory disappears instead of sitting there as offline.
                 let _ = mark(&state, &current, false, None, Some("UNAUTHORIZED")).await;
@@ -233,6 +235,7 @@ async fn run_mount(state: Arc<AppState>, mount: super::db::FederationMount) {
                 return;
             }
             Err(PresenceError::Transport { connected }) => {
+                tracing::warn!(mount = current.id, connected, "presence transport failed");
                 if connected {
                     mark(&state, &current, false, Some("presence_unreachable"), None).await;
                     backoff = 1;
@@ -321,7 +324,7 @@ async fn run_once(
         return Err(PresenceError::Auth);
     }
     let lost = || PresenceError::Transport { connected: true };
-    tracing::debug!(mount = mount.id, "presence websocket connected");
+    tracing::info!(mount = mount.id, peer = %mount.base_url, "presence connected");
 
     let mut baseline_prefix: Option<String> = None;
     let mut ticker = tokio::time::interval(PING_INTERVAL);
@@ -348,7 +351,12 @@ async fn run_once(
                         let Ok(value) = serde_json::from_str::<Value>(&text) else {
                             continue;
                         };
-                        match value.get("type").and_then(Value::as_str).unwrap_or_default() {
+                        let event_type = value
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        tracing::debug!(mount = mount.id, event = event_type, "presence event");
+                        match event_type {
                             "ping" => {
                                 if let Some(prefix) =
                                     value.get("token_prefix").and_then(Value::as_str)
