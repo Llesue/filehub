@@ -1999,6 +1999,27 @@ impl Db {
         .await
     }
 
+    /// Removes index rows for paths that no longer exist on disk. Called from
+    /// search after existence checks, so a stale index heals itself.
+    pub async fn delete_index_entries_by_path(&self, paths: Vec<String>) -> anyhow::Result<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let mut removed = 0usize;
+            for path in &paths {
+                removed += transaction.execute(
+                    "DELETE FROM index_entries WHERE real_path = ?1",
+                    params![path],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(removed)
+        })
+        .await
+    }
+
     pub async fn mark_index_stale(&self, real_path: &str) -> anyhow::Result<()> {
         let real_path = real_path.to_owned();
         self.call(move |connection| {

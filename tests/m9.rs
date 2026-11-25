@@ -125,6 +125,22 @@ async fn json_body(response: Response<Body>) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+async fn search_names(app: &TestApp, query: &str) -> Vec<String> {
+    let uri = format!(
+        "/api/v1/search?q={}&root={}",
+        percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC),
+        app.root_id
+    );
+    let response = send(&app.router, Method::GET, &uri, Some(&app.cookie), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
 async fn wait_job(app: &TestApp, id: &str) -> Value {
     for _ in 0..200 {
         let response = send(
@@ -1423,4 +1439,79 @@ async fn external_path_alias_rename_updates_assigned_roots() {
         .find(|root| root["id"].as_i64() == Some(root_id))
         .unwrap();
     assert_eq!(root["alias"], "Beta");
+}
+
+#[tokio::test]
+async fn search_hides_and_removes_deleted_files() {
+    let app = setup_app().await;
+    std::fs::write(app.home.join("stale-marker.txt"), b"gone soon").unwrap();
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert!(
+        search_names(&app, "stale")
+            .await
+            .contains(&"stale-marker.txt".to_owned())
+    );
+
+    // Delete outside FileHub; the index still has the row, but search must not
+    // return it and must clean the row in the background.
+    std::fs::remove_file(app.home.join("stale-marker.txt")).unwrap();
+    let names = search_names(&app, "stale").await;
+    assert!(
+        !names.contains(&"stale-marker.txt".to_owned()),
+        "deleted file leaked into search: {names:?}"
+    );
+
+    let mut cleaned = false;
+    for _ in 0..100 {
+        let response = send(
+            &app.router,
+            Method::GET,
+            "/api/v1/search?q=stale&root=1",
+            Some(&app.cookie),
+            None,
+        )
+        .await;
+        let body = json_body(response).await;
+        if body["entries"].as_array().unwrap().is_empty() {
+            cleaned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(cleaned, "stale search row was not removed");
+}
+
+#[tokio::test]
+async fn quick_scan_purges_a_deleted_parent_tree() {
+    let app = setup_app().await;
+    std::fs::create_dir_all(app.home.join("gone/inner")).unwrap();
+    std::fs::write(app.home.join("gone/inner/lost-note.txt"), b"lost").unwrap();
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert!(
+        search_names(&app, "lost")
+            .await
+            .contains(&"lost-note.txt".to_owned())
+    );
+
+    // Remove the whole parent tree outside FileHub; the root itself stays
+    // readable, so the scan must treat it as deleted, not as an offline disk.
+    std::fs::remove_dir_all(app.home.join("gone")).unwrap();
+    let cancel = CancellationToken::new();
+    let mut progress = |_checked: usize, _total: usize| {};
+    filehub::indexer::quick_scan(&app.state, &cancel, &mut progress)
+        .await
+        .unwrap();
+
+    let names = search_names(&app, "lost").await;
+    assert!(
+        !names.contains(&"lost-note.txt".to_owned()),
+        "deleted subtree leaked into search: {names:?}"
+    );
+    let inner = app.home.join("gone/inner").to_string_lossy().to_string();
+    assert!(
+        app.state.db.index_status(&inner).await.unwrap().is_none(),
+        "indexed_dirs for the deleted subtree still exists"
+    );
 }

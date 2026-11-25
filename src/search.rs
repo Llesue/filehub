@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -161,6 +162,67 @@ pub struct SearchQuery {
     kind: Option<String>,
 }
 
+async fn filter_missing_entries(
+    state: &Arc<AppState>,
+    entries: Vec<crate::db::IndexEntry>,
+) -> Vec<crate::db::IndexEntry> {
+    if entries.is_empty() {
+        return entries;
+    }
+    let checks = entries.iter().map(|entry| {
+        let path = entry.real_path.clone();
+        async move {
+            match tokio::fs::symlink_metadata(&path).await {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                // Permission or transient IO errors are not proof of deletion.
+                Err(_) => true,
+            }
+        }
+    });
+    let Ok(results) = tokio::time::timeout(
+        Duration::from_millis(2000),
+        futures_util::future::join_all(checks),
+    )
+    .await
+    else {
+        // A slow network filesystem must not break search; return the index
+        // view and let the next scan reconcile it.
+        return entries;
+    };
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut missing = Vec::new();
+    for (entry, exists) in entries.into_iter().zip(results) {
+        if exists {
+            kept.push(entry);
+        } else {
+            missing.push((entry.real_path.clone(), entry.is_dir));
+        }
+    }
+    if !missing.is_empty() {
+        schedule_missing_cleanup(state, missing);
+    }
+    kept
+}
+
+fn schedule_missing_cleanup(state: &Arc<AppState>, missing: Vec<(String, bool)>) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let paths: Vec<String> = missing.iter().map(|(path, _)| path.clone()).collect();
+        if let Err(error) = state.db.delete_index_entries_by_path(paths).await {
+            tracing::warn!(%error, "failed to drop stale search entries");
+        }
+        let dirs: Vec<std::path::PathBuf> = missing
+            .iter()
+            .filter(|(_, is_dir)| *is_dir)
+            .map(|(path, _)| std::path::PathBuf::from(path))
+            .collect();
+        if !dirs.is_empty() {
+            state.schedule_cache_cleanup(dirs);
+        }
+    });
+}
+
 pub async fn search(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -229,6 +291,7 @@ pub async fn search(
         )
         .await
         .map_err(AppError::internal)?;
+    let entries = filter_missing_entries(&state, entries).await;
     let root_prefix = root.real_path.trim_end_matches(['/', '\\']);
 
     let results: Vec<Value> = entries
@@ -409,6 +472,7 @@ pub async fn search_all(
             .await
             .map_err(AppError::internal)?
     };
+    let entries = filter_missing_entries(&state, entries).await;
     if started.elapsed().as_millis() >= 500 {
         tracing::warn!(
             roots = roots.len(),

@@ -477,6 +477,7 @@ pub async fn quick_scan(
                 apply_quick_scan_batch(
                     state,
                     batch,
+                    &roots,
                     &mut stats,
                     &mut parents,
                     &mut new_dir_candidates,
@@ -510,6 +511,7 @@ pub async fn quick_scan(
 async fn apply_quick_scan_batch(
     state: &Arc<AppState>,
     batch: QuickScanBatch,
+    roots: &[String],
     stats: &mut QuickScanStats,
     parents: &mut HashSet<PathBuf>,
     new_dir_candidates: &mut HashSet<String>,
@@ -599,16 +601,25 @@ async fn apply_quick_scan_batch(
     }
     if !missing_targets.is_empty() {
         let mut stale_only = Vec::new();
+        // If the root itself is reachable, a vanished parent means the
+        // directory tree was deleted or moved, not that a disk is offline.
+        let reachable: Vec<&String> = roots
+            .iter()
+            .filter(|root| std::path::Path::new(root).is_dir())
+            .collect();
         for target in &missing_targets {
-            // A missing parent usually means the whole mount is offline.
-            // Keep the index so it can be reused when the mount returns.
             let parent_exists = target.parent().is_some_and(|parent| parent.is_dir());
-            let remove = parent_exists
-                && match tokio::fs::metadata(target).await {
+            let remove = if parent_exists {
+                match tokio::fs::metadata(target).await {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                     Ok(metadata) if !metadata.is_dir() => true,
                     _ => false,
-                };
+                }
+            } else {
+                reachable
+                    .iter()
+                    .any(|root| crate::platform::path_within(target, std::path::Path::new(root)))
+            };
             if remove {
                 let prefix = target.to_string_lossy().to_string();
                 loop {

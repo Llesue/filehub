@@ -24,6 +24,8 @@
 - Offline remote roots are no longer clickable and no longer open a blocking dialog.
 - A revoked token removes the mount as soon as the peer answers 401/403.
 - Revoking a grant, or deleting the shared directory, now removes the mount instead of leaving it looking online while every browse fails.
+- Search hides index rows whose paths no longer exist and removes them in the background.
+- A quick scan now treats a vanished parent under a reachable root as a deletion, instead of keeping it as if it were an offline disk.
 
 ## v0.2.4 - 2026-11-24
 
