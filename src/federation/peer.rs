@@ -197,6 +197,12 @@ async fn presence(
     }))
 }
 
+async fn send_frame(socket: &mut WebSocket, message: Message) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), socket.send(message))
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
 struct PresenceIdentity {
     token_id: i64,
     user_id: i64,
@@ -217,33 +223,31 @@ async fn presence_session(
         grant_id,
         token_prefix,
     } = identity;
-    if socket
-        .send(Message::Text(welcome.to_string().into()))
-        .await
-        .is_err()
-    {
+    if !send_frame(&mut socket, Message::Text(welcome.to_string().into())).await {
         return;
     }
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = Instant::now();
+    let shutdown = state.shutdown.clone();
     loop {
         tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                let _ = send_frame(&mut socket, Message::Close(None)).await;
+                break;
+            }
             event = events.recv() => {
                 let Some(event) = event else { break };
                 let close = matches!(
                     event.get("type").and_then(Value::as_str),
                     Some("shutdown" | "token.revoked" | "token.rotated" | "grant.revoked")
                 );
-                if socket
-                    .send(Message::Text(event.to_string().into()))
-                    .await
-                    .is_err()
-                {
+                if !send_frame(&mut socket, Message::Text(event.to_string().into())).await {
                     break;
                 }
                 if close {
-                    let _ = socket.send(Message::Close(None)).await;
+                    let _ = send_frame(&mut socket, Message::Close(None)).await;
                     break;
                 }
             }
@@ -276,41 +280,43 @@ async fn presence_session(
                     None => false,
                 };
                 if !token_alive || !inbound || !user_ok {
-                    let _ = socket
-                        .send(Message::Text(
+                    let _ = send_frame(
+                        &mut socket,
+                        Message::Text(
                             json!({"type": "token.revoked", "token": token_id}).to_string().into(),
-                        ))
-                        .await;
-                    let _ = socket.send(Message::Close(None)).await;
+                        ),
+                    )
+                    .await;
+                    let _ = send_frame(&mut socket, Message::Close(None)).await;
                     break;
                 }
                 if current_prefix != token_prefix {
-                    let _ = socket
-                        .send(Message::Text(
+                    let _ = send_frame(
+                        &mut socket,
+                        Message::Text(
                             json!({"type": "token.rotated", "token": token_id}).to_string().into(),
-                        ))
-                        .await;
-                    let _ = socket.send(Message::Close(None)).await;
+                        ),
+                    )
+                    .await;
+                    let _ = send_frame(&mut socket, Message::Close(None)).await;
                     break;
                 }
                 if grant_revoked {
-                    let _ = socket
-                        .send(Message::Text(
+                    let _ = send_frame(
+                        &mut socket,
+                        Message::Text(
                             json!({"type": "grant.revoked", "grant": grant_id}).to_string().into(),
-                        ))
-                        .await;
-                    let _ = socket.send(Message::Close(None)).await;
+                        ),
+                    )
+                    .await;
+                    let _ = send_frame(&mut socket, Message::Close(None)).await;
                     break;
                 }
                 let ping = json!({
                     "type": "ping",
                     "token_prefix": token_prefix,
                 });
-                if socket
-                    .send(Message::Text(ping.to_string().into()))
-                    .await
-                    .is_err()
-                {
+                if !send_frame(&mut socket, Message::Text(ping.to_string().into())).await {
                     break;
                 }
             }

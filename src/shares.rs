@@ -1202,39 +1202,50 @@ pub async fn events(
             + Duration::from_secs(expires.saturating_sub(unix_now()).max(0) as u64)
     });
     let receiver = state.events.subscribe();
-    let stream = futures_util::stream::unfold(
-        (receiver, deadline),
-        move |(mut receiver, deadline)| async move {
-            loop {
-                if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                    return None;
-                }
-                let received = match deadline {
-                    Some(deadline) => tokio::select! {
-                        received = receiver.recv() => Some(received),
-                        () = tokio::time::sleep_until(deadline) => None,
-                    },
-                    None => Some(receiver.recv().await),
-                };
-                let received = received?;
-                match received {
-                    Ok(event) => {
-                        if !event.visible_to_share(share_id) {
-                            continue;
-                        }
-                        let data = serde_json::to_string(&event.data).unwrap_or_default();
-                        let out = SseEvent::default()
-                            .id(event.id.to_string())
-                            .event(event.event)
-                            .data(data);
-                        return Some((Ok::<_, Infallible>(out), (receiver, deadline)));
+    let shutdown = state.shutdown.clone();
+    let stream =
+        futures_util::stream::unfold((receiver, deadline), move |(mut receiver, deadline)| {
+            let shutdown = shutdown.clone();
+            async move {
+                loop {
+                    if shutdown.is_cancelled() {
+                        return None;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                        return None;
+                    }
+                    let received = match deadline {
+                        Some(deadline) => tokio::select! {
+                            biased;
+                            () = shutdown.cancelled() => return None,
+                            received = receiver.recv() => Some(received),
+                            () = tokio::time::sleep_until(deadline) => None,
+                        },
+                        None => tokio::select! {
+                            biased;
+                            () = shutdown.cancelled() => return None,
+                            received = receiver.recv() => Some(received),
+                        },
+                    };
+                    let received = received?;
+                    match received {
+                        Ok(event) => {
+                            if !event.visible_to_share(share_id) {
+                                continue;
+                            }
+                            let data = serde_json::to_string(&event.data).unwrap_or_default();
+                            let out = SseEvent::default()
+                                .id(event.id.to_string())
+                                .event(event.event)
+                                .data(data);
+                            return Some((Ok::<_, Infallible>(out), (receiver, deadline)));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    }
                 }
             }
-        },
-    );
+        });
     let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
         .into_response();

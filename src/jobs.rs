@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -261,6 +262,7 @@ pub struct JobManager {
     queue_limit: usize,
     thumbnail_queue_limit: usize,
     events: Arc<EventBus>,
+    shutting_down: AtomicBool,
 }
 
 impl JobManager {
@@ -295,6 +297,7 @@ impl JobManager {
             queue_limit: queue_limit.max(1),
             thumbnail_queue_limit: thumbnail_queue_limit.max(1),
             events,
+            shutting_down: AtomicBool::new(false),
         })
     }
 
@@ -321,6 +324,9 @@ impl JobManager {
         F: FnOnce(JobContext) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<JobOutcome, AppError>> + Send + 'static,
     {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Err(AppError::Cancelled);
+        }
         {
             let inner = self.inner.lock();
             let active = inner
@@ -924,6 +930,28 @@ impl JobManager {
             self.remove_active(&id, JobKind::Thumbnail, &key);
         }
         count
+    }
+
+    /// Signals every queued or running job to stop. Each job checks its token
+    /// at the next safe point, removes partial output and marks itself
+    /// cancelled.
+    pub fn cancel_all(&self) -> usize {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        let inner = self.inner.lock();
+        let mut count = 0;
+        for token in inner.cancel.values() {
+            token.cancel();
+            count += 1;
+        }
+        count
+    }
+
+    /// Waits until cancelled jobs have left the active set. Blocking file
+    /// operations finish at their next cancellation checkpoint.
+    pub async fn wait_idle(&self) {
+        while self.active_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     pub async fn cancel(&self, id: &str, user_id: i64, is_admin: bool) -> Result<Job, AppError> {

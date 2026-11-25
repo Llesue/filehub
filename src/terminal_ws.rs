@@ -65,11 +65,23 @@ async fn session(
     socket: WebSocket,
 ) {
     let (mut sender, mut receiver) = socket.split();
+    let shutdown = state.shutdown.clone();
     let mut authenticated = false;
     let mut root_id = 0_i64;
     let mut cwd = String::new();
 
-    while let Some(message) = receiver.next().await {
+    loop {
+        let message = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                close_socket(&mut sender).await;
+                break;
+            }
+            message = receiver.next() => message,
+        };
+        let Some(message) = message else {
+            break;
+        };
         let Ok(Message::Text(text)) = message else {
             continue;
         };
@@ -172,10 +184,19 @@ async fn session(
                     confirm_code,
                     &headers,
                 );
-                let result = if cmdrunner::is_long_command(&line) {
-                    Ok(future.await)
-                } else {
-                    tokio::time::timeout(Duration::from_secs(60), future).await
+                let result = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        close_socket(&mut sender).await;
+                        break;
+                    }
+                    result = async {
+                        if cmdrunner::is_long_command(&line) {
+                            Ok(future.await)
+                        } else {
+                            tokio::time::timeout(Duration::from_secs(60), future).await
+                        }
+                    } => result,
                 };
                 match result {
                     Ok(Ok(cmdrunner::ExecOutcome::Output(output))) => {
@@ -241,4 +262,8 @@ async fn send_error(
         },
     )
     .await
+}
+
+async fn close_socket(sender: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), sender.send(Message::Close(None))).await;
 }

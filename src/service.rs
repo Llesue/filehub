@@ -1,4 +1,6 @@
 use std::ffi::OsString;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -121,6 +123,8 @@ fn run_service(arguments: &[OsString]) -> anyhow::Result<()> {
     };
     let status = service_control_handler::register(SERVICE_NAME, handler)
         .map_err(|err| anyhow::anyhow!("failed to register service handler: {err}"))?;
+    let status = Arc::new(status);
+    let stopping = Arc::new(AtomicBool::new(false));
     status
         .set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
@@ -154,10 +158,43 @@ fn run_service(arguments: &[OsString]) -> anyhow::Result<()> {
             .find(|pair| pair[0] == "--config")
             .map(|pair| std::path::PathBuf::from(&pair[1]));
         let state = crate::state::AppState::new(config_path.as_deref()).await?;
+        let status_for_shutdown = Arc::clone(&status);
+        let stopping_for_shutdown = Arc::clone(&stopping);
         let shutdown = async move {
             let _ = tokio::task::spawn_blocking(move || stop_rx.recv()).await;
+            stopping_for_shutdown.store(true, Ordering::Relaxed);
+            let _ = status_for_shutdown.set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::StopPending,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 1,
+                wait_hint: Duration::from_secs(10),
+                process_id: None,
+            });
         };
-        crate::app::run_until(state, shutdown).await
+        let run = crate::app::run_until(state, shutdown);
+        tokio::pin!(run);
+        let mut checkpoint = 1_u32;
+        loop {
+            tokio::select! {
+                result = &mut run => break result,
+                _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                    if stopping.load(Ordering::Relaxed) {
+                        checkpoint = checkpoint.saturating_add(1);
+                        let _ = status.set_service_status(ServiceStatus {
+                            service_type: SERVICE_TYPE,
+                            current_state: ServiceState::StopPending,
+                            controls_accepted: ServiceControlAccept::empty(),
+                            exit_code: ServiceExitCode::Win32(0),
+                            checkpoint,
+                            wait_hint: Duration::from_secs(10),
+                            process_id: None,
+                        });
+                    }
+                }
+            }
+        }
     });
     let _ = status.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,

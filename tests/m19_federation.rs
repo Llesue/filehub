@@ -1637,3 +1637,50 @@ async fn disabling_inbound_rejects_federation_requests() {
     let blocked = app.router.clone().oneshot(request).await.unwrap();
     assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn presence_socket_closes_when_the_process_shuts_down() {
+    use futures_util::StreamExt;
+
+    let app = start().await;
+    let grant_id = app
+        .state
+        .db
+        .federation_create_grant(1, app.root_id, "/tmp/presence", "Presence", "ro")
+        .await
+        .unwrap();
+    let raw = "fhfed_presence_shutdown_token";
+    let hash = filehub::auth::sha256_hex(raw);
+    app.state
+        .db
+        .federation_create_token(1, "presence", &hash, raw, None, &[grant_id])
+        .await
+        .unwrap();
+
+    let ws_url = format!(
+        "{}/api/federation/v1/presence?grant={grant_id}",
+        app.base.replace("http://", "ws://")
+    );
+    let mut request = ws_url.into_client_request().expect("request");
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {raw}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("authorized upgrade");
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("welcome timeout")
+        .expect("welcome frame")
+        .expect("welcome ok");
+    assert!(welcome.to_text().unwrap().contains("welcome"));
+
+    app.state.shutdown.cancel();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+        .await
+        .expect("presence socket stayed open after shutdown");
+    match frame {
+        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {}
+        other => panic!("expected close frame, got {other:?}"),
+    }
+}

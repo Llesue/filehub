@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::{RateLimiter, random_token};
 use crate::config::{ConfigFile, Snapshot, build_snapshot, ensure_directories, load_config_file};
@@ -150,6 +151,9 @@ pub struct AppState {
     pub presence_tasks: Mutex<HashMap<i64, tokio::task::JoinHandle<()>>>,
     pub presence_unsupported: Mutex<std::collections::HashSet<i64>>,
     pub presence_peers: Mutex<HashMap<i64, crate::federation::presence::PresencePeer>>,
+    /// Cancelled once the process starts shutting down. Long-lived streams and
+    /// sockets watch this so graceful shutdown does not wait on them forever.
+    pub shutdown: CancellationToken,
 }
 
 fn path_chain(target: &Path) -> Vec<String> {
@@ -291,6 +295,7 @@ impl AppState {
             presence_tasks: Mutex::new(HashMap::new()),
             presence_unsupported: Mutex::new(std::collections::HashSet::new()),
             presence_peers: Mutex::new(HashMap::new()),
+            shutdown: CancellationToken::new(),
         });
         tokio::spawn(crate::federation::mounts::health_loop(Arc::clone(&state)));
         crate::federation::presence::start(Arc::clone(&state));

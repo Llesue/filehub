@@ -284,27 +284,36 @@ async fn events_stream(
     let user_id = current.user.id;
     let admin = current.user.role == "admin";
     let receiver = state.events.subscribe();
-    let stream = futures_util::stream::unfold(receiver, move |mut receiver| async move {
-        loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    if !event.visible_to_user(user_id, admin) {
-                        continue;
+    let shutdown = state.shutdown.clone();
+    let stream = futures_util::stream::unfold(receiver, move |mut receiver| {
+        let shutdown = shutdown.clone();
+        async move {
+            loop {
+                let received = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return None,
+                    received = receiver.recv() => received,
+                };
+                match received {
+                    Ok(event) => {
+                        if !event.visible_to_user(user_id, admin) {
+                            continue;
+                        }
+                        let data = serde_json::to_string(&event.data).unwrap_or_default();
+                        let out = SseEvent::default()
+                            .id(event.id.to_string())
+                            .event(event.event)
+                            .data(data);
+                        return Some((Ok::<_, Infallible>(out), receiver));
                     }
-                    let data = serde_json::to_string(&event.data).unwrap_or_default();
-                    let out = SseEvent::default()
-                        .id(event.id.to_string())
-                        .event(event.event)
-                        .data(data);
-                    return Some((Ok::<_, Infallible>(out), receiver));
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        let out = SseEvent::default()
+                            .event("resync")
+                            .data(json!({ "missed": missed }).to_string());
+                        return Some((Ok::<_, Infallible>(out), receiver));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                    let out = SseEvent::default()
-                        .event("resync")
-                        .data(json!({ "missed": missed }).to_string());
-                    return Some((Ok::<_, Infallible>(out), receiver));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
     });

@@ -26,6 +26,7 @@
 - Revoking a grant, or deleting the shared directory, now removes the mount instead of leaving it looking online while every browse fails.
 - Search hides index rows whose paths no longer exist and removes them in the background.
 - A quick scan now treats a vanished parent under a reachable root as a deletion, instead of keeping it as if it were an offline disk.
+- Stopping the service closes event streams, terminal and presence sockets, cancels background jobs and waits for their cleanup, so restarts no longer hang. The Windows service reports `StopPending` while it drains.
 
 ## v0.2.4 - 2026-11-24
 
