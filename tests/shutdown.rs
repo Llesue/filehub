@@ -15,6 +15,8 @@ struct TestApp {
     router: Router,
     state: Arc<filehub::state::AppState>,
     cookie: String,
+    csrf: String,
+    root_id: i64,
 }
 
 async fn setup_app() -> TestApp {
@@ -34,12 +36,17 @@ async fn setup_app() -> TestApp {
     .await;
     assert_eq!(setup.status(), StatusCode::OK);
     let cookie = session_cookie(&setup);
-    let _ = to_bytes(setup.into_body(), 1024 * 1024).await.unwrap();
+    let body = to_bytes(setup.into_body(), 1024 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let csrf = body["csrf_token"].as_str().unwrap().to_owned();
+    let root_id = state.db.list_roots(1).await.unwrap()[0].id;
     TestApp {
         _dir: dir,
         router,
         state,
         cookie,
+        csrf,
+        root_id,
     }
 }
 
@@ -159,4 +166,61 @@ async fn shutdown_cancels_background_jobs() {
     app.state.jobs.wait_idle().await;
     let job = app.state.jobs.get(&job_id).await.unwrap().unwrap();
     assert_eq!(job.status, "cancelled");
+}
+
+#[tokio::test]
+async fn terminal_socket_closes_when_the_process_shuts_down() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let app = setup_app().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn({
+        let router = app.router.clone();
+        async move {
+            let _ = axum::serve(listener, router).await;
+        }
+    });
+
+    let ws_url = format!("ws://{addr}/api/v1/terminal/ws");
+    let mut request = ws_url.into_client_request().expect("request");
+    request
+        .headers_mut()
+        .insert("cookie", app.cookie.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("terminal upgrade");
+
+    let init = json!({
+        "type": "init",
+        "root": app.root_id,
+        "cwd": "",
+        "csrf": app.csrf,
+    });
+    socket
+        .send(Message::Text(init.to_string().into()))
+        .await
+        .unwrap();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("terminal ready timeout")
+            .expect("terminal frame")
+            .expect("terminal frame ok");
+        if frame.to_text().is_ok_and(|text| text.contains("\"ready\"")) {
+            break;
+        }
+    }
+
+    app.state.shutdown.cancel();
+    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("terminal socket stayed open after shutdown");
+    match frame {
+        Some(Ok(Message::Close(_))) | None => {}
+        other => panic!("expected close frame, got {other:?}"),
+    }
+    server.abort();
 }
