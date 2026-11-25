@@ -76,9 +76,10 @@
       /></label
     >
     <label
-      ><span>{t($language, '初始密码（可修改）')}</span><input
+      ><span>{t($language, '临时密码（首次登录必须修改）')}</span><input
         bind:value={password}
         autocomplete="new-password"
+        minlength="6"
       /></label
     >
     <label

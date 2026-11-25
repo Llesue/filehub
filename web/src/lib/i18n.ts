@@ -311,6 +311,16 @@ const en: Record<string, string> = {
   登记: 'Register',
   撤销: 'Revoke',
   用户授权可信链接与系统设置: 'Users, roots, trusted links and settings',
+  '密码至少需要 8 位': 'Password must be at least 8 characters',
+  '密码至少 8 位。': 'Password must be at least 8 characters.',
+  '密码（至少 8 位）': 'Password (at least 8 characters)',
+  必须修改密码: 'Password change required',
+  '管理员重置了你的密码。请设置新密码后继续。':
+    'An administrator reset your password. Set a new password to continue.',
+  '临时密码已设置，用户下次登录必须修改':
+    'Temporary password set; the user must change it at the next sign-in.',
+  '临时密码（至少 6 位）': 'Temporary password (at least 6 characters)',
+  '临时密码（首次登录必须修改）': 'Temporary password (must be changed on first sign-in)',
   '密码至少 10 位': 'Password (min 10 chars)',
 
   // Shared actions, states and errors

@@ -22,6 +22,10 @@
   async function submit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     error = '';
+    if ([...next].length < 8) {
+      error = t($language, '密码至少需要 8 位');
+      return;
+    }
     if (next !== confirm) {
       error = t($language, '两次输入的新密码不一致');
       return;
@@ -74,6 +78,7 @@
           bind:value={next}
           type="password"
           autocomplete="new-password"
+          minlength="8"
         /></label
       >
       <label
@@ -81,6 +86,7 @@
           bind:value={confirm}
           type="password"
           autocomplete="new-password"
+          minlength="8"
         /></label
       >
       {#if error}<p class="error">{error}</p>{/if}

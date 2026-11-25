@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::authz;
-use crate::db::{IndexEntry, Root};
+use crate::db::{IndexEntry, Root, unix_now};
 use crate::error::AppError;
 use crate::jobs::{JobKind, JobOutcome};
 use crate::state::AppState;
@@ -37,6 +37,7 @@ struct DirScan {
     mtime_ns: i64,
     entries: Vec<IndexEntry>,
     partial: bool,
+    changed: bool,
     error: Option<String>,
 }
 
@@ -84,6 +85,7 @@ pub async fn index_path(
     root: Root,
     relative: &str,
     recursive: bool,
+    forced: bool,
     cancel: &CancellationToken,
     progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> Result<IndexStats, AppError> {
@@ -131,15 +133,27 @@ pub async fn index_path(
         errors: Vec::new(),
     };
     let mut totals: HashMap<String, u64> = HashMap::new();
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(settings.settings.index.scan_budget_seconds.max(1));
 
     let mut cancelled = false;
     while let Some(mut scan) = receiver.recv().await {
+        if recursive && std::time::Instant::now() >= deadline {
+            stats.partial = true;
+            break;
+        }
         enrich_entries(&mut scan.entries, video_enabled);
         if cancel.is_cancelled() {
             cancelled = true;
             break;
         }
         let path = scan.path.to_string_lossy().to_string();
+        let scan_changed = scan.changed;
+        if scan.changed && !forced {
+            stats.partial = true;
+            state.note_index_change(&scan.path, crate::gate::ChangeReason::QuickScan);
+            continue;
+        }
         let dir_id = state
             .db
             .upsert_index_dir(&path, scan.mtime_ns)
@@ -147,7 +161,7 @@ pub async fn index_path(
             .map_err(AppError::internal)?;
 
         let mut total_size = 0_u64;
-        let mut partial = scan.partial || !recursive;
+        let mut partial = scan.partial || scan.changed || !recursive;
         let mut child_dirs = Vec::new();
         for entry in &scan.entries {
             if entry.is_dir {
@@ -208,6 +222,24 @@ pub async fn index_path(
                 scan.error.as_deref(),
             )
             .await;
+        if let Ok(policy) = crate::policy::resolve(state, std::path::Path::new(&path)).await {
+            let _ = state
+                .db
+                .set_indexed_dir_visible(&path, !policy.is_ignore())
+                .await;
+            let _ = state
+                .db
+                .set_indexed_dir_policy(&path, policy.as_str())
+                .await;
+        }
+        if scan_changed {
+            state.note_index_change(
+                std::path::Path::new(&path),
+                crate::gate::ChangeReason::Write,
+            );
+        } else {
+            state.gate.mark_done(std::path::Path::new(&path));
+        }
         totals.insert(path, total_size);
         stats.directories += 1;
         stats.entries += count;
@@ -268,129 +300,14 @@ struct ScanLimits {
     max_entries: usize,
 }
 
-struct QuickScanChange {
-    path: String,
-    mtime_ns: i64,
-    entries: Vec<IndexEntry>,
-    child_dirs: Vec<PathBuf>,
-    partial: bool,
-    error: Option<String>,
-}
-
-struct QuickScanBatch {
-    checked: usize,
-    changes: Vec<QuickScanChange>,
-    missing: Vec<String>,
-    errors: Vec<String>,
-}
-
-fn quick_scan_batch(
-    paths: Vec<(String, i64, String)>,
-    roots: &[String],
-    ignore: &[String],
-    cancel: &CancellationToken,
-    video_enabled: bool,
-    limits: &ScanLimits,
-) -> Result<QuickScanBatch, AppError> {
-    let mut batch = QuickScanBatch {
-        checked: 0,
-        changes: Vec::new(),
-        missing: Vec::new(),
-        errors: Vec::new(),
-    };
-    for (path, database_mtime, status) in paths {
-        if cancel.is_cancelled() {
-            return Err(AppError::Cancelled);
-        }
-        batch.checked += 1;
-        if !roots
-            .iter()
-            .any(|root| crate::platform::path_within(Path::new(&path), Path::new(root)))
-        {
-            batch.missing.push(path);
-            continue;
-        }
-        let real_path = Path::new(&path);
-        let metadata = match std::fs::symlink_metadata(real_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                batch.missing.push(path);
-                continue;
-            }
-            Err(error) => {
-                if batch.errors.len() < 20 {
-                    batch.errors.push(format!("{path}: {error}"));
-                }
-                continue;
-            }
-        };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            batch.missing.push(path);
-            continue;
-        }
-        let mtime_ns = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos() as i64)
-            .unwrap_or_default();
-        if mtime_ns == database_mtime && status == "ready" {
-            continue;
-        }
-        match read_directory_contents(real_path, ignore, cancel, limits, roots, 0) {
-            Ok(mut contents) => {
-                enrich_entries(&mut contents.entries, video_enabled);
-                batch.changes.push(QuickScanChange {
-                    path,
-                    mtime_ns: contents.mtime_ns,
-                    entries: contents.entries,
-                    child_dirs: contents.child_dirs,
-                    partial: contents.partial,
-                    error: (!contents.errors.is_empty()).then(|| contents.errors.join("; ")),
-                });
-            }
-            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
-            Err(error) => {
-                if batch.errors.len() < 20 {
-                    batch.errors.push(format!("{path}: {error}"));
-                }
-            }
-        }
-    }
-    Ok(batch)
-}
-
 pub async fn quick_scan(
     state: &Arc<AppState>,
     cancel: &CancellationToken,
     progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> Result<QuickScanStats, AppError> {
     let settings = state.settings();
-    let ignore = settings.settings.index.ignore.clone();
-    let video_enabled = settings.settings.thumbnails.enabled
-        && settings.settings.thumbnails.video
-        && state.ffmpeg.is_some();
-    let users = state.db.list_users().await.map_err(AppError::internal)?;
-    let mut root_entries: Vec<(i64, Root)> = Vec::new();
-    for user in users {
-        for root in state
-            .db
-            .list_roots(user.id)
-            .await
-            .map_err(AppError::internal)?
-        {
-            root_entries.push((user.id, root));
-        }
-    }
-    let roots: Vec<String> = root_entries
-        .iter()
-        .map(|(_, root)| root.real_path.clone())
-        .collect();
-    let total = state
-        .db
-        .count_indexed_dirs()
-        .await
-        .map_err(AppError::internal)? as usize;
+    let budget = std::time::Duration::from_secs(settings.settings.index.scan_budget_seconds.max(1));
+    let started = std::time::Instant::now();
     let mut stats = QuickScanStats {
         checked: 0,
         changed: 0,
@@ -399,250 +316,197 @@ pub async fn quick_scan(
         new_directories: 0,
         errors: Vec::new(),
     };
-    let mut after: Option<String> = None;
-    let mut parents: HashSet<PathBuf> = HashSet::new();
-    let mut new_dir_candidates: HashSet<String> = HashSet::new();
-    match state
+    let total = state
         .db
-        .take_pending_index_dirs(QUICK_SCAN_CHILD_LIMIT as i64)
+        .count_indexed_dirs()
         .await
-    {
-        Ok(pending) if !pending.is_empty() => {
-            let checked = tokio::task::spawn_blocking(move || {
-                pending
-                    .into_iter()
-                    .filter(|path| Path::new(path).is_dir())
-                    .collect::<Vec<_>>()
-            })
-            .await;
-            match checked {
-                Ok(paths) => new_dir_candidates.extend(paths),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to validate deferred index directories");
-                }
-            }
-        }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(%error, "failed to load deferred index directories"),
-    }
-
+        .map_err(AppError::internal)? as usize;
+    let scan_state = state
+        .db
+        .scan_state("quick")
+        .await
+        .map_err(AppError::internal)?
+        .unwrap_or(crate::db::ScanState {
+            kind: "quick".to_owned(),
+            cursor: None,
+            pass_started_at: None,
+            last_progress_at: None,
+            completed_at: None,
+            pass_id: 0,
+        });
+    let pass_started_at = scan_state.pass_started_at.unwrap_or_else(unix_now);
+    let pass_id = if scan_state.pass_started_at.is_none() {
+        scan_state.pass_id.saturating_add(1)
+    } else {
+        scan_state.pass_id
+    };
+    let background_before = unix_now()
+        - settings
+            .settings
+            .index
+            .background_scan_hours
+            .max(1)
+            .saturating_mul(3600) as i64;
     loop {
         if cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
         let rows = state
             .db
-            .indexed_dirs_page(after.clone(), 2000)
+            .indexed_dirs_checked_page(pass_started_at, background_before, 2000)
             .await
             .map_err(AppError::internal)?;
         if rows.is_empty() {
+            let now = unix_now();
+            let _ = state
+                .db
+                .set_scan_state("quick", None, None, Some(now), Some(now), pass_id)
+                .await;
+            let _ = state
+                .db
+                .runtime_state_set("index.last_quick_scan", now)
+                .await;
             break;
         }
-        after = rows.last().map(|row| row.0.clone());
-        let paths: Vec<(String, i64, String)> = rows
-            .into_iter()
-            .map(|(path, _id, mtime, status)| (path, mtime, status))
-            .collect();
-        let workers = state.settings().settings.index.scan_workers.clamp(1, 16);
-        let scan_limits = Arc::new(ScanLimits {
-            follow_symlinks: state.settings().settings.symlinks.follow_in_index,
-            max_depth: state.settings().settings.symlinks.max_depth,
-            max_entries: state.settings().settings.index.max_entries_per_dir,
-        });
-        let chunk_size = 250_usize;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(workers));
-        let batch_roots = Arc::new(roots.clone());
-        let batch_ignore = Arc::new(ignore.clone());
-        for group in paths.chunks(workers.saturating_mul(chunk_size)) {
-            let mut handles = Vec::new();
-            for chunk in group.chunks(chunk_size) {
-                let permit = Arc::clone(&semaphore)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| AppError::internal(anyhow::anyhow!("index scanner closed")))?;
-                let roots = Arc::clone(&batch_roots);
-                let ignore = Arc::clone(&batch_ignore);
-                let cancel = cancel.clone();
-                let chunk = chunk.to_vec();
-                let limits = Arc::clone(&scan_limits);
-                handles.push(tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    quick_scan_batch(chunk, &roots, &ignore, &cancel, video_enabled, &limits)
-                }));
+        let checked_at = unix_now();
+        let mut touched = Vec::with_capacity(rows.len());
+        for (path, _id, database_mtime, status, last_checked_at) in &rows {
+            if cancel.is_cancelled() {
+                return Err(AppError::Cancelled);
             }
-            for handle in handles {
-                let batch = handle.await.map_err(|error| {
-                    AppError::internal(anyhow::anyhow!("quick index scan task failed: {error}"))
-                })??;
-                apply_quick_scan_batch(
-                    state,
-                    batch,
-                    &roots,
-                    &mut stats,
-                    &mut parents,
-                    &mut new_dir_candidates,
-                    cancel,
-                )
-                .await?;
-                progress(stats.checked, total);
+            stats.checked += 1;
+            let policy = crate::policy::resolve(state, Path::new(path)).await?;
+            if policy.is_ignore() || policy == crate::policy::IndexPolicy::OnDemand {
+                touched.push(path.clone());
+                continue;
             }
+            if policy == crate::policy::IndexPolicy::Background {
+                let interval = settings
+                    .settings
+                    .index
+                    .background_scan_hours
+                    .max(1)
+                    .saturating_mul(3600) as i64;
+                if last_checked_at.is_some_and(|at| checked_at.saturating_sub(at) < interval) {
+                    continue;
+                }
+            }
+            touched.push(path.clone());
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    stats.missing += 1;
+                    let parent_exists = Path::new(path)
+                        .parent()
+                        .is_some_and(|parent| parent.is_dir());
+                    if parent_exists {
+                        loop {
+                            match state.db.delete_cached_subtree_batch(path, 2000).await {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, path, "failed to purge deleted index subtree");
+                                    break;
+                                }
+                            }
+                        }
+                        let _ = state.db.delete_pending_subtree(path).await;
+                        let _ = state.db.delete_file_hashes_subtree(path).await;
+                        state.gate.clear_subtree(Path::new(path));
+                        if let Some(parent) = Path::new(path).parent() {
+                            state.note_index_change(parent, crate::gate::ChangeReason::Delete);
+                        }
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    if stats.errors.len() < 20 {
+                        stats.errors.push(format!("{path}: {error}"));
+                    }
+                    continue;
+                }
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            let mtime_ns = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos() as i64)
+                .unwrap_or_default();
+            if mtime_ns != *database_mtime || status != "ready" {
+                stats.changed += 1;
+                state.note_index_change(Path::new(path), crate::gate::ChangeReason::QuickScan);
+            }
+            let _ = last_checked_at;
+        }
+        if !touched.is_empty() {
+            state
+                .db
+                .touch_indexed_dirs(&touched, checked_at, None)
+                .await
+                .map_err(AppError::internal)?;
+        }
+        let _ = state
+            .db
+            .set_scan_state(
+                "quick",
+                None,
+                Some(pass_started_at),
+                Some(unix_now()),
+                None,
+                pass_id,
+            )
+            .await;
+        progress(stats.checked, total.max(1));
+        if started.elapsed() >= budget {
+            break;
         }
     }
-
-    for parent in parents {
-        state.invalidate_index_totals(&parent).await;
+    if !cancel.is_cancelled() && started.elapsed() < budget {
+        let pending = state
+            .db
+            .take_pending_index_dirs(QUICK_SCAN_CHILD_LIMIT as i64)
+            .await
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            let root_entries = best_roots(state).await?;
+            let mut candidates = Vec::new();
+            for path in pending {
+                let policy = crate::policy::resolve(state, Path::new(&path)).await?;
+                if policy.allows_browse() {
+                    candidates.push(path);
+                }
+            }
+            queue_new_directory_indexes(
+                state,
+                &root_entries,
+                candidates,
+                cancel,
+                &mut stats.new_directories,
+            )
+            .await?;
+        }
     }
-
-    if !new_dir_candidates.is_empty() {
-        let candidates: Vec<String> = new_dir_candidates.into_iter().collect();
-        queue_new_directory_indexes(
-            state,
-            &root_entries,
-            candidates,
-            cancel,
-            &mut stats.new_directories,
-        )
-        .await?;
-    }
-
+    let _ = scan_state;
     Ok(stats)
 }
 
-async fn apply_quick_scan_batch(
-    state: &Arc<AppState>,
-    batch: QuickScanBatch,
-    roots: &[String],
-    stats: &mut QuickScanStats,
-    parents: &mut HashSet<PathBuf>,
-    new_dir_candidates: &mut HashSet<String>,
-    cancel: &CancellationToken,
-) -> Result<(), AppError> {
-    stats.checked += batch.checked;
-    for error in batch.errors {
-        if stats.errors.len() < 20 {
-            stats.errors.push(error);
-        }
-    }
-
-    for change in batch.changes {
-        if cancel.is_cancelled() {
-            return Err(AppError::Cancelled);
-        }
-        let dir_id = state
+async fn best_roots(state: &Arc<AppState>) -> Result<Vec<(i64, Root)>, AppError> {
+    let users = state.db.list_users().await.map_err(AppError::internal)?;
+    let mut roots = Vec::new();
+    for user in users {
+        for root in state
             .db
-            .upsert_index_dir(&change.path, change.mtime_ns)
+            .list_roots(user.id)
             .await
-            .map_err(AppError::internal)?;
-        let direct_size: u64 = change
-            .entries
-            .iter()
-            .filter(|entry| !entry.is_dir)
-            .map(|entry| entry.size.max(0) as u64)
-            .sum();
-        let child_paths: Vec<String> = change
-            .child_dirs
-            .iter()
-            .map(|child| child.to_string_lossy().to_string())
-            .collect();
-        let child_sizes = if child_paths.is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            state
-                .db
-                .directory_size_values(child_paths)
-                .await
-                .unwrap_or_default()
-        };
-        let mut total_size = direct_size;
-        let mut partial = change.partial;
-        for child in &change.child_dirs {
-            let child = child.to_string_lossy().to_string();
-            if let Some((status, child_size)) = child_sizes.get(&child)
-                && matches!(status.as_str(), "ready" | "stale")
-            {
-                total_size = total_size.saturating_add((*child_size).max(0) as u64);
-            } else {
-                partial = true;
-            }
+            .map_err(AppError::internal)?
+        {
+            roots.push((user.id, root));
         }
-        let count = state
-            .db
-            .replace_index_entries(dir_id, change.entries)
-            .await
-            .map_err(AppError::internal)?;
-        let _ = state
-            .db
-            .finish_index_dir(
-                dir_id,
-                "ready",
-                count as i64,
-                total_size.min(i64::MAX as u64) as i64,
-                partial,
-                change.error.as_deref(),
-            )
-            .await;
-        let _ = state.db.mark_directory_size_stale(&change.path).await;
-        for child in change.child_dirs {
-            new_dir_candidates.insert(child.to_string_lossy().to_string());
-        }
-        if let Some(parent) = Path::new(&change.path).parent() {
-            parents.insert(parent.to_path_buf());
-        }
-        stats.changed += 1;
-        stats.entries += count;
     }
-    let mut missing_targets = Vec::with_capacity(batch.missing.len());
-    for missing in batch.missing {
-        if let Some(parent) = Path::new(&missing).parent() {
-            parents.insert(parent.to_path_buf());
-        }
-        missing_targets.push(PathBuf::from(missing));
-        stats.missing += 1;
-    }
-    if !missing_targets.is_empty() {
-        let mut stale_only = Vec::new();
-        // If the root itself is reachable, a vanished parent means the
-        // directory tree was deleted or moved, not that a disk is offline.
-        let reachable: Vec<&String> = roots
-            .iter()
-            .filter(|root| std::path::Path::new(root).is_dir())
-            .collect();
-        for target in &missing_targets {
-            let parent_exists = target.parent().is_some_and(|parent| parent.is_dir());
-            let remove = if parent_exists {
-                match tokio::fs::metadata(target).await {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                    Ok(metadata) if !metadata.is_dir() => true,
-                    _ => false,
-                }
-            } else {
-                reachable
-                    .iter()
-                    .any(|root| crate::platform::path_within(target, std::path::Path::new(root)))
-            };
-            if remove {
-                let prefix = target.to_string_lossy().to_string();
-                loop {
-                    match state.db.delete_cached_subtree_batch(&prefix, 2000).await {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, path = %prefix, "failed to purge missing index subtree");
-                            break;
-                        }
-                    }
-                }
-                let _ = state.db.delete_pending_subtree(&prefix).await;
-            } else {
-                stale_only.push(target.clone());
-            }
-        }
-        if !stale_only.is_empty() {
-            state.invalidate_paths_exact(&stale_only, None).await;
-        }
-        state.schedule_cache_cleanup(missing_targets);
-    }
-    Ok(())
+    Ok(roots)
 }
 
 const QUICK_SCAN_CHILD_LIMIT: usize = 500;
@@ -677,6 +541,14 @@ async fn queue_new_directory_indexes(
             break;
         }
         let path = new_dirs[cursor].clone();
+        let policy = crate::policy::resolve(state, Path::new(&path)).await?;
+        if policy.is_ignore()
+            || policy == crate::policy::IndexPolicy::OnDemand
+            || policy == crate::policy::IndexPolicy::Background
+        {
+            cursor += 1;
+            continue;
+        }
         let Some((user_id, root, relative)) = best_root_for_path(root_entries, &path) else {
             cursor += 1;
             continue;
@@ -720,6 +592,7 @@ async fn queue_new_directory_indexes(
                         job_root,
                         &job_relative,
                         true,
+                        false,
                         &cancel,
                         &mut progress,
                     )
@@ -780,87 +653,285 @@ fn best_root_for_path(roots: &[(i64, Root)], path: &str) -> Option<(i64, Root, S
         })
 }
 
+pub async fn scan_dir_once(
+    state: &Arc<AppState>,
+    user_id: i64,
+    root: Root,
+    relative: &str,
+    forced: bool,
+    cancel: &CancellationToken,
+) -> Result<(IndexStats, Vec<String>), AppError> {
+    let resolved = authz::resolve(state, user_id, root.id, relative, false).await?;
+    let base = resolved.absolute.clone();
+    let settings = state.settings();
+    let ignore = settings.settings.index.ignore.clone();
+    let video_enabled = settings.settings.thumbnails.enabled
+        && settings.settings.thumbnails.video
+        && state.ffmpeg.is_some();
+    let scan_limits = ScanLimits {
+        follow_symlinks: settings.settings.symlinks.follow_in_index,
+        max_depth: settings.settings.symlinks.max_depth,
+        max_entries: settings.settings.index.max_entries_per_dir,
+    };
+    let roots: Vec<String> = state
+        .db
+        .list_roots(user_id)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .map(|root| root.real_path)
+        .collect();
+    let scan_path = base.clone();
+    let scan_cancel = cancel.clone();
+    let contents = tokio::task::spawn_blocking(move || {
+        read_directory_contents(&scan_path, &ignore, &scan_cancel, &scan_limits, &roots, 0)
+    })
+    .await
+    .map_err(|error| AppError::internal(anyhow::anyhow!("index task failed: {error}")))??;
+    let mut stats = IndexStats {
+        directories: 0,
+        entries: 0,
+        partial: contents.changed && !forced,
+        errors: Vec::new(),
+    };
+    if contents.changed && !forced {
+        state.note_index_change(&base, crate::gate::ChangeReason::QuickScan);
+        return Ok((stats, Vec::new()));
+    }
+    let child_dirs: Vec<String> = contents
+        .child_dirs
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    let mut entries = contents.entries;
+    let scan_error = (!contents.errors.is_empty()).then(|| contents.errors.join("; "));
+    enrich_entries(&mut entries, video_enabled);
+    let dir_id = state
+        .db
+        .upsert_index_dir(&base.to_string_lossy(), contents.mtime_ns)
+        .await
+        .map_err(AppError::internal)?;
+    let mut total_size = 0_u64;
+    for entry in &entries {
+        if !entry.is_dir {
+            total_size = total_size.saturating_add(entry.size.max(0) as u64);
+        }
+    }
+    let child_sizes = state
+        .db
+        .directory_size_values(child_dirs.clone())
+        .await
+        .unwrap_or_default();
+    let mut partial = contents.partial || contents.changed;
+    for child in &child_dirs {
+        if let Some((status, child_size)) = child_sizes.get(child)
+            && matches!(status.as_str(), "ready" | "stale")
+        {
+            total_size = total_size.saturating_add((*child_size).max(0) as u64);
+        } else {
+            partial = true;
+        }
+    }
+    let count = state
+        .db
+        .replace_index_entries(dir_id, entries)
+        .await
+        .map_err(AppError::internal)?;
+    let _ = state
+        .db
+        .finish_index_dir(
+            dir_id,
+            "ready",
+            count as i64,
+            total_size.min(i64::MAX as u64) as i64,
+            partial,
+            scan_error.as_deref(),
+        )
+        .await;
+    if let Ok(policy) = crate::policy::resolve(state, &base).await {
+        let _ = state
+            .db
+            .set_indexed_dir_visible(&base.to_string_lossy(), !policy.is_ignore())
+            .await;
+        let _ = state
+            .db
+            .set_indexed_dir_policy(&base.to_string_lossy(), policy.as_str())
+            .await;
+    }
+    state.gate.mark_done(&base);
+    stats.directories = 1;
+    stats.entries = count;
+    stats.partial |= partial;
+    Ok((stats, child_dirs))
+}
+
 pub async fn scheduled_full_scan(
     state: &Arc<AppState>,
     cancel: &CancellationToken,
     progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> Result<IndexStats, AppError> {
-    let users = state.db.list_users().await.map_err(AppError::internal)?;
-    let mut candidates: Vec<(i64, Root)> = Vec::new();
-    for user in users {
-        for root in state
-            .db
-            .list_roots(user.id)
-            .await
-            .map_err(AppError::internal)?
-        {
-            candidates.push((user.id, root));
-        }
-    }
-    candidates.sort_by_key(|(_, root)| root.real_path.len());
-    let mut selected: Vec<(i64, Root)> = Vec::new();
-    for (user_id, root) in candidates {
-        let root_path = Path::new(&root.real_path);
-        if selected.iter().any(|(_, existing)| {
-            crate::platform::paths_equal(root_path, Path::new(&existing.real_path))
-                || crate::platform::path_within(root_path, Path::new(&existing.real_path))
-        }) {
-            continue;
-        }
-        selected.push((user_id, root));
-    }
-
-    let total = selected.len();
+    let settings = state.settings();
+    let budget = std::time::Duration::from_secs(settings.settings.index.scan_budget_seconds.max(1));
+    let started = std::time::Instant::now();
     let mut stats = IndexStats {
         directories: 0,
         entries: 0,
         partial: false,
         errors: Vec::new(),
     };
-    for (index, (user_id, root)) in selected.into_iter().enumerate() {
+    let roots = best_roots(state).await?;
+    let scan_state = state
+        .db
+        .scan_state("full")
+        .await
+        .map_err(AppError::internal)?
+        .unwrap_or(crate::db::ScanState {
+            kind: "full".to_owned(),
+            cursor: None,
+            pass_started_at: None,
+            last_progress_at: None,
+            completed_at: None,
+            pass_id: 0,
+        });
+    let pass_started_at = scan_state.pass_started_at.unwrap_or_else(unix_now);
+    let pass_id = if scan_state.pass_started_at.is_none() {
+        scan_state.pass_id.saturating_add(1)
+    } else {
+        scan_state.pass_id
+    };
+    if scan_state.pass_started_at.is_none() {
+        let mut roots_found = Vec::new();
+        for (_, root) in &roots {
+            if roots_found.iter().any(|existing: &String| {
+                crate::platform::path_within(Path::new(&root.real_path), Path::new(existing))
+            }) {
+                continue;
+            }
+            roots_found.push(root.real_path.clone());
+        }
+        state
+            .db
+            .frontier_push("full", &roots_found)
+            .await
+            .map_err(AppError::internal)?;
+        state
+            .db
+            .set_scan_state(
+                "full",
+                None,
+                Some(pass_started_at),
+                Some(unix_now()),
+                None,
+                pass_id,
+            )
+            .await
+            .map_err(AppError::internal)?;
+    }
+    let total = state.db.frontier_len("full").await.unwrap_or(0).max(1) as usize;
+    loop {
         if cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
-        #[cfg(windows)]
-        if let Ok(volume) = crate::winindex::volume_name(Path::new(&root.real_path)) {
-            let _ = state.db.delete_usn_state(&volume).await;
+        let paths = state
+            .db
+            .frontier_pop("full", 8)
+            .await
+            .map_err(AppError::internal)?;
+        if paths.is_empty() {
+            let now = unix_now();
+            for (_, root) in &roots {
+                let _ = state
+                    .db
+                    .delete_stale_index_dirs(&root.real_path, pass_id, pass_started_at)
+                    .await;
+            }
+            let _ = state
+                .db
+                .set_scan_state("full", None, None, Some(now), Some(now), pass_id)
+                .await;
+            let _ = state
+                .db
+                .runtime_state_set("index.last_full_scan", now)
+                .await;
+            break;
         }
-        progress(index, total);
-        let mut root_progress = |_directories: usize, _entries: usize| {
-            progress(index, total);
-        };
-        match index_path(
-            state,
-            user_id,
-            root.clone(),
-            "",
-            true,
-            cancel,
-            &mut root_progress,
-        )
-        .await
-        {
-            Ok(result) => {
-                stats.directories += result.directories;
-                stats.entries += result.entries;
-                stats.partial |= result.partial;
-                for error in result.errors {
+        for path in paths {
+            if cancel.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+            let policy = crate::policy::resolve(state, Path::new(&path)).await?;
+            if policy == crate::policy::IndexPolicy::Ignore
+                || policy == crate::policy::IndexPolicy::OnDemand
+                || policy == crate::policy::IndexPolicy::Background
+            {
+                continue;
+            }
+            let Some((user_id, root, relative)) = find_root_for_path(&roots, &path) else {
+                continue;
+            };
+            match scan_dir_once(state, user_id, root, &relative, false, cancel).await {
+                Ok((result, children)) => {
+                    stats.directories += result.directories;
+                    stats.entries += result.entries;
+                    stats.partial |= result.partial;
+                    let _ = state.db.set_index_generation(&path, pass_id).await;
+                    let children: Vec<String> = children
+                        .into_iter()
+                        .filter(|child| {
+                            Path::new(child)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| !name.starts_with(".filehub-upload-"))
+                        })
+                        .collect();
+                    let _ = state.db.frontier_push("full", &children).await;
+                    progress(stats.directories, total);
+                }
+                Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+                Err(error) => {
+                    stats.partial = true;
                     if stats.errors.len() < 20 {
-                        stats.errors.push(error);
+                        stats.errors.push(format!("{path}: {error}"));
                     }
                 }
             }
-            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
-            Err(error) => {
-                stats.partial = true;
-                if stats.errors.len() < 20 {
-                    stats.errors.push(format!("{}: {error}", root.real_path));
-                }
-            }
+        }
+        let _ = state
+            .db
+            .set_scan_state(
+                "full",
+                None,
+                Some(pass_started_at),
+                Some(unix_now()),
+                None,
+                pass_id,
+            )
+            .await;
+        if started.elapsed() >= budget {
+            break;
         }
     }
-    progress(total, total);
+    let _ = scan_state;
     Ok(stats)
+}
+
+fn find_root_for_path(roots: &[(i64, Root)], path: &str) -> Option<(i64, Root, String)> {
+    roots
+        .iter()
+        .filter(|(_, root)| {
+            crate::platform::path_within(Path::new(path), Path::new(&root.real_path))
+        })
+        .max_by_key(|(_, root)| root.real_path.len())
+        .and_then(|(user_id, root)| {
+            let relative = Path::new(path)
+                .strip_prefix(Path::new(&root.real_path))
+                .ok()?
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            Some((*user_id, root.clone(), relative))
+        })
 }
 
 fn enrich_entries(entries: &mut [IndexEntry], video_enabled: bool) {
@@ -911,6 +982,7 @@ fn collect_dirs_channel(
                             mtime_ns,
                             entries: scan.entries,
                             partial: false,
+                            changed: false,
                             error: None,
                         })
                         .is_err()
@@ -967,6 +1039,7 @@ fn collect_dirs_channel(
                             mtime_ns,
                             entries: scan.entries,
                             partial: false,
+                            changed: false,
                             error: None,
                         })
                         .is_err()
@@ -1010,6 +1083,7 @@ struct DirectoryContents {
     entries: Vec<IndexEntry>,
     child_dirs: Vec<PathBuf>,
     partial: bool,
+    changed: bool,
     errors: Vec<String>,
 }
 
@@ -1156,11 +1230,23 @@ fn read_directory_contents(
         }
     }
 
+    let after = std::fs::metadata(path).map_err(io_error)?;
+    let after_mtime_ns = after
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or_default();
+    let identity_before = crate::platform::metadata_identity(&metadata);
+    let identity_after = crate::platform::metadata_identity(&after);
+    let changed = after_mtime_ns != mtime_ns || identity_before != identity_after;
+
     Ok(DirectoryContents {
         mtime_ns,
         entries,
         child_dirs,
         partial,
+        changed,
         errors,
     })
 }
@@ -1201,6 +1287,7 @@ fn scan_walk(
         entries,
         child_dirs,
         mut partial,
+        changed,
         mut errors,
     } = read_directory_contents(path, ignore, cancel, limits, roots, depth)?;
 
@@ -1242,6 +1329,7 @@ fn scan_walk(
             mtime_ns,
             entries,
             partial,
+            changed,
             error: (!errors.is_empty()).then(|| errors.join("; ")),
         })
         .is_err()
@@ -1322,4 +1410,12 @@ mod scan_limit_tests {
         assert_eq!(contents.entries.len(), 2);
         assert!(contents.partial);
     }
+}
+
+pub async fn index_target_for_path(
+    state: &Arc<AppState>,
+    path: &str,
+) -> Result<Option<(i64, Root, String)>, AppError> {
+    let roots = best_roots(state).await?;
+    Ok(find_root_for_path(&roots, path))
 }

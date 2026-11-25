@@ -59,12 +59,40 @@ pub async fn properties(
     // Inspect the path as requested so a symlink is reported as a link, not
     // as its canonical target (authz has already validated the target).
     let absolute = Path::new(&resolved.root.real_path).join(&resolved.relative);
+    let hash_path = resolved.absolute.clone();
     let relative = resolved.relative.clone();
-    let value = tokio::task::spawn_blocking(move || describe(&absolute, &relative))
+    let mut value = tokio::task::spawn_blocking(move || describe(&absolute, &relative))
         .await
         .map_err(|error| {
             AppError::internal(anyhow::anyhow!("properties task failed: {error}"))
         })??;
+    if value.get("is_dir").and_then(Value::as_bool) != Some(true)
+        && !value
+            .get("is_symlink")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && let Ok(metadata) = tokio::fs::metadata(&hash_path).await
+        && metadata.is_file()
+    {
+        let mtime_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as i64)
+            .unwrap_or_default();
+        if let Some(hash) = crate::hash::cached_property_hash(
+            &state,
+            &hash_path.to_string_lossy(),
+            metadata.len() as i64,
+            mtime_ns,
+        )
+        .await?
+        {
+            for (key, item) in hash.as_object().into_iter().flatten() {
+                value[key] = item.clone();
+            }
+        }
+    }
     Ok(Json(value))
 }
 

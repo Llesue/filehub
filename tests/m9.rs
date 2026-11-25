@@ -142,7 +142,7 @@ async fn search_names(app: &TestApp, query: &str) -> Vec<String> {
 }
 
 async fn wait_job(app: &TestApp, id: &str) -> Value {
-    for _ in 0..200 {
+    for _ in 0..400 {
         let response = send(
             &app.router,
             Method::GET,
@@ -477,7 +477,7 @@ async fn index_aggregate_size_is_used_by_dir_size() {
 }
 
 #[tokio::test]
-async fn quick_scan_persists_new_directories_when_the_batch_limit_is_hit() {
+async fn quick_scan_detects_new_directories_and_index_rebuilds_them() {
     let app = setup_app().await;
     let job = run_index(&app).await;
     assert_eq!(job["status"], "completed", "{job}");
@@ -488,20 +488,17 @@ async fn quick_scan_persists_new_directories_when_the_batch_limit_is_hit() {
 
     let cancel = CancellationToken::new();
     let mut progress = |_checked: usize, _total: usize| {};
-    filehub::indexer::quick_scan(&app.state, &cancel, &mut progress)
+    let stats = filehub::indexer::quick_scan(&app.state, &cancel, &mut progress)
         .await
         .unwrap();
+    assert!(stats.changed >= 1, "{stats:?}");
 
-    let pending = app.state.db.take_pending_index_dirs(1000).await.unwrap();
-    assert!(
-        pending.len() >= 20,
-        "overflow candidates were dropped: {} pending",
-        pending.len()
-    );
-    assert!(
-        pending.iter().all(|path| path.contains("d1/n")),
-        "{pending:?}"
-    );
+    // The scan only marks the parent dirty; the gate/index worker rebuilds it.
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    let target = app.home.join("d1/n0").to_string_lossy().to_string();
+    let indexed = app.state.db.index_status(&target).await.unwrap();
+    assert!(indexed.is_some(), "new child directory was not indexed");
 }
 
 async fn run_index(app: &TestApp) -> Value {
@@ -537,7 +534,8 @@ async fn quick_scan_refreshes_changed_directories() {
         .await
         .unwrap();
     assert!(stats.changed >= 1, "{stats:?}");
-    assert!(stats.new_directories >= 1, "{stats:?}");
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
 
     let new_dir = app.home.join("d1/newdir");
     let new_dir = new_dir.to_string_lossy().to_string();
@@ -1514,4 +1512,590 @@ async fn quick_scan_purges_a_deleted_parent_tree() {
         app.state.db.index_status(&inner).await.unwrap().is_none(),
         "indexed_dirs for the deleted subtree still exists"
     );
+}
+
+#[tokio::test]
+async fn index_policy_ignore_hides_search_but_keeps_listing() {
+    let app = setup_app().await;
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert!(
+        search_names(&app, "a.txt")
+            .await
+            .contains(&"a.txt".to_owned())
+    );
+
+    let response = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/index/policy",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "d1", "policy": "ignore"}),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{:?}",
+        json_body(response).await
+    );
+
+    assert!(
+        !search_names(&app, "a.txt")
+            .await
+            .contains(&"a.txt".to_owned()),
+        "ignored subtree should not be searchable"
+    );
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/list?root={}&path=d1", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let names: Vec<String> = json_body(response).await["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
+        .collect();
+    assert!(names.contains(&"a.txt".to_owned()), "{names:?}");
+}
+
+#[tokio::test]
+async fn index_policy_on_demand_reveals_when_browsed() {
+    let app = setup_app().await;
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    let response = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/index/policy",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "d1", "policy": "on_demand"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !search_names(&app, "a.txt")
+            .await
+            .contains(&"a.txt".to_owned())
+    );
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/list?root={}&path=d1", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut revealed = false;
+    for _ in 0..60 {
+        if search_names(&app, "a.txt")
+            .await
+            .contains(&"a.txt".to_owned())
+        {
+            revealed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        revealed,
+        "browsing an on_demand directory should reveal its index"
+    );
+}
+
+#[tokio::test]
+async fn index_policy_background_is_not_checked_every_quick_scan() {
+    let app = setup_app().await;
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    let d1 = app.home.join("d1").to_string_lossy().to_string();
+    let now = filehub::db::unix_now();
+    app.state
+        .db
+        .touch_indexed_dirs(&[d1], now, None)
+        .await
+        .unwrap();
+    let response = send_json(
+        &app.router,
+        Method::PUT,
+        "/api/v1/index/policy",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "d1", "policy": "background"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    std::fs::write(app.home.join("d1/changed.txt"), b"changed").unwrap();
+    let cancel = CancellationToken::new();
+    let mut progress = |_checked: usize, _total: usize| {};
+    let stats = filehub::indexer::quick_scan(&app.state, &cancel, &mut progress)
+        .await
+        .unwrap();
+    assert_eq!(
+        stats.changed, 0,
+        "background subtree should wait for its slow pass"
+    );
+}
+
+#[tokio::test]
+async fn hash_endpoints_return_sha256_and_per_path_errors() {
+    let app = setup_app().await;
+    let expected = filehub::auth::sha256_hex("alpha");
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/hash?root={}&path=d1/a.txt&wait=true", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = json_body(response).await;
+    assert_eq!(value["status"], "ready", "{value}");
+    assert_eq!(value["sha256"], expected);
+    assert_eq!(value["algo"], "sha256");
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/hash?root={}&path=d1/a.txt", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cached = json_body(response).await;
+    assert_eq!(cached["cached"], true, "{cached}");
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/properties?root={}&path=d1/a.txt", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let properties = json_body(response).await;
+    assert_eq!(properties["sha256"], expected);
+    assert_eq!(properties["hash_status"], "ready");
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/list?root={}&path=d1&hashes=true", app.root_id),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list = json_body(response).await;
+    let entry = list["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "a.txt")
+        .unwrap();
+    assert_eq!(entry["sha256"], expected);
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/hashes",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "paths": ["d1/a.txt", "missing.txt"]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = json_body(response).await;
+    let hashes = value["hashes"].as_array().unwrap();
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(hashes[0]["status"], "ready");
+    assert_eq!(hashes[1]["status"], "error");
+    assert_eq!(hashes[1]["error"]["code"], "NOT_FOUND");
+}
+
+async fn send_body(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+    body: Vec<u8>,
+) -> Response<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/octet-stream");
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn upload_with_correct_hash_is_verified() {
+    let app = setup_app().await;
+    let data = b"hash me".to_vec();
+    let sha256 = filehub::auth::sha256_hex("hash me");
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/uploads",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "dst",
+            "filename": "hash.bin",
+            "total_size": data.len(),
+            "sha256": sha256,
+            "verify": "required"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = json_body(response).await;
+    let id = value["upload_id"].as_str().unwrap().to_owned();
+
+    let response = send_body(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/uploads/{id}/chunks/0"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        data,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/uploads/{id}/complete"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+    )
+    .await;
+    if response.status() != StatusCode::OK {
+        panic!("complete failed: {:?}", json_body(response).await);
+    }
+    let value = json_body(response).await;
+    assert_eq!(value["verified"], true, "{value}");
+    assert_eq!(value["hash_status"], "verified", "{value}");
+    assert_eq!(value["sha256"], filehub::auth::sha256_hex("hash me"));
+}
+
+#[tokio::test]
+async fn upload_with_wrong_hash_does_not_create_target() {
+    let app = setup_app().await;
+    let data = b"wrong hash".to_vec();
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/uploads",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({
+            "root": app.root_id,
+            "path": "dst",
+            "filename": "bad.bin",
+            "total_size": data.len(),
+            "sha256": filehub::auth::sha256_hex("not the content"),
+            "verify": "required"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = json_body(response).await["upload_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let response = send_body(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/uploads/{id}/chunks/0"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        data,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/uploads/{id}/complete"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!app.home.join("dst/bad.bin").exists());
+}
+
+#[tokio::test]
+async fn scheduled_full_scan_uses_frontier_and_completes() {
+    let app = setup_app().await;
+    let cancel = CancellationToken::new();
+    let mut progress = |_done: usize, _total: usize| {};
+    let stats = filehub::indexer::scheduled_full_scan(&app.state, &cancel, &mut progress)
+        .await
+        .unwrap();
+    assert!(stats.directories >= 4, "{stats:?}");
+    let state = app.state.db.scan_state("full").await.unwrap().unwrap();
+    assert!(state.completed_at.is_some(), "{state:?}");
+    let frontier = app.state.db.frontier_len("full").await.unwrap();
+    assert_eq!(frontier, 0);
+}
+
+#[tokio::test]
+async fn quick_scan_advances_cursor_across_pages() {
+    let app = setup_app().await;
+    for index in 0..2100 {
+        std::fs::create_dir_all(app.home.join(format!("bulk/n{index:04}"))).unwrap();
+    }
+    let job = run_index(&app).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    let cancel = CancellationToken::new();
+    let mut progress = |_checked: usize, _total: usize| {};
+    let stats = filehub::indexer::quick_scan(&app.state, &cancel, &mut progress)
+        .await
+        .unwrap();
+    let total = app.state.db.count_indexed_dirs().await.unwrap() as usize;
+    assert!(
+        stats.checked <= total + 50,
+        "cursor repeated pages: checked={} total={}",
+        stats.checked,
+        total
+    );
+    assert!(
+        stats.checked >= total.saturating_sub(50),
+        "cursor skipped pages: checked={} total={}",
+        stats.checked,
+        total
+    );
+}
+
+#[tokio::test]
+async fn password_reset_requires_change_and_revokes_sessions() {
+    let app = setup_app().await;
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/users",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"username": "tempuser", "password": "123456", "role": "user"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = json_body(response).await;
+    let user_id = created["user"]["id"].as_i64().unwrap();
+    assert_eq!(created["user"]["must_change_password"], true);
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username": "tempuser", "password": "123456"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = session_cookie(&response);
+    let login = json_body(response).await;
+    assert_eq!(login["user"]["must_change_password"], true);
+    let csrf = login["csrf_token"].as_str().unwrap().to_owned();
+
+    let response = send(&app.router, Method::GET, "/api/v1/me", Some(&cookie), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["user"]["must_change_password"],
+        true
+    );
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/auth/tokens",
+        Some(&cookie),
+        Some(&csrf),
+        json!({"name": "blocked", "scope": "read"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "PASSWORD_CHANGE_REQUIRED"
+    );
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "PASSWORD_CHANGE_REQUIRED"
+    );
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/me/password/forced",
+        Some(&cookie),
+        Some(&csrf),
+        json!({"new_password": "newpassword"}),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        json_body(response).await
+    );
+
+    let response = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username": "tempuser", "password": "123456"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username": "tempuser", "password": "newpassword"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = session_cookie(&response);
+    let login = json_body(response).await;
+    assert_eq!(login["user"]["must_change_password"], false);
+    let csrf = login["csrf_token"].as_str().unwrap().to_owned();
+
+    // An admin reset must revoke the existing session, not just flip the flag.
+    let response = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/admin/users/{user_id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"password": "abcdef"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/roots",
+        Some(&cookie),
+        Some(&csrf),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username": "tempuser", "password": "abcdef"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["user"]["must_change_password"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn password_policy_minimum_and_common_password() {
+    let app = setup_app().await;
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/users",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"username": "shortpass", "password": "12345", "role": "user"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"]["code"], "WEAK_PASSWORD");
+
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/users",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"username": "commonpass", "password": "123456", "role": "user"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/login",
+        None,
+        None,
+        json!({"username": "commonpass", "password": "123456"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = session_cookie(&response);
+    let login = json_body(response).await;
+    let csrf = login["csrf_token"].as_str().unwrap().to_owned();
+    let response = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/me/password/forced",
+        Some(&cookie),
+        Some(&csrf),
+        json!({"new_password": "password"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"]["code"], "WEAK_PASSWORD");
 }

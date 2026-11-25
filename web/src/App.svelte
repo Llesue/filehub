@@ -26,6 +26,7 @@
   import CodeEditor from './lib/components/CodeEditor.svelte';
   import TransferDialog from './lib/components/TransferDialog.svelte';
   import AuthScreen from './lib/components/AuthScreen.svelte';
+  import ForcePasswordChange from './lib/components/ForcePasswordChange.svelte';
   import SharePage from './lib/components/SharePage.svelte';
   import Icon from './lib/components/Icon.svelte';
   import AudioPlayer from './lib/components/AudioPlayer.svelte';
@@ -929,15 +930,7 @@
 
       try {
         const auth = await api.me();
-        user = auth.user;
-        userRemote = auth.remote ?? null;
-        csrf = auth.csrf_token;
-        ensureNotificationOwner(auth.user.id);
-        connectEvents(auth.user.id);
-        attachUploads(auth.user.id);
-        void restoreJobs(auth.user.id);
-        await loadPreferences();
-        await loadRoots();
+        handleAuth(auth);
       } catch (error) {
         if (!(error instanceof ApiError && error.status === 401)) {
           console.warn('could not restore session', error);
@@ -964,6 +957,12 @@
     user = auth.user;
     userRemote = auth.remote ?? null;
     csrf = auth.csrf_token;
+    if (auth.user.must_change_password) {
+      initialized = true;
+      loading = false;
+      stopBootSlowHint();
+      return;
+    }
     entries = [];
     filesLoading = true;
     filesLoadedOnce = false;
@@ -993,6 +992,7 @@
           user = auth.user;
           userRemote = auth.remote ?? null;
           csrf = auth.csrf_token;
+          if (auth.user.must_change_password) return;
         } catch (error) {
           if (error instanceof ApiError && error.status === 401) {
             uploadManager.detach();
@@ -2079,6 +2079,10 @@
       user = null;
       userRemote = null;
       csrf = '';
+      return;
+    }
+    if (error instanceof ApiError && error.code === 'PASSWORD_CHANGE_REQUIRED') {
+      user = user ? { ...user, must_change_password: true } : user;
       return;
     }
     if (error instanceof ApiError && error.status === 403) {
@@ -4244,6 +4248,12 @@
   <AuthScreen mode="setup" onSuccess={handleAuth} />
 {:else if !user}
   <AuthScreen mode="login" onSuccess={handleAuth} />
+{:else if user.must_change_password}
+  <ForcePasswordChange
+    {csrf}
+    onSuccess={handleAuth}
+    onLogout={() => void logout()}
+  />
 {:else}
   <div
     class="app"

@@ -6,7 +6,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,8 @@ pub struct Entry {
     pub created_at: i64,
     pub mime_type: String,
     pub has_preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub symlink_state: Option<String>,
     pub symlink_target: Option<String>,
 }
@@ -119,6 +121,7 @@ pub fn list_dir(resolved: &ResolvedPath, sort: &str, order: &str) -> Result<Vec<
             created_at,
             mime_type,
             has_preview: false,
+            sha256: None,
             symlink_state,
             symlink_target,
         });
@@ -1501,6 +1504,8 @@ pub fn dir_size_scan(
     ignore: &[String],
     cancel: &CancellationToken,
     use_logical: bool,
+    budget: Duration,
+    max_entries: u64,
     on_dir: &mut dyn FnMut(&Path, u64, i64, bool),
 ) -> Result<DirSizeResult, AppError> {
     let mut seen = HashSet::new();
@@ -1514,10 +1519,22 @@ pub fn dir_size_scan(
     let mut directories = 1_u64;
     let mut first_error: Option<String> = None;
     let mut partial = false;
+    let started = Instant::now();
 
     while !stack.is_empty() {
         if cancel.is_cancelled() {
             return Err(AppError::Cancelled);
+        }
+        if started.elapsed() >= budget || directories >= max_entries {
+            partial = true;
+            first_error.get_or_insert_with(|| "directory size budget reached".to_owned());
+            let total = stack.iter().map(|frame| frame.total).sum();
+            return Ok(DirSizeResult {
+                total,
+                partial,
+                error: first_error,
+                directories,
+            });
         }
         let Some(frame) = stack.last_mut() else {
             break;
@@ -1593,7 +1610,15 @@ pub fn path_size_cancellable(
     if !metadata.is_dir() {
         return Ok(0);
     }
-    let result = dir_size_scan(path, &[], cancel, true, &mut |_, _, _, _| {})?;
+    let result = dir_size_scan(
+        path,
+        &[],
+        cancel,
+        true,
+        Duration::from_secs(60),
+        200_000,
+        &mut |_, _, _, _| {},
+    )?;
     on_bytes(result.total);
     Ok(result.total)
 }

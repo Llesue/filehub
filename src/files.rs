@@ -1,7 +1,7 @@
 use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -132,6 +132,7 @@ pub struct ListQuery {
     limit: Option<usize>,
     cursor: Option<String>,
     focus: Option<String>,
+    hashes: Option<bool>,
 }
 
 async fn mark_shared_entries(
@@ -179,9 +180,43 @@ fn map_indexed_entry(entry: crate::db::IndexEntry, video_enabled: bool) -> fsops
         created_at: entry.created_at,
         mime_type: entry.mime_type,
         has_preview,
+        sha256: None,
         symlink_state: None,
         symlink_target: None,
     }
+}
+
+async fn attach_hashes(
+    state: &Arc<AppState>,
+    entries: &mut [fsops::Entry],
+    base: &std::path::Path,
+) -> Result<(), AppError> {
+    let paths: Vec<(usize, String)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.is_dir)
+        .map(|(index, entry)| (index, base.join(&entry.name).to_string_lossy().to_string()))
+        .collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let hashes = state
+        .db
+        .file_hashes_for_paths(
+            paths.iter().map(|(_, path)| path.clone()).collect(),
+            "sha256",
+        )
+        .await
+        .map_err(AppError::internal)?;
+    for (index, path) in paths {
+        if let Some(hash) = hashes.get(&path)
+            && hash.size == entries[index].size
+            && hash.mtime_ns / 1_000_000_000 == entries[index].modified
+        {
+            entries[index].sha256 = Some(hash.sha256.clone());
+        }
+    }
+    Ok(())
 }
 
 pub async fn list(
@@ -274,7 +309,9 @@ pub async fn list(
         .transpose()?
         .unwrap_or(0);
 
-    if !sort_by_size && !has_symlinks {
+    let index_policy = crate::policy::resolve(&state, &resolved.absolute).await?;
+
+    if !sort_by_size && !has_symlinks && !index_policy.is_ignore() {
         if let Some(focus_name) = focus.as_deref() {
             if let Some((indexed_mtime, focus_offset, total)) = state
                 .db
@@ -310,6 +347,17 @@ pub async fn list(
                         entries = enriched;
                     }
                     let focus_index = focus_offset.saturating_sub(page_start);
+                    schedule_browse_index(
+                        &state,
+                        current.user.id,
+                        resolved.root.clone(),
+                        resolved.relative.clone(),
+                        real_path.clone(),
+                    )
+                    .await;
+                    if query.hashes.unwrap_or(false) {
+                        attach_hashes(&state, &mut entries, &resolved.absolute).await?;
+                    }
                     return Ok(Json(json!({
                         "root": root_json(&resolved.root),
                         "path": resolved.relative,
@@ -349,6 +397,17 @@ pub async fn list(
                         let (enriched, _) =
                             enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
                         entries = enriched;
+                    }
+                    schedule_browse_index(
+                        &state,
+                        current.user.id,
+                        resolved.root.clone(),
+                        resolved.relative.clone(),
+                        real_path.clone(),
+                    )
+                    .await;
+                    if query.hashes.unwrap_or(false) {
+                        attach_hashes(&state, &mut entries, &resolved.absolute).await?;
                     }
                     return Ok(Json(json!({
                         "root": root_json(&resolved.root),
@@ -404,17 +463,19 @@ pub async fn list(
         } else {
             (offset, None)
         };
-        let entries: Vec<fsops::Entry> = entries.into_iter().skip(page_start).take(limit).collect();
-        if settings.settings.index.auto_index_on_browse {
-            schedule_browse_index(
-                &state,
-                current.user.id,
-                resolved.root.clone(),
-                resolved.relative.clone(),
-                real_path.clone(),
-            )
-            .await;
+        let mut entries: Vec<fsops::Entry> =
+            entries.into_iter().skip(page_start).take(limit).collect();
+        if query.hashes.unwrap_or(false) {
+            attach_hashes(&state, &mut entries, &resolved.absolute).await?;
         }
+        schedule_browse_index(
+            &state,
+            current.user.id,
+            resolved.root.clone(),
+            resolved.relative.clone(),
+            real_path.clone(),
+        )
+        .await;
         let mut payload = json!({
             "root": root_json(&resolved.root),
             "path": resolved.relative,
@@ -463,15 +524,16 @@ pub async fn list(
             let (enriched, _) = enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
             entries = enriched;
         }
-        if settings.settings.index.auto_index_on_browse {
-            schedule_browse_index(
-                &state,
-                current.user.id,
-                resolved.root.clone(),
-                resolved.relative.clone(),
-                real_path.clone(),
-            )
-            .await;
+        schedule_browse_index(
+            &state,
+            current.user.id,
+            resolved.root.clone(),
+            resolved.relative.clone(),
+            real_path.clone(),
+        )
+        .await;
+        if query.hashes.unwrap_or(false) {
+            attach_hashes(&state, &mut entries, &resolved.absolute).await?;
         }
         let focus_index = focus_offset - page_start;
         return Ok(Json(json!({
@@ -512,15 +574,16 @@ pub async fn list(
         let (enriched, _) = enrich_directory_sizes(&state, entries, &resolved.absolute).await?;
         entries = enriched;
     }
-    if settings.settings.index.auto_index_on_browse {
-        schedule_browse_index(
-            &state,
-            current.user.id,
-            resolved.root.clone(),
-            resolved.relative.clone(),
-            real_path.clone(),
-        )
-        .await;
+    schedule_browse_index(
+        &state,
+        current.user.id,
+        resolved.root.clone(),
+        resolved.relative.clone(),
+        real_path.clone(),
+    )
+    .await;
+    if query.hashes.unwrap_or(false) {
+        attach_hashes(&state, &mut entries, &resolved.absolute).await?;
     }
 
     Ok(Json(json!({
@@ -546,6 +609,61 @@ async fn schedule_browse_index(
     relative: String,
     real_path: String,
 ) {
+    let settings = state.settings();
+    let policy = match crate::policy::resolve(state, std::path::Path::new(&real_path)).await {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::debug!(%error, path = %real_path, "failed to resolve index policy");
+            return;
+        }
+    };
+    if policy.is_ignore() {
+        return;
+    }
+    if !settings.settings.index.auto_index_on_browse
+        && policy != crate::policy::IndexPolicy::OnDemand
+    {
+        return;
+    }
+    let current_mtime = match crate::fsops::dir_mtime_ns(std::path::Path::new(&real_path)) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    if let Ok(Some((indexed_mtime, status))) = state.db.indexed_dir_mtime_status(&real_path).await {
+        if status == "ready" && indexed_mtime == current_mtime {
+            if policy == crate::policy::IndexPolicy::OnDemand
+                && let Err(error) = state.db.set_indexed_dir_visible(&real_path, true).await
+            {
+                tracing::debug!(%error, path = %real_path, "failed to reveal on-demand index");
+            }
+            return;
+        }
+        if indexed_mtime != current_mtime || status != "ready" {
+            state.note_index_change(
+                std::path::Path::new(&real_path),
+                crate::gate::ChangeReason::Browse,
+            );
+            return;
+        }
+    }
+    if policy == crate::policy::IndexPolicy::Background && state.interactive_pressure() {
+        state.note_index_change(
+            std::path::Path::new(&real_path),
+            crate::gate::ChangeReason::Browse,
+        );
+        return;
+    }
+    let settle = Duration::from_secs(settings.settings.index.settle_seconds.max(1));
+    if !state
+        .gate
+        .allow_index(std::path::Path::new(&real_path), settle)
+    {
+        state.note_index_change(
+            std::path::Path::new(&real_path),
+            crate::gate::ChangeReason::Browse,
+        );
+        return;
+    }
     let key = format!("dir:{real_path}");
     if state.jobs.active_job_exact(JobKind::Index, &key).is_some() {
         return;
@@ -565,6 +683,8 @@ async fn schedule_browse_index(
         "auto": true,
     });
     let job_state = Arc::clone(state);
+    let gate_path = std::path::PathBuf::from(&real_path);
+    let gate_retry_path = gate_path.clone();
     let result = state
         .jobs
         .submit(
@@ -579,24 +699,40 @@ async fn schedule_browse_index(
                 let mut progress = |directories: usize, _entries: usize| {
                     ctx.report(directories, 1, 0, 0);
                 };
-                let stats = crate::indexer::index_path(
+                let result = crate::indexer::index_path(
                     &job_state,
                     user_id,
                     root,
                     &relative,
                     false,
+                    false,
                     &cancel,
                     &mut progress,
                 )
-                .await?;
-                Ok(JobOutcome::done(json!(stats), 1, 1))
+                .await;
+                match result {
+                    Ok(stats) => Ok(JobOutcome::done(json!(stats), 1, 1)),
+                    Err(error) => {
+                        job_state
+                            .gate
+                            .mark_failed(&gate_path, Duration::from_secs(30));
+                        Err(error)
+                    }
+                }
             },
         )
         .await;
     match result {
         Ok(_) => {}
-        Err(AppError::QueueFull) => {}
-        Err(error) => tracing::debug!(%error, path = %real_path, "failed to queue browse index"),
+        Err(AppError::QueueFull) => {
+            state.note_index_change(&gate_retry_path, crate::gate::ChangeReason::Browse);
+        }
+        Err(error) => {
+            state
+                .gate
+                .mark_failed(&gate_retry_path, Duration::from_secs(30));
+            tracing::debug!(%error, path = %real_path, "failed to queue browse index");
+        }
     }
 }
 
@@ -627,6 +763,11 @@ async fn enrich_directory_sizes(
         .map_err(AppError::internal)?;
     let mut unknown = Vec::new();
     for (index, path) in dirs {
+        if let Ok(policy) = crate::policy::resolve(state, std::path::Path::new(&path)).await
+            && policy.is_ignore()
+        {
+            continue;
+        }
         if let Some((_mtime, size, partial, status)) = indexed.get(&path)
             && status == "ready"
             && !partial
@@ -1432,6 +1573,10 @@ pub struct CreateUploadRequest {
     chunk_size: Option<i64>,
     /// Source file modified time as Unix seconds. Omitted keeps server time.
     mtime: Option<i64>,
+    /// Expected lowercase SHA-256 of the completed file.
+    sha256: Option<String>,
+    /// auto | required | none. Defaults to auto.
+    verify: Option<String>,
 }
 
 pub(crate) fn validate_upload_mtime(value: Option<i64>) -> Result<Option<i64>, AppError> {
@@ -1441,6 +1586,29 @@ pub(crate) fn validate_upload_mtime(value: Option<i64>) -> Result<Option<i64>, A
         )),
         Some(0) | None => Ok(None),
         Some(value) => Ok(Some(value)),
+    }
+}
+
+pub(crate) fn validate_upload_sha256(value: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(
+            "sha256 must be a 64-character lowercase hex string",
+        ));
+    }
+    Ok(Some(value))
+}
+
+pub(crate) fn validate_upload_verify(value: Option<String>) -> Result<String, AppError> {
+    let value = value.unwrap_or_else(|| "auto".to_owned());
+    match value.as_str() {
+        "auto" | "required" | "none" => Ok(value),
+        _ => Err(AppError::bad_request(
+            "verify must be auto, required or none",
+        )),
     }
 }
 
@@ -1463,7 +1631,12 @@ pub async fn create_upload(
     let root = load_root(&state, current.user.id, request.root).await?;
     let path = request.path.unwrap_or_default();
     let mtime = validate_upload_mtime(request.mtime)?;
+    let sha256 = validate_upload_sha256(request.sha256)?;
+    let verify = validate_upload_verify(request.verify)?;
     if root.is_remote() {
+        if sha256.is_some() || verify != "auto" {
+            return Err(AppError::HashUnsupported);
+        }
         let filename = validate_filename(&request.filename)?;
         let size = validate_upload_size(&state, request.total_size)?;
         let chunk_size = request
@@ -1557,7 +1730,7 @@ pub async fn create_upload(
     let temp = fsops::create_upload_temp(&resolved.absolute, &upload_id)?;
     let now = unix_now();
     let ttl = state.settings().settings.uploads.session_ttl_hours as i64;
-    let upload = UploadSession {
+    let mut upload = UploadSession {
         id: upload_id.clone(),
         user_id: current.user.id,
         root_id: root.id,
@@ -1568,6 +1741,11 @@ pub async fn create_upload(
         received: 0,
         chunk_bitmap: vec![0; ((chunks + 7) / 8) as usize],
         temp_path: temp.to_string_lossy().to_string(),
+        sha256,
+        verify,
+        hash_status: None,
+        hash_error: None,
+        verified_at: None,
         expires_at: now + ttl.saturating_mul(3600),
         created_at: now,
         updated_at: now,
@@ -1577,6 +1755,13 @@ pub async fn create_upload(
         token_id: None,
         mtime,
     };
+    if upload.sha256.is_some() {
+        upload.hash_status = Some(if upload.verify == "none" {
+            "none".to_owned()
+        } else {
+            "pending".to_owned()
+        });
+    }
 
     if let Err(err) = state.db.insert_upload(&upload).await {
         fsops::delete_temp(&temp);
@@ -1612,6 +1797,10 @@ pub async fn upload_status(
         "received": upload.received,
         "received_chunks": received_chunks,
         "expires_at": upload.expires_at,
+        "sha256_expected": upload.sha256,
+        "verify": upload.verify,
+        "hash_status": upload.hash_status,
+        "hash_error": upload.hash_error,
     })))
 }
 
@@ -1758,21 +1947,77 @@ pub async fn complete_upload(
     let mut target_path = target.absolute.clone();
     let mut target_relative = target_relative;
     let target_existed = target_path.exists();
+    if target_existed && conflict.as_str() == "skip" {
+        fsops::delete_temp(&temp);
+        state
+            .db
+            .delete_upload(&upload.id, current.user.id)
+            .await
+            .map_err(AppError::internal)?;
+        return Ok(Json(json!({
+            "path": target_relative,
+            "size": upload.total_size,
+            "skipped": true,
+            "verified": false,
+            "hash_status": "none",
+        })));
+    }
+
+    let hash_settings = state.settings().settings.hash.clone();
+    let size_u64 = upload.total_size.max(0) as u64;
+    let mut verified_hash: Option<String> = None;
+    let mut hash_status = "none";
+    if let Some(expected) = upload.sha256.as_deref() {
+        let should_verify = match upload.verify.as_str() {
+            "none" => false,
+            "required" => true,
+            _ => size_u64 <= hash_settings.upload_verify_max_bytes,
+        };
+        if upload.verify == "required" && size_u64 > hash_settings.upload_verify_max_bytes {
+            fsops::delete_temp(&temp);
+            let _ = state.db.delete_upload(&upload.id, current.user.id).await;
+            let error = AppError::HashVerifyTooLarge;
+            warn_upload(current.user.id, &upload.filename, "hash_size", &error);
+            return Err(error);
+        }
+        if should_verify {
+            match state
+                .hash
+                .verify_upload(
+                    &temp,
+                    expected,
+                    size_u64,
+                    hash_settings.upload_verify_max_bytes,
+                )
+                .await
+            {
+                Ok((sha256, _size, _mtime)) => {
+                    verified_hash = Some(sha256);
+                    hash_status = "verified";
+                }
+                Err(error) => {
+                    fsops::delete_temp(&temp);
+                    let _ = state.db.delete_upload(&upload.id, current.user.id).await;
+                    let _ = state
+                        .db
+                        .update_upload_hash_status(
+                            &upload.id,
+                            current.user.id,
+                            "mismatch",
+                            Some(&error.to_string()),
+                        )
+                        .await;
+                    warn_upload(current.user.id, &upload.filename, "hash", &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            hash_status = "too_large";
+        }
+    }
+
     if target_existed {
         match conflict.as_str() {
-            "skip" => {
-                fsops::delete_temp(&temp);
-                state
-                    .db
-                    .delete_upload(&upload.id, current.user.id)
-                    .await
-                    .map_err(AppError::internal)?;
-                return Ok(Json(json!({
-                    "path": target_relative,
-                    "size": upload.total_size,
-                    "skipped": true,
-                })));
-            }
             "overwrite" => {
                 if target_path.is_dir() {
                     let error = AppError::conflict("target is a directory");
@@ -1806,6 +2051,29 @@ pub async fn complete_upload(
         warn_upload(current.user.id, &upload.filename, "finalize", &error);
         return Err(error);
     }
+    if let Some(sha256) = verified_hash.as_deref()
+        && let Ok(metadata) = tokio::fs::metadata(&target_path).await
+    {
+        let mtime_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as i64)
+            .unwrap_or_default();
+        if let Err(error) = state
+            .db
+            .upsert_file_hash(
+                &target_path.to_string_lossy(),
+                "sha256",
+                sha256,
+                metadata.len() as i64,
+                mtime_ns,
+            )
+            .await
+        {
+            tracing::warn!(%error, path = %target_path.display(), "failed to cache upload hash");
+        }
+    }
     if !target_existed {
         state.adjust_entries(current.user.id, 1);
     }
@@ -1826,6 +2094,9 @@ pub async fn complete_upload(
     state
         .invalidate_path_caches_with_usage(&target_path, Some(current.user.id), false, usage)
         .await;
+    if let Some(parent) = target_path.parent() {
+        state.note_index_change(parent, crate::gate::ChangeReason::Upload);
+    }
 
     audit(
         &state,
@@ -1839,6 +2110,9 @@ pub async fn complete_upload(
     Ok(Json(json!({
         "path": target_relative,
         "size": upload.total_size,
+        "verified": verified_hash.is_some(),
+        "hash_status": hash_status,
+        "sha256": verified_hash,
     })))
 }
 
@@ -2110,10 +2384,17 @@ pub async fn delete_confirm(
         cache_targets.push(resolved.absolute.clone());
     }
     let phase = Instant::now();
+    let note_targets = cache_targets.clone();
     state
         .invalidate_paths_exact(&cache_targets, Some(current.user.id))
         .await;
     state.schedule_cache_cleanup(cache_targets);
+    for target in &note_targets {
+        state.gate.clear_subtree(target);
+        if let Some(parent) = target.parent() {
+            state.note_index_change(parent, crate::gate::ChangeReason::Delete);
+        }
+    }
     cache_ns += phase.elapsed().as_nanos();
 
     let audit_started = Instant::now();
@@ -2628,6 +2909,8 @@ async fn enqueue_dir_size(
                         &ignore,
                         &scan_cancel,
                         use_logical,
+                        Duration::from_secs(60),
+                        200_000,
                         &mut |path, total, mtime, partial| {
                             let error = partial
                                 .then(|| "some entries could not be read".to_owned());
@@ -2769,6 +3052,9 @@ pub async fn mkdir(
             UsageInvalidation::None,
         )
         .await;
+    if let Some(parent) = resolved.absolute.parent() {
+        state.note_index_change(parent, crate::gate::ChangeReason::Write);
+    }
     audit(
         &state,
         current.user.id,
@@ -2883,6 +3169,13 @@ pub async fn rename(
         )
         .await;
     state.schedule_cache_cleanup(cache_targets);
+    state.gate.clear_subtree(&source.absolute);
+    if let Some(parent) = source.absolute.parent() {
+        state.note_index_change(parent, crate::gate::ChangeReason::Rename);
+    }
+    if let Some(parent) = target.absolute.parent() {
+        state.note_index_change(parent, crate::gate::ChangeReason::Rename);
+    }
     audit(
         &state,
         current.user.id,

@@ -233,6 +233,16 @@ async fn root_crud_overlap_permissions_and_quota() {
         .as_str()
         .unwrap()
         .to_owned();
+    let forced = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/me/password/forced",
+        Some(&alice_cookie),
+        Some(&alice_csrf),
+        json!({"new_password": "new password 9"}),
+    )
+    .await;
+    assert_eq!(forced.status(), StatusCode::NO_CONTENT);
     let alice_roots = send(
         &app.router,
         Method::GET,

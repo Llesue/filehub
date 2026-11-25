@@ -488,6 +488,16 @@ async fn admin_feature_toggles_are_enforced_server_side() {
         .as_str()
         .unwrap()
         .to_owned();
+    let forced = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/me/password/forced",
+        Some(&alice_cookie),
+        Some(&alice_csrf),
+        json!({"new_password": "new password 9"}),
+    )
+    .await;
+    assert_eq!(forced.status(), StatusCode::NO_CONTENT);
     let alice_root = send_json(
         &app.router,
         Method::POST,

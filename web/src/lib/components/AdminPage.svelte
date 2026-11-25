@@ -186,7 +186,11 @@
   async function resetPassword(value: string): Promise<void> {
     if (!passwordUser) return;
     await api.updateUser(passwordUser.id, { password: value }, csrf);
-    showNotice(t($language, '密码已重置'), 'info', t($language, '操作成功'));
+    showNotice(
+      t($language, '临时密码已设置，用户下次登录必须修改'),
+      'info',
+      t($language, '操作成功'),
+    );
   }
 
   async function toggleRole(user: User): Promise<void> {
@@ -637,7 +641,6 @@
     'thumbnails.video_timeout_secs': 15,
     'index.quick_scan_minutes': 60,
     'index.full_scan_hours': 24,
-    'index.scan_workers': 4,
     'index.max_entries_per_dir': 200_000,
     'uploads.session_ttl_hours': 24,
     'uploads.concurrency_per_user': 32,
@@ -756,7 +759,6 @@
   const indexNumberFields: NumberField[] = [
     { key: 'index.quick_scan_minutes', label: '快速扫描间隔', min: 1, max: 10_080, unit: '分钟' },
     { key: 'index.full_scan_hours', label: '全量扫描间隔', min: 1, max: 8_760, unit: '小时' },
-    { key: 'index.scan_workers', label: '扫描线程数', min: 1, max: 16, hint: '建议 2–4，HDD 用 2' },
     { key: 'index.max_entries_per_dir', label: '单目录条目上限', min: 1000, max: 2_000_000 },
   ];
   const indexBoolFields: BoolField[] = [
@@ -875,7 +877,6 @@
     'index.scheduled_scans',
     'index.quick_scan_minutes',
     'index.full_scan_hours',
-    'index.scan_workers',
     'index.max_entries_per_dir',
     'index.ignore',
   ];

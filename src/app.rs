@@ -204,6 +204,7 @@ pub async fn run_until(
         shutdown.await;
         crate::federation::presence::broadcast_shutdown(&shutdown_state).await;
         shutdown_state.shutdown.cancel();
+        shutdown_state.hash.cancel();
         let cancelled = shutdown_state.jobs.cancel_all();
         if cancelled > 0 {
             tracing::info!(cancelled, "cancelling background jobs for shutdown");
@@ -218,6 +219,7 @@ pub async fn run_until(
     .context("http server failed")?;
     state.jobs.cancel_all();
     state.jobs.wait_idle().await;
+    state.hash.cancel();
     state.flush_audit().await;
     match state.db.checkpoint().await {
         Ok(true) => tracing::warn!("shutdown WAL checkpoint was busy"),

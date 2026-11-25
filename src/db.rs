@@ -82,6 +82,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (35, include_str!("../migrations/0035_remote_avatar.sql")),
     (36, include_str!("../migrations/0036_upload_mtime.sql")),
     (37, include_str!("../migrations/0037_mount_endpoints.sql")),
+    (38, include_str!("../migrations/0038_file_hashes.sql")),
+    (39, include_str!("../migrations/0039_index_scan_state.sql")),
+    (40, include_str!("../migrations/0040_index_policies.sql")),
+    (41, include_str!("../migrations/0041_upload_hash_state.sql")),
+    (
+        42,
+        include_str!("../migrations/0042_user_password_state.sql"),
+    ),
 ];
 
 pub fn unix_now() -> i64 {
@@ -108,6 +116,8 @@ pub struct User {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_login_at: Option<i64>,
+    pub must_change_password: bool,
+    pub password_changed_at: Option<i64>,
 }
 
 impl User {
@@ -128,6 +138,8 @@ impl User {
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
             last_login_at: row.get("last_login_at")?,
+            must_change_password: row.get::<_, i64>("must_change_password")? != 0,
+            password_changed_at: row.get("password_changed_at")?,
         })
     }
 }
@@ -199,6 +211,11 @@ pub struct UploadSession {
     pub received: i64,
     pub chunk_bitmap: Vec<u8>,
     pub temp_path: String,
+    pub sha256: Option<String>,
+    pub verify: String,
+    pub hash_status: Option<String>,
+    pub hash_error: Option<String>,
+    pub verified_at: Option<i64>,
     pub expires_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -359,6 +376,7 @@ pub struct TrustedLink {
 pub struct Db {
     connections: Vec<Arc<Mutex<Connection>>>,
     next: AtomicUsize,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Clone for Db {
@@ -366,6 +384,7 @@ impl Clone for Db {
         Self {
             connections: self.connections.clone(),
             next: AtomicUsize::new(0),
+            write_lock: Arc::clone(&self.write_lock),
         }
     }
 }
@@ -502,6 +521,7 @@ impl Db {
         Ok(Self {
             connections,
             next: AtomicUsize::new(0),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -531,6 +551,15 @@ impl Db {
         .await
         .context("database task failed")?;
         result.map_err(|error| anyhow::anyhow!("database query failed: {error}"))
+    }
+
+    async fn call_serialized<T, F>(&self, f: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
+    {
+        let _permit = self.write_lock.lock().await;
+        self.call(f).await
     }
 
     pub async fn count_users(&self) -> anyhow::Result<i64> {
@@ -653,15 +682,85 @@ impl Db {
         .await
     }
 
-    pub async fn update_user_password(&self, id: i64, password_hash: &str) -> anyhow::Result<bool> {
+    pub async fn update_user_password(
+        &self,
+        id: i64,
+        password_hash: &str,
+        must_change_password: bool,
+        password_changed_at: Option<i64>,
+    ) -> anyhow::Result<bool> {
         let password_hash = password_hash.to_owned();
         self.call(move |connection| {
             let now = unix_now();
             let changed = connection.execute(
-                "UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
-                params![password_hash, now, id],
+                "UPDATE users SET password_hash = ?1, must_change_password = ?2, \
+                 password_changed_at = ?3, updated_at = ?4 \
+                 WHERE id = ?5 AND deleted_at IS NULL",
+                params![
+                    password_hash,
+                    must_change_password as i64,
+                    password_changed_at,
+                    now,
+                    id
+                ],
             )?;
             Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn set_user_must_change_password(
+        &self,
+        id: i64,
+        required: bool,
+    ) -> anyhow::Result<()> {
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE users SET must_change_password = ?1, updated_at = ?2 \
+                 WHERE id = ?3 AND deleted_at IS NULL",
+                params![required as i64, unix_now(), id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_user_sessions(&self, user_id: i64) -> anyhow::Result<usize> {
+        self.call(move |connection| {
+            let removed =
+                connection.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn delete_user_sessions_except(
+        &self,
+        user_id: i64,
+        keep_token_hash: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        let keep_token_hash = keep_token_hash.map(str::to_owned);
+        self.call(move |connection| {
+            let removed = if let Some(keep) = keep_token_hash {
+                connection.execute(
+                    "DELETE FROM sessions WHERE user_id = ?1 AND token_hash != ?2",
+                    params![user_id, keep],
+                )?
+            } else {
+                connection.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?
+            };
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn delete_user_tokens(&self, user_id: i64) -> anyhow::Result<usize> {
+        self.call(move |connection| {
+            let removed = connection.execute(
+                "DELETE FROM api_tokens WHERE user_id = ?1",
+                params![user_id],
+            )?;
+            Ok(removed)
         })
         .await
     }
@@ -1343,8 +1442,8 @@ impl Db {
                 "INSERT INTO upload_sessions \
                  (id, user_id, root_id, dir_path, filename, total_size, chunk_size, received, \
                   chunk_bitmap, temp_path, sha256, expires_at, created_at, updated_at, remote_upload_id, \
-                  if_match, if_none_match, token_id, mtime) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?12, ?13, ?14, ?15, ?16, ?17)",
+                  if_match, if_none_match, token_id, mtime, verify, hash_status, hash_error, verified_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                 params![
                     upload.id,
                     upload.user_id,
@@ -1356,13 +1455,18 @@ impl Db {
                     upload.received,
                     upload.chunk_bitmap,
                     upload.temp_path,
+                    upload.sha256,
                     upload.expires_at,
                     upload.created_at,
                     upload.remote_upload_id,
                     upload.if_match,
                     upload.if_none_match,
                     upload.token_id,
-                    upload.mtime
+                    upload.mtime,
+                    upload.verify,
+                    upload.hash_status,
+                    upload.hash_error,
+                    upload.verified_at
                 ],
             )?;
             Ok(())
@@ -1381,7 +1485,8 @@ impl Db {
                 .query_row(
                     "SELECT id, user_id, root_id, dir_path, filename, total_size, chunk_size, \
                      received, chunk_bitmap, temp_path, expires_at, created_at, updated_at, \
-                     remote_upload_id, if_match, if_none_match, token_id, mtime \
+                     remote_upload_id, if_match, if_none_match, token_id, mtime, \
+                     sha256, verify, hash_status, hash_error, verified_at \
                      FROM upload_sessions WHERE id = ?1 AND user_id = ?2",
                     params![id, user_id],
                     |row| {
@@ -1404,6 +1509,13 @@ impl Db {
                             if_none_match: row.get(15)?,
                             token_id: row.get(16)?,
                             mtime: row.get(17)?,
+                            sha256: row.get(18)?,
+                            verify: row
+                                .get::<_, Option<String>>(19)?
+                                .unwrap_or_else(|| "auto".to_owned()),
+                            hash_status: row.get(20)?,
+                            hash_error: row.get(21)?,
+                            verified_at: row.get(22)?,
                         })
                     },
                 )
@@ -1421,7 +1533,8 @@ impl Db {
             let mut statement = connection.prepare(
                 "SELECT id, user_id, root_id, dir_path, filename, total_size, chunk_size, \
                         received, chunk_bitmap, temp_path, expires_at, created_at, updated_at, \
-                        remote_upload_id, if_match, if_none_match, token_id, mtime \
+                        remote_upload_id, if_match, if_none_match, token_id, mtime, \
+                        sha256, verify, hash_status, hash_error, verified_at \
                  FROM upload_sessions WHERE user_id = ?1 AND root_id = ?2",
             )?;
             let rows = statement.query_map(params![user_id, root_id], |row| {
@@ -1444,6 +1557,13 @@ impl Db {
                     if_none_match: row.get(15)?,
                     token_id: row.get(16)?,
                     mtime: row.get(17)?,
+                    sha256: row.get(18)?,
+                    verify: row
+                        .get::<_, Option<String>>(19)?
+                        .unwrap_or_else(|| "auto".to_owned()),
+                    hash_status: row.get(20)?,
+                    hash_error: row.get(21)?,
+                    verified_at: row.get(22)?,
                 })
             })?;
             rows.collect()
@@ -1883,6 +2003,7 @@ impl Db {
     }
 
     pub async fn upsert_index_dir(&self, real_path: &str, mtime_ns: i64) -> anyhow::Result<i64> {
+        let _permit = self.write_lock.lock().await;
         let real_path = real_path.to_owned();
         self.call(move |connection| {
             connection.query_row(
@@ -1903,6 +2024,7 @@ impl Db {
         dir_id: i64,
         entries: Vec<IndexEntry>,
     ) -> anyhow::Result<usize> {
+        let _permit = self.write_lock.lock().await;
         // Commit in bounded chunks. A single transaction for a directory with
         // tens of thousands of entries keeps the SQLite writer lock for seconds
         // and makes deletes/uploads/listing wait behind it.
@@ -1976,6 +2098,7 @@ impl Db {
         partial: bool,
         error: Option<&str>,
     ) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
         let status = status.to_owned();
         let error = error.map(str::to_owned);
         self.call(move |connection| {
@@ -2236,6 +2359,7 @@ impl Db {
         mtime_ns: i64,
         error: Option<&str>,
     ) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
         let real_path = real_path.to_owned();
         let status = status.to_owned();
         let has_value = i64::from(status == "ready");
@@ -2270,6 +2394,7 @@ impl Db {
     /// successfully calculated value available for stale-while-revalidate
     /// responses.
     pub async fn begin_directory_size(&self, real_path: &str, mtime_ns: i64) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
         let real_path = real_path.to_owned();
         self.call(move |connection| {
             connection.execute(
@@ -2295,6 +2420,7 @@ impl Db {
         mtime_ns: i64,
         error: Option<&str>,
     ) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
         let real_path = real_path.to_owned();
         let status = status.to_owned();
         let error = error.map(str::to_owned);
@@ -2329,6 +2455,7 @@ impl Db {
         &self,
         rows: Vec<(String, i64, i64, Option<String>)>,
     ) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
         if rows.is_empty() {
             return Ok(());
         }
@@ -2386,6 +2513,7 @@ impl Db {
         prefix: &str,
         limit: usize,
     ) -> anyhow::Result<usize> {
+        let _permit = self.write_lock.lock().await;
         let bounds = Self::subtree_bounds(prefix);
         if bounds.is_empty() {
             return Ok(0);
@@ -2481,6 +2609,7 @@ impl Db {
     /// Apply a target + ancestor cache invalidation chain in one transaction.
     /// This collapses many short write attempts into a single writer-lock wait.
     pub async fn invalidate_path_chain(&self, paths: Vec<String>) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
         if paths.is_empty() {
             return Ok(());
         }
@@ -2852,6 +2981,11 @@ impl Db {
                  WHERE status IN ('queued', 'running')",
                 [],
             )?;
+            connection.execute(
+                "UPDATE indexed_dirs SET status = 'stale', visible = 0 \
+                 WHERE status = 'indexing'",
+                [],
+            )?;
             Ok(changed)
         })
         .await
@@ -2941,6 +3075,15 @@ impl Db {
         self.call(|connection| {
             let busy: i64 =
                 connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            Ok(busy != 0)
+        })
+        .await
+    }
+
+    pub async fn checkpoint_passive(&self) -> anyhow::Result<bool> {
+        self.call(|connection| {
+            let busy: i64 =
+                connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(0))?;
             Ok(busy != 0)
         })
         .await
@@ -3241,7 +3384,8 @@ impl Db {
                         e.mime_type, e.has_preview, e.is_hidden \
                  FROM index_fts JOIN index_entries e ON e.id = index_fts.rowid \
                  JOIN indexed_dirs d ON d.id = e.dir_id \
-                 WHERE index_fts MATCH ?1 AND (",
+                 WHERE d.status IN ('ready', 'stale') AND d.visible = 1 \
+                   AND index_fts MATCH ?1 AND (",
             );
             let mut params: Vec<rusqlite::types::Value> =
                 vec![rusqlite::types::Value::Text(fts_query)];
@@ -3373,7 +3517,8 @@ impl Db {
                         e.mime_type, e.has_preview, e.is_hidden \
                  FROM index_name_bigrams b JOIN index_entries e ON e.id = b.entry_id \
                  JOIN indexed_dirs d ON d.id = e.dir_id \
-                 WHERE b.gram = ?1 AND (",
+                 WHERE d.status IN ('ready', 'stale') AND d.visible = 1 \
+                   AND b.gram = ?1 AND (",
             );
             let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(gram)];
             let mut index = 2;
@@ -3545,7 +3690,8 @@ impl Db {
                             e.mime_type, e.has_preview, e.is_hidden \
                      FROM index_fts JOIN index_entries e ON e.id = index_fts.rowid \
                      JOIN indexed_dirs d ON d.id = e.dir_id \
-                     WHERE index_fts MATCH ?1
+                     WHERE d.status IN ('ready', 'stale') AND d.visible = 1 \
+                       AND index_fts MATCH ?1
                        AND (e.real_path = ?3 OR e.real_path LIKE ?4 ESCAPE '!')
                        AND (?5 = 1 OR e.name NOT LIKE '.%')
                        AND (?6 IS NULL OR e.size >= ?6)
@@ -3606,7 +3752,8 @@ impl Db {
                     "SELECT e.name, e.real_path, e.is_dir, e.size, e.mtime, e.created_at, \
                             e.mime_type, e.has_preview, e.is_hidden \
                      FROM index_entries e JOIN indexed_dirs d ON d.id = e.dir_id \
-                     WHERE e.name LIKE ?1 ESCAPE '\\'
+                     WHERE d.status IN ('ready', 'stale') AND d.visible = 1 \
+                       AND e.name LIKE ?1 ESCAPE '\\'
                        AND (e.real_path = ?3 OR e.real_path LIKE ?4 ESCAPE '!')
                        AND (?5 = 1 OR e.name NOT LIKE '.%')
                        AND (?6 IS NULL OR e.size >= ?6)
@@ -3960,6 +4107,30 @@ impl Db {
                 params![revoked as i64, id, creator_id],
             )?;
             Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Flip every expired, still-active share to revoked and return the rows
+    /// that changed. Expiry is authoritative: once `expires_at` passes the
+    /// share must look and behave exactly like a manually stopped share.
+    pub async fn revoke_expired_shares(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(i64, i64)>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "UPDATE shares SET revoked = 1 \
+                 WHERE id IN (SELECT id FROM shares \
+                              WHERE revoked = 0 AND expires_at IS NOT NULL AND expires_at <= ?1 \
+                              ORDER BY expires_at LIMIT ?2) \
+                 RETURNING id, creator_id",
+            )?;
+            let rows = statement.query_map(params![now, limit], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect()
         })
         .await
     }
@@ -4374,5 +4545,640 @@ impl Db {
             Ok(())
         })
         .await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileHash {
+    pub real_path: String,
+    pub algo: String,
+    pub sha256: String,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub computed_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexPolicyRecord {
+    pub real_path: String,
+    pub policy: String,
+    pub updated_by: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanState {
+    pub kind: String,
+    pub cursor: Option<String>,
+    pub pass_started_at: Option<i64>,
+    pub last_progress_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub pass_id: i64,
+}
+
+impl Db {
+    pub async fn file_hash(&self, real_path: &str, algo: &str) -> anyhow::Result<Option<FileHash>> {
+        let real_path = real_path.to_owned();
+        let algo = algo.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT real_path, algo, sha256, size, mtime_ns, computed_at \
+                     FROM file_hashes WHERE real_path = ?1 AND algo = ?2",
+                    params![real_path, algo],
+                    |row| {
+                        Ok(FileHash {
+                            real_path: row.get(0)?,
+                            algo: row.get(1)?,
+                            sha256: row.get(2)?,
+                            size: row.get(3)?,
+                            mtime_ns: row.get(4)?,
+                            computed_at: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn upsert_file_hash(
+        &self,
+        real_path: &str,
+        algo: &str,
+        sha256: &str,
+        size: i64,
+        mtime_ns: i64,
+    ) -> anyhow::Result<()> {
+        let real_path = real_path.to_owned();
+        let algo = algo.to_owned();
+        let sha256 = sha256.to_owned();
+        let now = unix_now();
+        self.call_serialized(move |connection| {
+            connection.execute(
+                "INSERT INTO file_hashes \
+                 (real_path, algo, sha256, size, mtime_ns, computed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(real_path, algo) DO UPDATE SET \
+                   sha256 = excluded.sha256, size = excluded.size, \
+                   mtime_ns = excluded.mtime_ns, computed_at = excluded.computed_at",
+                params![real_path, algo, sha256, size, mtime_ns, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_file_hashes_subtree(&self, prefix: &str) -> anyhow::Result<usize> {
+        let _permit = self.write_lock.lock().await;
+        let prefix = prefix.to_owned();
+        let bounds = Self::subtree_bounds(&prefix);
+        if bounds.is_empty() {
+            return Ok(0);
+        }
+        self.call(move |connection| {
+            let mut removed = connection.execute(
+                "DELETE FROM file_hashes WHERE real_path = ?1",
+                params![prefix],
+            )?;
+            for (start, end) in bounds {
+                loop {
+                    let count = connection.execute(
+                        "DELETE FROM file_hashes WHERE rowid IN (\
+                           SELECT rowid FROM file_hashes \
+                           WHERE real_path >= ?1 AND real_path < ?2 LIMIT 500)",
+                        params![start, end],
+                    )?;
+                    removed += count;
+                    if count < 500 {
+                        break;
+                    }
+                }
+            }
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn index_policies(&self) -> anyhow::Result<Vec<IndexPolicyRecord>> {
+        self.call(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT real_path, policy, updated_by, updated_at \
+                 FROM index_policies ORDER BY length(real_path) ASC, real_path ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(IndexPolicyRecord {
+                    real_path: row.get(0)?,
+                    policy: row.get(1)?,
+                    updated_by: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn set_index_policy(
+        &self,
+        real_path: &str,
+        policy: &str,
+        updated_by: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let real_path = real_path.to_owned();
+        let policy = policy.to_owned();
+        let now = unix_now();
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO index_policies (real_path, policy, updated_by, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(real_path) DO UPDATE SET \
+                   policy = excluded.policy, updated_by = excluded.updated_by, \
+                   updated_at = excluded.updated_at",
+                params![real_path, policy, updated_by, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_index_policy(&self, real_path: &str) -> anyhow::Result<bool> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            let changed = connection.execute(
+                "DELETE FROM index_policies WHERE real_path = ?1",
+                params![real_path],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn set_index_visible_subtree(
+        &self,
+        prefix: &str,
+        visible: bool,
+    ) -> anyhow::Result<usize> {
+        let _permit = self.write_lock.lock().await;
+        let prefix = prefix.to_owned();
+        let bounds = Self::subtree_bounds(&prefix);
+        if bounds.is_empty() {
+            return Ok(0);
+        }
+        self.call(move |connection| {
+            let mut changed = connection.execute(
+                "UPDATE indexed_dirs SET visible = ?1 WHERE real_path = ?2 AND visible != ?1",
+                params![visible as i64, prefix],
+            )?;
+            for (start, end) in bounds {
+                loop {
+                    let count = connection.execute(
+                        "UPDATE indexed_dirs SET visible = ?1 \
+                         WHERE rowid IN (\
+                           SELECT rowid FROM indexed_dirs \
+                           WHERE real_path >= ?2 AND real_path < ?3 \
+                             AND visible != ?1 LIMIT 500)",
+                        params![visible as i64, start, end],
+                    )?;
+                    changed += count;
+                    if count < 500 {
+                        break;
+                    }
+                }
+            }
+            Ok(changed)
+        })
+        .await
+    }
+
+    pub async fn indexed_dirs_checked_page(
+        &self,
+        pass_started_at: i64,
+        background_before: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(String, i64, i64, String, Option<i64>)>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT real_path, id, mtime_ns, status, last_checked_at \
+                 FROM indexed_dirs \
+                 WHERE (visible = 1 OR status = 'stale') \
+                   AND (last_checked_at IS NULL OR last_checked_at < ?1) \
+                   AND (policy = 'normal' \
+                        OR (policy = 'background' \
+                            AND (last_checked_at IS NULL OR last_checked_at < ?2))) \
+                 ORDER BY COALESCE(last_checked_at, 0) ASC, real_path ASC LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![pass_started_at, background_before, limit.max(1)],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn touch_indexed_dirs(
+        &self,
+        paths: &[String],
+        checked_at: i64,
+        scan_generation: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
+        let paths = paths.to_vec();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            for path in &paths {
+                if let Some(generation) = scan_generation {
+                    transaction.execute(
+                        "UPDATE indexed_dirs SET last_checked_at = ?2, scan_generation = ?3 \
+                         WHERE real_path = ?1",
+                        params![path, checked_at, generation],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "UPDATE indexed_dirs SET last_checked_at = ?2 WHERE real_path = ?1",
+                        params![path, checked_at],
+                    )?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn scan_state(&self, kind: &str) -> anyhow::Result<Option<ScanState>> {
+        let kind = kind.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT kind, cursor, pass_started_at, last_progress_at, completed_at, pass_id \
+                     FROM index_scan_state WHERE kind = ?1",
+                    params![kind],
+                    |row| {
+                        Ok(ScanState {
+                            kind: row.get(0)?,
+                            cursor: row.get(1)?,
+                            pass_started_at: row.get(2)?,
+                            last_progress_at: row.get(3)?,
+                            completed_at: row.get(4)?,
+                            pass_id: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn set_scan_state(
+        &self,
+        kind: &str,
+        cursor: Option<&str>,
+        pass_started_at: Option<i64>,
+        last_progress_at: Option<i64>,
+        completed_at: Option<i64>,
+        pass_id: i64,
+    ) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
+        let kind = kind.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO index_scan_state \
+                 (kind, cursor, pass_started_at, last_progress_at, completed_at, pass_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(kind) DO UPDATE SET \
+                   cursor = excluded.cursor, pass_started_at = excluded.pass_started_at, \
+                   last_progress_at = excluded.last_progress_at, \
+                   completed_at = excluded.completed_at, pass_id = excluded.pass_id",
+                params![
+                    kind,
+                    cursor,
+                    pass_started_at,
+                    last_progress_at,
+                    completed_at,
+                    pass_id
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn frontier_push(&self, kind: &str, paths: &[String]) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
+        let kind = kind.to_owned();
+        let paths = paths.to_vec();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            for path in &paths {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO index_scan_frontier (kind, real_path) VALUES (?1, ?2)",
+                    params![kind, path],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn frontier_pop(&self, kind: &str, limit: i64) -> anyhow::Result<Vec<String>> {
+        let _permit = self.write_lock.lock().await;
+        let kind = kind.to_owned();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let paths: Vec<String> = {
+                let mut statement = transaction.prepare(
+                    "SELECT real_path FROM index_scan_frontier WHERE kind = ?1 \
+                     ORDER BY real_path LIMIT ?2",
+                )?;
+                let rows = statement.query_map(params![kind, limit.max(1)], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<String>>>()?
+            };
+            for path in &paths {
+                transaction.execute(
+                    "DELETE FROM index_scan_frontier WHERE kind = ?1 AND real_path = ?2",
+                    params![kind, path],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(paths)
+        })
+        .await
+    }
+
+    pub async fn frontier_len(&self, kind: &str) -> anyhow::Result<i64> {
+        let kind = kind.to_owned();
+        self.call(move |connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM index_scan_frontier WHERE kind = ?1",
+                params![kind],
+                |row| row.get(0),
+            )
+        })
+        .await
+    }
+
+    pub async fn clear_frontier(&self, kind: &str) -> anyhow::Result<()> {
+        let kind = kind.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "DELETE FROM index_scan_frontier WHERE kind = ?1",
+                params![kind],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_index_generation(&self, real_path: &str, pass_id: i64) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE indexed_dirs SET scan_generation = ?2 WHERE real_path = ?1",
+                params![real_path, pass_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn update_upload_hash_status(
+        &self,
+        id: &str,
+        user_id: i64,
+        status: &str,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let id = id.to_owned();
+        let status = status.to_owned();
+        let error = error.map(str::to_owned);
+        let now = unix_now();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE upload_sessions SET hash_status = ?3, hash_error = ?4, verified_at = ?5, \
+                 updated_at = ?5 WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id, status, error, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+impl Db {
+    pub async fn indexed_dir_mtime_status(
+        &self,
+        real_path: &str,
+    ) -> anyhow::Result<Option<(i64, String)>> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT mtime_ns, status FROM indexed_dirs WHERE real_path = ?1",
+                    params![real_path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+        })
+        .await
+    }
+}
+
+impl Db {
+    pub async fn set_indexed_dir_visible(
+        &self,
+        real_path: &str,
+        visible: bool,
+    ) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE indexed_dirs SET visible = ?2 WHERE real_path = ?1",
+                params![real_path, visible as i64],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+impl Db {
+    pub async fn indexed_dir_visible(&self, real_path: &str) -> anyhow::Result<Option<bool>> {
+        let real_path = real_path.to_owned();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT visible FROM indexed_dirs WHERE real_path = ?1",
+                    params![real_path],
+                    |row| Ok(row.get::<_, i64>(0)? != 0),
+                )
+                .optional()
+        })
+        .await
+    }
+}
+
+impl Db {
+    pub async fn set_indexed_dir_policy(
+        &self,
+        real_path: &str,
+        policy: &str,
+    ) -> anyhow::Result<()> {
+        let _permit = self.write_lock.lock().await;
+        let real_path = real_path.to_owned();
+        let policy = policy.to_owned();
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE indexed_dirs SET policy = ?2 WHERE real_path = ?1",
+                params![real_path, policy],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_indexed_dir_policy_subtree(
+        &self,
+        prefix: &str,
+        policy: &str,
+    ) -> anyhow::Result<usize> {
+        let _permit = self.write_lock.lock().await;
+        let prefix = prefix.to_owned();
+        let policy = policy.to_owned();
+        let bounds = Self::subtree_bounds(&prefix);
+        if bounds.is_empty() {
+            return Ok(0);
+        }
+        self.call(move |connection| {
+            let mut changed = connection.execute(
+                "UPDATE indexed_dirs SET policy = ?2 WHERE real_path = ?1 AND policy != ?2",
+                params![prefix, policy],
+            )?;
+            for (start, end) in bounds {
+                loop {
+                    let count = connection.execute(
+                        "UPDATE indexed_dirs SET policy = ?1 \
+                         WHERE rowid IN (\
+                           SELECT rowid FROM indexed_dirs \
+                           WHERE real_path >= ?2 AND real_path < ?3 \
+                             AND policy != ?1 LIMIT 500)",
+                        params![policy, start, end],
+                    )?;
+                    changed += count;
+                    if count < 500 {
+                        break;
+                    }
+                }
+            }
+            Ok(changed)
+        })
+        .await
+    }
+}
+
+impl Db {
+    pub async fn delete_stale_index_dirs(
+        &self,
+        prefix: &str,
+        pass_id: i64,
+        pass_started_at: i64,
+    ) -> anyhow::Result<usize> {
+        let prefix = prefix.to_owned();
+        let bounds = Self::subtree_bounds(&prefix);
+        if bounds.is_empty() {
+            return Ok(0);
+        }
+        let _permit = self.write_lock.lock().await;
+        self.call(move |connection| {
+            let mut removed = connection.execute(
+                "DELETE FROM indexed_dirs \
+                 WHERE real_path = ?1 AND policy = 'normal' \
+                   AND scan_generation IS NOT NULL AND scan_generation < ?2 \
+                   AND (last_checked_at IS NULL OR last_checked_at < ?3)",
+                params![prefix, pass_id, pass_started_at],
+            )?;
+            for (start, end) in bounds {
+                loop {
+                    let transaction = connection.transaction()?;
+                    let count = transaction.execute(
+                        "DELETE FROM indexed_dirs WHERE id IN (\
+                           SELECT id FROM indexed_dirs \
+                           WHERE real_path >= ?1 AND real_path < ?2 AND policy = 'normal' \
+                             AND scan_generation IS NOT NULL AND scan_generation < ?3 \
+                             AND (last_checked_at IS NULL OR last_checked_at < ?4) \
+                           LIMIT 200)",
+                        params![start, end, pass_id, pass_started_at],
+                    )?;
+                    transaction.commit()?;
+                    removed += count;
+                    if count < 200 {
+                        break;
+                    }
+                }
+            }
+            Ok(removed)
+        })
+        .await
+    }
+}
+
+impl Db {
+    pub async fn file_hashes_for_paths(
+        &self,
+        paths: Vec<String>,
+        algo: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, FileHash>> {
+        if paths.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let algo = algo.to_owned();
+        let mut result = std::collections::HashMap::new();
+        for chunk in paths.chunks(500) {
+            let chunk = chunk.to_vec();
+            let algo = algo.clone();
+            let rows = self
+                .call(move |connection| {
+                    let placeholders = std::iter::repeat_n("?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let sql = format!(
+                        "SELECT real_path, algo, sha256, size, mtime_ns, computed_at \
+                         FROM file_hashes WHERE algo = ? AND real_path IN ({placeholders})"
+                    );
+                    let mut statement = connection.prepare(&sql)?;
+                    let mut params: Vec<rusqlite::types::Value> =
+                        vec![rusqlite::types::Value::Text(algo)];
+                    params.extend(chunk.into_iter().map(rusqlite::types::Value::Text));
+                    let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+                        Ok(FileHash {
+                            real_path: row.get(0)?,
+                            algo: row.get(1)?,
+                            sha256: row.get(2)?,
+                            size: row.get(3)?,
+                            mtime_ns: row.get(4)?,
+                            computed_at: row.get(5)?,
+                        })
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<FileHash>>>()
+                })
+                .await?;
+            for row in rows {
+                result.insert(row.real_path.clone(), row);
+            }
+        }
+        Ok(result)
     }
 }

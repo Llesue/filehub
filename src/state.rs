@@ -133,6 +133,8 @@ pub struct AppState {
     pub thumb_preview_semaphore: Arc<Semaphore>,
     zip_semaphore: Mutex<Arc<Semaphore>>,
     pub jobs: Arc<JobManager>,
+    pub gate: Arc<crate::gate::ChangeGate>,
+    pub hash: Arc<crate::hash::HashService>,
     pub audit_tx: tokio::sync::mpsc::Sender<AuditMessage>,
     pub usage_cache: Mutex<HashMap<i64, UsageSnapshot>>,
     pub usage_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
@@ -151,6 +153,8 @@ pub struct AppState {
     pub presence_tasks: Mutex<HashMap<i64, tokio::task::JoinHandle<()>>>,
     pub presence_unsupported: Mutex<std::collections::HashSet<i64>>,
     pub presence_peers: Mutex<HashMap<i64, crate::federation::presence::PresencePeer>>,
+    /// Cached explicit index policies; invalidated on every policy mutation.
+    pub policy_cache: Mutex<Option<Vec<crate::db::IndexPolicyRecord>>>,
     /// Cancelled once the process starts shutting down. Long-lived streams and
     /// sockets watch this so graceful shutdown does not wait on them forever.
     pub shutdown: CancellationToken,
@@ -257,6 +261,14 @@ impl AppState {
         spawn_audit_writer(db.clone(), audit_rx, Arc::clone(&events));
         let zip_permits = snapshot.settings.downloads.zip_concurrency.max(1);
         let updates = Arc::new(crate::updates::UpdateChecker::new(crate::updates::API_URL)?);
+        let shutdown = CancellationToken::new();
+        let hash = crate::hash::HashService::new(
+            db.clone(),
+            snapshot.settings.hash.workers,
+            snapshot.settings.hash.queue_max,
+            snapshot.settings.hash.per_user_queue,
+            shutdown.clone(),
+        );
 
         let state = Arc::new(Self {
             db,
@@ -277,6 +289,8 @@ impl AppState {
             thumb_preview_semaphore: Arc::new(Semaphore::new(preview_workers)),
             zip_semaphore: Mutex::new(Arc::new(Semaphore::new(zip_permits))),
             jobs,
+            gate: Arc::new(crate::gate::ChangeGate::default()),
+            hash,
             audit_tx,
             usage_cache: Mutex::new(HashMap::new()),
             usage_locks: Mutex::new(HashMap::new()),
@@ -295,7 +309,8 @@ impl AppState {
             presence_tasks: Mutex::new(HashMap::new()),
             presence_unsupported: Mutex::new(std::collections::HashSet::new()),
             presence_peers: Mutex::new(HashMap::new()),
-            shutdown: CancellationToken::new(),
+            policy_cache: Mutex::new(None),
+            shutdown,
         });
         tokio::spawn(crate::federation::mounts::health_loop(Arc::clone(&state)));
         crate::federation::presence::start(Arc::clone(&state));
@@ -523,6 +538,7 @@ impl AppState {
         let state = Arc::clone(self);
         tokio::spawn(async move {
             for target in unique {
+                let _ = state.db.delete_file_hashes_subtree(&target).await;
                 loop {
                     match state.db.delete_cached_subtree_batch(&target, 500).await {
                         Ok(0) => break,
@@ -605,6 +621,34 @@ impl AppState {
         self.slow_requests.lock().iter().rev().cloned().collect()
     }
 
+    /// True when an interactive request took longer than 1s in the last minute.
+    pub fn interactive_pressure(&self) -> bool {
+        let now = unix_now();
+        self.slow_requests
+            .lock()
+            .iter()
+            .any(|request| now.saturating_sub(request.at) < 60 && request.duration_ms > 1000)
+    }
+
+    pub fn index_settle(&self) -> Duration {
+        Duration::from_secs(self.settings().settings.index.settle_seconds.max(1))
+    }
+
+    pub fn index_max_defer(&self) -> Duration {
+        Duration::from_secs(self.settings().settings.index.max_defer_seconds.max(1))
+    }
+
+    pub fn note_index_change(&self, path: &Path, reason: crate::gate::ChangeReason) {
+        let settings = self.settings();
+        self.gate.note_change(
+            path,
+            reason,
+            Duration::from_secs(settings.settings.index.settle_seconds.max(1)),
+            Duration::from_secs(settings.settings.index.max_defer_seconds.max(1)),
+            settings.settings.index.max_pending,
+        );
+    }
+
     pub fn start_background_tasks(self: &Arc<Self>) {
         let state = Arc::clone(self);
         tokio::spawn(async move {
@@ -624,6 +668,47 @@ impl AppState {
             }
         });
 
+        let shares = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                shares.expire_shares().await;
+            }
+        });
+
+        let gate = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                gate.dispatch_gate().await;
+            }
+        });
+
+        let watchdog = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let settings = watchdog.settings();
+                let queue_timeout =
+                    Duration::from_secs(settings.settings.index.queue_timeout_seconds.max(1));
+                let stall_timeout =
+                    Duration::from_secs(settings.settings.index.job_stall_seconds.max(1));
+                let candidates = watchdog
+                    .jobs
+                    .watchdog_candidates(queue_timeout, stall_timeout);
+                for id in candidates {
+                    if let Err(error) = watchdog.jobs.cancel(&id, 0, true).await {
+                        tracing::debug!(%error, job_id = %id, "watchdog could not cancel job");
+                    } else {
+                        tracing::warn!(job_id = %id, "watchdog cancelled stalled background job");
+                    }
+                }
+            }
+        });
+
         let presence = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(15));
@@ -632,6 +717,109 @@ impl AppState {
                 crate::presence::cleanup(&presence);
             }
         });
+    }
+
+    async fn dispatch_gate(self: &Arc<Self>) {
+        let settings = self.settings();
+        let settle = Duration::from_secs(settings.settings.index.settle_seconds.max(1));
+        let ready = self.gate.take_ready(settle, 8);
+        if ready.is_empty() {
+            return;
+        }
+        for item in ready {
+            let real_path = item.path.to_string_lossy().to_string();
+            let policy = match crate::policy::resolve(self, &item.path).await {
+                Ok(policy) => policy,
+                Err(_) => continue,
+            };
+            if policy.is_ignore() {
+                continue;
+            }
+            if policy == crate::policy::IndexPolicy::Background && self.interactive_pressure() {
+                self.note_index_change(&item.path, item.reason);
+                continue;
+            }
+            let key = format!("dir:{real_path}");
+            if self
+                .jobs
+                .active_job_for_path(crate::jobs::JobKind::Index, &real_path)
+                .is_some()
+            {
+                self.note_index_change(&item.path, item.reason);
+                continue;
+            }
+            let Some((user_id, root, relative)) =
+                crate::indexer::index_target_for_path(self, &real_path)
+                    .await
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            let job_state = Arc::clone(self);
+            let job_path = item.path.clone();
+            let gate_path = item.path.clone();
+            let forced = item.forced;
+            let payload = serde_json::json!({
+                "root_id": root.id,
+                "path": relative,
+                "real_path": real_path,
+                "recursive": false,
+                "auto": true,
+                "forced": forced,
+            });
+            let result = self
+                .jobs
+                .submit(
+                    JobKind::Index,
+                    key,
+                    user_id,
+                    payload,
+                    1,
+                    false,
+                    move |ctx| async move {
+                        let cancel = ctx.token();
+                        let mut progress = |directories: usize, _entries: usize| {
+                            ctx.report(directories, 1, 0, 0);
+                        };
+                        let result = crate::indexer::index_path(
+                            &job_state,
+                            user_id,
+                            root,
+                            &relative,
+                            false,
+                            forced,
+                            &cancel,
+                            &mut progress,
+                        )
+                        .await;
+                        match result {
+                            Ok(stats) => Ok(JobOutcome::done(serde_json::json!(stats), 1, 1)),
+                            Err(error) => {
+                                job_state
+                                    .gate
+                                    .mark_failed(&gate_path, Duration::from_secs(30));
+                                Err(error)
+                            }
+                        }
+                    },
+                )
+                .await;
+            match result {
+                Ok(outcome) => {
+                    if outcome.created {
+                        tracing::debug!(path = %job_path.display(), forced, "gate queued index");
+                    }
+                }
+                Err(crate::error::AppError::QueueFull) => {
+                    self.note_index_change(&job_path, item.reason);
+                }
+                Err(error) => {
+                    self.gate.mark_failed(&job_path, Duration::from_secs(30));
+                    tracing::debug!(%error, path = %job_path.display(), "gate index submit failed");
+                }
+            }
+        }
     }
 
     async fn schedule_index_scans(self: &Arc<Self>) {
@@ -669,19 +857,22 @@ impl AppState {
 
         let last_quick = match self.db.runtime_state_get("index.last_quick_scan").await {
             Ok(Some(value)) => value,
-            Ok(None) => {
-                let _ = self
-                    .db
-                    .runtime_state_set("index.last_quick_scan", now)
-                    .await;
-                now
-            }
+            // A fresh database should get an initial quick scan instead of
+            // waiting a full quick_scan_minutes interval.
+            Ok(None) => 0,
             Err(error) => {
                 tracing::warn!(%error, "failed to read quick scan state");
                 return;
             }
         };
-        if now.saturating_sub(last_quick) >= quick_seconds {
+        let quick_resume = self
+            .db
+            .scan_state("quick")
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.pass_started_at.is_some());
+        if quick_resume || now.saturating_sub(last_quick) >= quick_seconds {
             let job_state = Arc::clone(self);
             let result = self
                 .jobs
@@ -699,10 +890,6 @@ impl AppState {
                         };
                         let stats =
                             crate::indexer::quick_scan(&job_state, &cancel, &mut progress).await?;
-                        let _ = job_state
-                            .db
-                            .runtime_state_set("index.last_quick_scan", unix_now())
-                            .await;
                         let checked = stats.checked;
                         Ok(JobOutcome::done(
                             serde_json::json!(stats),
@@ -735,7 +922,8 @@ impl AppState {
                 return;
             }
         };
-        if now.saturating_sub(last_full) >= full_seconds {
+        let full_resume = self.db.frontier_len("full").await.unwrap_or(0) > 0;
+        if full_resume || now.saturating_sub(last_full) >= full_seconds {
             let job_state = Arc::clone(self);
             let result = self
                 .jobs
@@ -754,10 +942,6 @@ impl AppState {
                         let stats =
                             crate::indexer::scheduled_full_scan(&job_state, &cancel, &mut progress)
                                 .await?;
-                        let _ = job_state
-                            .db
-                            .runtime_state_set("index.last_full_scan", unix_now())
-                            .await;
                         let directories = stats.directories;
                         Ok(JobOutcome::done(
                             serde_json::json!(stats),
@@ -778,6 +962,41 @@ impl AppState {
                 Err(error) => tracing::warn!(%error, "failed to queue full index scan"),
             }
         }
+    }
+
+    /// Persist expired shares as stopped and notify their creators and any
+    /// open public share page. Runs often enough that the stored `revoked`
+    /// flag follows `expires_at` without waiting for the hourly maintenance.
+    pub async fn expire_shares(&self) -> usize {
+        const BATCH: i64 = 500;
+        let now = unix_now();
+        let mut total = 0_usize;
+        loop {
+            match self.db.revoke_expired_shares(now, BATCH).await {
+                Ok(expired) if expired.is_empty() => break,
+                Ok(expired) => {
+                    let count = expired.len();
+                    total += count;
+                    for (id, creator_id) in expired {
+                        let payload = serde_json::json!({ "id": id });
+                        self.events
+                            .publish("share.revoked", Some(creator_id), payload.clone());
+                        self.events.publish_share("share.revoked", id, payload);
+                    }
+                    if count < BATCH as usize {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to revoke expired shares");
+                    break;
+                }
+            }
+        }
+        if total > 0 {
+            tracing::info!(count = total, "revoked expired shares");
+        }
+        total
     }
 
     pub async fn run_maintenance(&self) {
@@ -892,7 +1111,7 @@ impl AppState {
             0 => {}
             removed => tracing::info!(removed, "pruned old service logs"),
         }
-        match self.db.checkpoint().await {
+        match self.db.checkpoint_passive().await {
             Ok(true) => tracing::debug!("WAL checkpoint was busy; will retry next pass"),
             Ok(false) => {}
             Err(error) => tracing::warn!(%error, "WAL checkpoint failed"),

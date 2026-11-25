@@ -59,6 +59,20 @@ pub enum AppError {
     GrantRevoked,
     #[error("operation is not supported for remote directories")]
     RemoteUnsupported,
+    #[error("hash mismatch: {0}")]
+    HashMismatch(String),
+    #[error("hash too large: {0}")]
+    HashTooLarge(String),
+    #[error("hash verification is too large for a synchronous request")]
+    HashVerifyTooLarge,
+    #[error("hash queue is full")]
+    HashQueueFull,
+    #[error("hash is not supported for this path")]
+    HashUnsupported,
+    #[error("password change required: {0}")]
+    PasswordChangeRequired(String),
+    #[error("weak password: {0}")]
+    WeakPassword(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -111,6 +125,13 @@ impl AppError {
             Self::TokenExpired => "TOKEN_EXPIRED",
             Self::GrantRevoked => "GRANT_REVOKED",
             Self::RemoteUnsupported => "REMOTE_ROOT_UNSUPPORTED",
+            Self::HashMismatch(_) => "HASH_MISMATCH",
+            Self::HashTooLarge(_) => "HASH_TOO_LARGE",
+            Self::HashVerifyTooLarge => "HASH_VERIFY_TOO_LARGE",
+            Self::HashQueueFull => "HASH_QUEUE_FULL",
+            Self::HashUnsupported => "HASH_UNSUPPORTED",
+            Self::PasswordChangeRequired(_) => "PASSWORD_CHANGE_REQUIRED",
+            Self::WeakPassword(_) => "WEAK_PASSWORD",
             Self::RemoteTokenInvalid => "REMOTE_TOKEN_INVALID",
             Self::RemoteGrantRevoked => "REMOTE_GRANT_REVOKED",
             Self::RemoteOffline => "REMOTE_OFFLINE",
@@ -222,6 +243,39 @@ impl IntoResponse for AppError {
                 "REMOTE_ROOT_UNSUPPORTED",
                 "This operation is not supported for remote directories".to_owned(),
             ),
+            Self::HashMismatch(message) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "HASH_MISMATCH",
+                message.clone(),
+            ),
+            Self::HashTooLarge(message) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "HASH_TOO_LARGE",
+                message.clone(),
+            ),
+            Self::HashVerifyTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "HASH_VERIFY_TOO_LARGE",
+                "The file is too large for synchronous hash verification".to_owned(),
+            ),
+            Self::HashQueueFull => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "HASH_QUEUE_FULL",
+                "Too many hash jobs are pending; try again later".to_owned(),
+            ),
+            Self::HashUnsupported => (
+                StatusCode::NOT_IMPLEMENTED,
+                "HASH_UNSUPPORTED",
+                "Hashing is not supported for this path".to_owned(),
+            ),
+            Self::PasswordChangeRequired(message) => (
+                StatusCode::FORBIDDEN,
+                "PASSWORD_CHANGE_REQUIRED",
+                message.clone(),
+            ),
+            Self::WeakPassword(message) => {
+                (StatusCode::BAD_REQUEST, "WEAK_PASSWORD", message.clone())
+            }
             Self::RemoteTokenInvalid => (
                 StatusCode::FAILED_DEPENDENCY,
                 "REMOTE_TOKEN_INVALID",

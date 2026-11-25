@@ -177,6 +177,7 @@ struct Inner {
     jobs: HashMap<String, Job>,
     cancel: HashMap<String, CancellationToken>,
     last_persist: HashMap<String, Instant>,
+    last_progress: HashMap<String, Instant>,
     waiters: HashMap<String, Vec<tokio::sync::oneshot::Sender<Job>>>,
 }
 
@@ -286,6 +287,7 @@ impl JobManager {
                 jobs: HashMap::new(),
                 cancel: HashMap::new(),
                 last_persist: HashMap::new(),
+                last_progress: HashMap::new(),
                 waiters: HashMap::new(),
             }),
             io: Arc::new(Semaphore::new(io_workers.max(1))),
@@ -483,6 +485,7 @@ impl JobManager {
                 .insert((kind.as_str().to_owned(), key.clone()), id.clone());
             inner.jobs.insert(id.clone(), job.clone());
             inner.cancel.insert(id.clone(), token.clone());
+            inner.last_progress.insert(id.clone(), Instant::now());
         }
         tracing::info!(
             job_id = %id,
@@ -568,6 +571,7 @@ impl JobManager {
                 job.status = "running".to_owned();
                 job.started_at = Some(unix_now());
             }
+            inner.last_progress.insert(id.clone(), Instant::now());
         }
         self.events.publish(
             "job.updated",
@@ -649,6 +653,7 @@ impl JobManager {
             clear_active(&mut inner, kind.as_str(), &key, &id);
             inner.cancel.remove(&id);
             inner.last_persist.remove(&id);
+            inner.last_progress.remove(&id);
             already
         };
         if was_cancelled {
@@ -761,6 +766,7 @@ impl JobManager {
         clear_active(&mut inner, kind.as_str(), key, id);
         inner.cancel.remove(id);
         inner.last_persist.remove(id);
+        inner.last_progress.remove(id);
         inner.jobs.remove(id);
     }
 
@@ -836,7 +842,9 @@ impl JobManager {
                     job.kind == kind.as_str()
                         && matches!(job.status.as_str(), "queued" | "running")
                         && job
-                            .key
+                            .scope_path
+                            .as_deref()
+                            .unwrap_or(job.key.as_str())
                             .strip_prefix(prefix)
                             .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
                 })
@@ -998,6 +1006,36 @@ impl JobManager {
         Ok(cancelled)
     }
 
+    pub fn watchdog_candidates(
+        &self,
+        queue_timeout: Duration,
+        stall_timeout: Duration,
+    ) -> Vec<String> {
+        let now = Instant::now();
+        let wall = unix_now();
+        let inner = self.inner.lock();
+        inner
+            .jobs
+            .values()
+            .filter(|job| {
+                if job.kind != "index" && job.kind != "dir_size" {
+                    return false;
+                }
+                if job.status == "queued" {
+                    wall.saturating_sub(job.created_at) >= queue_timeout.as_secs() as i64
+                } else if job.status == "running" {
+                    inner
+                        .last_progress
+                        .get(&job.id)
+                        .is_none_or(|at| now.duration_since(*at) >= stall_timeout)
+                } else {
+                    false
+                }
+            })
+            .map(|job| job.id.clone())
+            .collect()
+    }
+
     pub fn summary(&self) -> Vec<JobSummary> {
         let inner = self.inner.lock();
         let mut summary: HashMap<&str, (i64, i64)> = HashMap::new();
@@ -1069,6 +1107,7 @@ impl JobContext {
                 job.bytes_total = bytes_total;
             }
             let now = Instant::now();
+            inner.last_progress.insert(self.id.clone(), now);
             let due = inner
                 .last_persist
                 .get(&self.id)

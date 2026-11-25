@@ -16,6 +16,7 @@ pub struct Settings {
     pub thumbnails: ThumbnailsSettings,
     pub symlinks: SymlinkSettings,
     pub index: IndexSettings,
+    pub hash: HashSettings,
     pub uploads: UploadSettings,
     pub downloads: DownloadSettings,
     pub editor: EditorSettings,
@@ -44,6 +45,7 @@ impl Default for Settings {
             thumbnails: ThumbnailsSettings::default(),
             symlinks: SymlinkSettings::default(),
             index: IndexSettings::default(),
+            hash: HashSettings::default(),
             uploads: UploadSettings::default(),
             downloads: DownloadSettings::default(),
             editor: EditorSettings::default(),
@@ -132,8 +134,16 @@ pub struct IndexSettings {
     pub auto_index_on_browse: bool,
     pub scheduled_scans: bool,
     pub quick_scan_minutes: u64,
-    pub scan_workers: usize,
     pub full_scan_hours: u64,
+    pub settle_seconds: u64,
+    pub max_defer_seconds: u64,
+    pub scan_budget_seconds: u64,
+    pub job_stall_seconds: u64,
+    pub queue_timeout_seconds: u64,
+    pub hotness_ttl_seconds: u64,
+    pub background_scan_hours: u64,
+    pub max_pending: usize,
+    pub watch_enabled: bool,
 }
 
 impl Default for IndexSettings {
@@ -144,8 +154,42 @@ impl Default for IndexSettings {
             auto_index_on_browse: true,
             scheduled_scans: true,
             quick_scan_minutes: 60,
-            scan_workers: 4,
             full_scan_hours: 24,
+            settle_seconds: 20,
+            max_defer_seconds: 600,
+            scan_budget_seconds: 60,
+            job_stall_seconds: 180,
+            queue_timeout_seconds: 600,
+            hotness_ttl_seconds: 3600,
+            background_scan_hours: 24,
+            max_pending: 10_000,
+            watch_enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HashSettings {
+    pub workers: usize,
+    pub max_file_bytes: u64,
+    pub upload_verify_max_bytes: u64,
+    pub per_user_concurrency: usize,
+    pub per_user_queue: usize,
+    pub queue_max: usize,
+    pub wait_timeout_ms: u64,
+}
+
+impl Default for HashSettings {
+    fn default() -> Self {
+        Self {
+            workers: 2,
+            max_file_bytes: 20 * 1024 * 1024 * 1024,
+            upload_verify_max_bytes: 64 * 1024 * 1024,
+            per_user_concurrency: 2,
+            per_user_queue: 128,
+            queue_max: 512,
+            wait_timeout_ms: 5000,
         }
     }
 }
@@ -498,6 +542,30 @@ impl Settings {
             if self.index.full_scan_hours == 0 {
                 bail!("index.full_scan_hours must be greater than zero");
             }
+        }
+        if self.index.scan_budget_seconds == 0 {
+            bail!("index.scan_budget_seconds must be greater than zero");
+        }
+        if self.index.job_stall_seconds == 0 {
+            bail!("index.job_stall_seconds must be greater than zero");
+        }
+        if self.index.background_scan_hours == 0 {
+            bail!("index.background_scan_hours must be greater than zero");
+        }
+        if self.index.max_pending == 0 {
+            bail!("index.max_pending must be greater than zero");
+        }
+        if self.hash.workers == 0 {
+            bail!("hash.workers must be greater than zero");
+        }
+        if self.hash.per_user_concurrency == 0 {
+            bail!("hash.per_user_concurrency must be greater than zero");
+        }
+        if self.hash.per_user_queue == 0 || self.hash.queue_max == 0 {
+            bail!("hash queues must be greater than zero");
+        }
+        if self.hash.wait_timeout_ms == 0 {
+            bail!("hash.wait_timeout_ms must be greater than zero");
         }
         Ok(())
     }

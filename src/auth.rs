@@ -111,7 +111,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     value.strip_prefix("Bearer ").map(str::to_owned)
 }
 
-pub async fn current_user(
+pub(crate) async fn current_user_raw(
     state: &Arc<AppState>,
     headers: &HeaderMap,
 ) -> Result<CurrentUser, AppError> {
@@ -181,6 +181,19 @@ pub async fn current_user(
     }
 
     Err(AppError::Unauthorized)
+}
+
+pub async fn current_user(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<CurrentUser, AppError> {
+    let current = current_user_raw(state, headers).await?;
+    if current.user.must_change_password {
+        return Err(AppError::PasswordChangeRequired(
+            "set a new password before continuing".to_owned(),
+        ));
+    }
+    Ok(current)
 }
 
 pub fn require_admin(user: &CurrentUser) -> Result<(), AppError> {

@@ -128,6 +128,7 @@
     if (!target) return;
     try {
       await api.updateUser(target.id, { password: value }, csrf);
+      showNotice(t($language, '临时密码已设置，用户下次登录必须修改'), 'info', t($language, '操作成功'));
     } catch (err) {
       showNotice(messageOf(err));
     }
@@ -270,7 +271,7 @@
           <input
             bind:value={newPassword}
             type="password"
-            placeholder={t($language, '密码（至少 10 位）')}
+            placeholder={t($language, '临时密码（至少 6 位）')}
           />
           <input bind:value={newQuota} placeholder={t($language, '配额字节，空=不限制')} />
           <button type="button" disabled={busy} onclick={() => void createUser()}

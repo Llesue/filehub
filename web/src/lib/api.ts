@@ -106,6 +106,8 @@ export interface User {
   created_at: number;
   updated_at: number;
   last_login_at: number | null;
+  must_change_password: boolean;
+  password_changed_at?: number | null;
   online?: boolean;
 }
 
@@ -1419,6 +1421,17 @@ export const api = {
   previewUrl(root: number, path: string): string {
     const query = new URLSearchParams({ root: String(root), path, inline: 'true' });
     return `${BASE}/download?${query.toString()}`;
+  },
+
+  forcePasswordChange(newPassword: string, csrf: string): Promise<void> {
+    return request<void>(
+      '/me/password/forced',
+      {
+        method: 'POST',
+        body: JSON.stringify({ new_password: newPassword }),
+      },
+      csrf,
+    );
   },
 
   changePassword(currentPassword: string, newPassword: string, csrf: string): Promise<void> {

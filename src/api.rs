@@ -100,6 +100,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(crate::federation::mounts::attach_grant),
         )
         .route("/me/password", post(change_password))
+        .route("/me/password/forced", post(change_password_forced))
         .route("/events", get(events_stream))
         .route(
             "/me/preferences",
@@ -149,6 +150,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/list", get(crate::files::list))
         .route("/fs/dir-size", get(crate::files::dir_size))
         .route("/properties", get(crate::properties::properties))
+        .route("/hash", get(crate::hash::get_hash))
+        .route("/hashes", post(crate::hash::post_hashes))
         .route("/download", get(crate::files::download))
         .route("/download/zip", post(crate::files::zip))
         .route("/download/zip/form", post(crate::files::zip_form))
@@ -159,6 +162,12 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/archive/unzip", post(crate::unzip::archive_unzip))
         .route("/index", post(crate::search::index))
         .route("/index/status", get(crate::search::index_status))
+        .route("/index/metrics", get(crate::search::index_metrics))
+        .route("/index/policies", get(crate::policy::list_policies))
+        .route(
+            "/index/policy",
+            put(crate::policy::put_policy).delete(crate::policy::delete_policy),
+        )
         .route("/search", get(crate::search::search))
         .route("/search/all", get(crate::search::search_all))
         .route("/usage", get(crate::usage::usage))
@@ -369,7 +378,7 @@ async fn setup(
     }
 
     validate_username(&request.username)?;
-    validate_password(&request.password)?;
+    validate_permanent_password(&request.password, &request.username)?;
     if let Some(language) = request.language.as_deref()
         && !matches!(language, "zh-CN" | "en")
     {
@@ -463,6 +472,7 @@ async fn login(
     payload: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Response, AppError> {
     let Json(request) = payload.map_err(json_rejection)?;
+    validate_login_password(&request.password)?;
 
     let client_ip = auth::client_ip(&headers).unwrap_or_else(|| "unknown".to_owned());
     let ip_key = format!("login-ip:{client_ip}");
@@ -542,7 +552,7 @@ async fn logout(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let current = auth::current_user(&state, &headers).await?;
+    let current = auth::current_user_raw(&state, &headers).await?;
     auth::require_csrf(&current, &headers)?;
 
     if current.auth_kind == AuthKind::Session
@@ -577,7 +587,7 @@ async fn me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
-    let current = auth::current_user(&state, &headers).await?;
+    let current = auth::current_user_raw(&state, &headers).await?;
     let auth_kind = match current.auth_kind {
         AuthKind::Session => "session",
         AuthKind::Token => "token",
@@ -586,6 +596,13 @@ async fn me(
     Ok(Json(json!({
         "user": user_json(&current.user),
         "remote": remote_capabilities(&state, &current.user),
+        "capabilities": {
+            "hash": true,
+            "hash_batch": true,
+            "hash_upload_verify": true,
+            "hash_verify_max_bytes": state.settings().settings.hash.upload_verify_max_bytes,
+            "hash_algo": "sha256",
+        },
         "csrf_token": current.csrf_token,
         "auth": auth_kind,
     })))
@@ -754,7 +771,7 @@ async fn create_user(
 
     let Json(request) = payload.map_err(json_rejection)?;
     validate_username(&request.username)?;
-    validate_password(&request.password)?;
+    validate_temporary_password(&request.password)?;
 
     let role = request.role.as_deref().unwrap_or("user");
     validate_role(role)?;
@@ -790,6 +807,11 @@ async fn create_user(
         .map_err(map_db_error)?;
 
     create_home_root(&state, id, &home_dir).await?;
+    state
+        .db
+        .set_user_must_change_password(id, true)
+        .await
+        .map_err(AppError::internal)?;
     let mut preferences = state
         .db
         .get_user_preferences(id)
@@ -870,7 +892,12 @@ async fn update_user(
         return Err(AppError::bad_request("quota_bytes cannot be negative"));
     }
     if request.password.is_some() {
-        validate_password(request.password.as_deref().unwrap_or_default())?;
+        validate_temporary_password(request.password.as_deref().unwrap_or_default())?;
+        if id == current.user.id {
+            return Err(AppError::bad_request(
+                "use the profile page to change your own password",
+            ));
+        }
     }
 
     let disables_target = request.disabled == Some(true);
@@ -951,9 +978,34 @@ async fn update_user(
             .map_err(AppError::internal)?;
         state
             .db
-            .update_user_password(id, &password_hash)
+            .update_user_password(id, &password_hash, true, Some(unix_now()))
             .await
             .map_err(AppError::internal)?;
+        let sessions = state
+            .db
+            .delete_user_sessions(id)
+            .await
+            .map_err(AppError::internal)?;
+        let tokens = state
+            .db
+            .delete_user_tokens(id)
+            .await
+            .map_err(AppError::internal)?;
+        tracing::info!(
+            user_id = id,
+            sessions,
+            tokens,
+            "password reset revoked credentials"
+        );
+        audit(
+            &state,
+            Some(current.user.id),
+            "password_reset",
+            None,
+            Some(&format!("user_id={id}")),
+            &headers,
+        )
+        .await;
     }
 
     let user = state
@@ -1545,6 +1597,8 @@ fn user_json(user: &User) -> Value {
         "created_at": user.created_at,
         "updated_at": user.updated_at,
         "last_login_at": user.last_login_at,
+        "must_change_password": user.must_change_password,
+        "password_changed_at": user.password_changed_at,
     })
 }
 
@@ -1579,12 +1633,65 @@ fn validate_username(username: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_password(password: &str) -> Result<(), AppError> {
+const PASSWORD_MIN_CHARS: usize = 8;
+const PASSWORD_MAX_CHARS: usize = 128;
+const TEMP_PASSWORD_MIN_CHARS: usize = 6;
+const COMMON_PASSWORDS: &[&str] = &[
+    "12345678",
+    "123456789",
+    "password",
+    "passw0rd",
+    "qwertyui",
+    "qwerty123",
+    "1q2w3e4r",
+    "zaq12wsx",
+    "qazwsxedc",
+    "11111111",
+    "abc12345",
+    "letmein1",
+    "iloveyou",
+    "admin123",
+    "changeme",
+    "filehub",
+];
+
+fn validate_login_password(password: &str) -> Result<(), AppError> {
     if password.is_empty() {
         return Err(AppError::bad_request("password cannot be empty"));
     }
     if password.chars().count() > 1024 {
         return Err(AppError::bad_request("password is too long"));
+    }
+    Ok(())
+}
+
+fn validate_temporary_password(password: &str) -> Result<(), AppError> {
+    let length = password.chars().count();
+    if !(TEMP_PASSWORD_MIN_CHARS..=PASSWORD_MAX_CHARS).contains(&length) {
+        return Err(AppError::WeakPassword(format!(
+            "temporary password must be {TEMP_PASSWORD_MIN_CHARS}-{PASSWORD_MAX_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_permanent_password(password: &str, username: &str) -> Result<(), AppError> {
+    let length = password.chars().count();
+    if !(PASSWORD_MIN_CHARS..=PASSWORD_MAX_CHARS).contains(&length) {
+        return Err(AppError::WeakPassword(format!(
+            "password must be {PASSWORD_MIN_CHARS}-{PASSWORD_MAX_CHARS} characters"
+        )));
+    }
+    if password.eq_ignore_ascii_case(username) {
+        return Err(AppError::WeakPassword(
+            "password cannot be the same as the username".to_owned(),
+        ));
+    }
+    let normalized = password.to_ascii_lowercase();
+    if COMMON_PASSWORDS.contains(&normalized.as_str()) {
+        return Err(AppError::WeakPassword(
+            "password is too common; choose another password".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1611,7 +1718,7 @@ async fn change_password(
     let current = auth::current_user(&state, &headers).await?;
     auth::require_csrf(&current, &headers)?;
     let Json(request) = payload.map_err(json_rejection)?;
-    validate_password(&request.new_password)?;
+    validate_permanent_password(&request.new_password, &current.user.username)?;
 
     let valid =
         auth::verify_password_async(request.current_password, current.user.password_hash.clone())
@@ -1626,13 +1733,71 @@ async fn change_password(
         .map_err(AppError::internal)?;
     state
         .db
-        .update_user_password(current.user.id, &hash)
+        .update_user_password(current.user.id, &hash, false, Some(unix_now()))
+        .await
+        .map_err(AppError::internal)?;
+    let keep = auth::session_token(&headers).map(|token| auth::sha256_hex(&token));
+    state
+        .db
+        .delete_user_sessions_except(current.user.id, keep.as_deref())
         .await
         .map_err(AppError::internal)?;
     audit(
         &state,
         Some(current.user.id),
         "password_changed",
+        None,
+        None,
+        &headers,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct ForcedPasswordChangeRequest {
+    new_password: String,
+}
+
+async fn change_password_forced(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    payload: Result<Json<ForcedPasswordChangeRequest>, JsonRejection>,
+) -> Result<StatusCode, AppError> {
+    let current = auth::current_user_raw(&state, &headers).await?;
+    if current.auth_kind != AuthKind::Session {
+        return Err(AppError::Forbidden);
+    }
+    if !current.user.must_change_password {
+        return Err(AppError::bad_request("password change is not required"));
+    }
+    auth::require_csrf(&current, &headers)?;
+    let Json(request) = payload.map_err(json_rejection)?;
+    validate_permanent_password(&request.new_password, &current.user.username)?;
+
+    let hash = auth::hash_password_async(request.new_password)
+        .await
+        .map_err(AppError::internal)?;
+    state
+        .db
+        .update_user_password(current.user.id, &hash, false, Some(unix_now()))
+        .await
+        .map_err(AppError::internal)?;
+    let keep = auth::session_token(&headers).map(|token| auth::sha256_hex(&token));
+    state
+        .db
+        .delete_user_sessions_except(current.user.id, keep.as_deref())
+        .await
+        .map_err(AppError::internal)?;
+    state
+        .db
+        .delete_user_tokens(current.user.id)
+        .await
+        .map_err(AppError::internal)?;
+    audit(
+        &state,
+        Some(current.user.id),
+        "password_forced_change",
         None,
         None,
         &headers,
@@ -1677,7 +1842,7 @@ fn map_db_error(err: anyhow::Error) -> AppError {
     }
 }
 
-async fn audit(
+pub(crate) async fn audit(
     state: &Arc<AppState>,
     user_id: Option<i64>,
     action: &str,

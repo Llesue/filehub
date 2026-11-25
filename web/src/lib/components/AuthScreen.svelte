@@ -21,6 +21,10 @@
   async function submit(): Promise<void> {
     error = '';
 
+    if (mode === 'setup' && password.length < 8) {
+      error = t($language, '密码至少需要 8 位');
+      return;
+    }
     if (mode === 'setup' && password !== confirmPassword) {
       error = t($language, '两次输入的密码不一致');
       return;
@@ -92,7 +96,7 @@
           bind:value={password}
           type="password"
           autocomplete={mode === 'setup' ? 'new-password' : 'current-password'}
-          minlength="10"
+          minlength={mode === 'setup' ? 8 : undefined}
           required
         />
       </label>
@@ -104,7 +108,7 @@
             bind:value={confirmPassword}
             type="password"
             autocomplete="new-password"
-            minlength="10"
+            minlength="8"
             required
           />
         </label>

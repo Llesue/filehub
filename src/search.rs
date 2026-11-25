@@ -80,6 +80,7 @@ pub async fn index(
                     job_root,
                     &job_relative,
                     recursive,
+                    false,
                     &cancel,
                     &mut progress,
                 )
@@ -127,6 +128,12 @@ pub async fn index_status(
         .index_status(&real_path)
         .await
         .map_err(AppError::internal)?;
+    let policy = crate::policy::resolve(&state, std::path::Path::new(&real_path)).await?;
+    let visible = state
+        .db
+        .indexed_dir_visible(&real_path)
+        .await
+        .map_err(AppError::internal)?;
     let job = state.jobs.active_job_for_path(JobKind::Index, &real_path);
 
     match status {
@@ -136,6 +143,8 @@ pub async fn index_status(
             "indexed_at": indexed_at,
             "total_size_bytes": total_size_bytes,
             "partial": partial,
+            "policy": policy.as_str(),
+            "visible": visible.unwrap_or_else(|| !policy.is_ignore()),
             "job": job,
         }))),
         None => Ok(Json(json!({
@@ -144,6 +153,8 @@ pub async fn index_status(
             "indexed_at": null,
             "total_size_bytes": 0,
             "partial": false,
+            "policy": policy.as_str(),
+            "visible": visible.unwrap_or_else(|| !policy.is_ignore()),
             "job": job,
         }))),
     }
@@ -546,4 +557,32 @@ async fn load_root(state: &Arc<AppState>, user_id: i64, root_id: i64) -> Result<
         .await
         .map_err(AppError::internal)?
         .ok_or(AppError::NotFound)
+}
+
+pub async fn index_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let _current = crate::auth::current_user(&state, &headers).await?;
+    let quick = state.db.scan_state("quick").await.ok().flatten();
+    let full = state.db.scan_state("full").await.ok().flatten();
+    let full_pending = state.db.frontier_len("full").await.unwrap_or(0);
+    let jobs = state.jobs.summary();
+    Ok(Json(serde_json::json!({
+        "gate_pending": state.gate.pending_len(),
+        "gate_oldest_ms": state.gate.oldest_pending_age().map(|age| age.as_millis()),
+        "quick": quick.map(|state| serde_json::json!({
+            "cursor": state.cursor,
+            "pass_id": state.pass_id,
+            "pass_started_at": state.pass_started_at,
+            "last_progress_at": state.last_progress_at,
+        })),
+        "full": full.map(|state| serde_json::json!({
+            "pass_id": state.pass_id,
+            "pass_started_at": state.pass_started_at,
+            "last_progress_at": state.last_progress_at,
+        })),
+        "full_frontier": full_pending,
+        "jobs": jobs,
+    })))
 }

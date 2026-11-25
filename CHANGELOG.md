@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2.6 - 2026-11-26
+
+### Added
+
+- Directory indexing now waits for changes to settle, compares mtimes before rebuilding, and merges repeated requests through a change gate.
+- Quick and full scans persist their cursors and frontiers, run under a time budget and resume on the next pass instead of starting over.
+- Administrators can set `normal`, `background`, `on_demand` or `ignore` index policies per path through the API, with inheritance, override removal and audit entries.
+- `GET /api/v1/index/metrics` exposes change-gate, scan, queue and database lock metrics.
+- A watchdog cancels index and directory-size jobs that stay queued or stop reporting progress.
+- `GET /api/v1/hash`, `POST /api/v1/hashes`, `GET /list?hashes=1` and properties expose cached SHA-256 values with size and mtime validation.
+- Uploads accept a client `sha256` with `verify=auto|required|none`; verified uploads store the hash and return `verified` and `hash_status`.
+- `GET /api/v1/me` advertises hash capabilities for Android 0.1.5 while older clients keep their existing behavior.
+- Admin-created users and password resets use a temporary password, and `POST /api/v1/me/password/forced` completes the required change.
+- Expired shares are persisted as revoked, emit `share.revoked`, and disappear from open public share pages immediately.
+
+### Changed
+
+- Login only rejects empty or oversized passwords, so existing accounts with short passwords can still sign in.
+- Permanent passwords must be 8-128 characters and cannot match the username or a short common-password list.
+- Index concurrency now follows `jobs.index_workers`, and the obsolete `index.scan_workers` setting was removed.
+
+### Fixed
+
+- Quick scan no longer rescans rows from the previous pass or skips rows when the cursor advances.
+- Browsing an unchanged directory no longer queues another index job.
+- Search no longer shows directories that are halfway through being rebuilt.
+- `dir_size` scans stop at a 60 second and 200k directory budget, and stuck jobs no longer occupy workers indefinitely.
+- SQLite writes from indexing are serialized and background IO is capped, removing `database is locked` spikes during large syncs.
+- Upload overwrite now verifies the incoming SHA-256 before deleting the existing target.
+- An administrator can no longer reset their own password through the user admin endpoint.
+
+### Security
+
+- Password resets revoke the user's sessions and API tokens, and a forced change keeps only the current session.
+
 ## v0.2.5 - 2026-11-25
 
 ### Added

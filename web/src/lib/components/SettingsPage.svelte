@@ -45,6 +45,10 @@
   async function changePassword(): Promise<void> {
     passwordError = '';
     passwordMessage = '';
+    if ([...newPassword].length < 8) {
+      passwordError = t($language, '密码至少需要 8 位');
+      return;
+    }
     if (newPassword !== confirmPassword) {
       passwordError = t($language, '两次输入的新密码不一致');
       return;
@@ -188,6 +192,7 @@
             bind:value={newPassword}
             type="password"
             autocomplete="new-password"
+            minlength="8"
           /></label
         >
         <label
@@ -195,6 +200,7 @@
             bind:value={confirmPassword}
             type="password"
             autocomplete="new-password"
+            minlength="8"
           /></label
         >
         {#if passwordError}<p class="error">{passwordError}</p>{/if}

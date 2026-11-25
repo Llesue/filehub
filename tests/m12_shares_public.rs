@@ -2,11 +2,14 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceExt;
 
 struct TestApp {
     _dir: tempfile::TempDir,
     home: std::path::PathBuf,
+    state: Arc<filehub::state::AppState>,
     router: Router,
     cookie: String,
     csrf: String,
@@ -18,7 +21,7 @@ async fn setup_app() -> TestApp {
     let state = filehub::state::AppState::new_test(dir.path(), "test-token")
         .await
         .unwrap();
-    let router = filehub::app::router(state);
+    let router = filehub::app::router(state.clone());
     let setup = send_json(
         &router,
         Method::POST,
@@ -50,6 +53,7 @@ async fn setup_app() -> TestApp {
     TestApp {
         _dir: dir,
         home,
+        state,
         router,
         cookie,
         csrf,
@@ -1009,4 +1013,86 @@ async fn public_share_zip_form_accepts_repeated_paths() {
         .await
         .unwrap();
     assert!(body.starts_with(b"PK"));
+}
+
+#[tokio::test]
+async fn expired_share_is_persisted_as_revoked() {
+    let app = setup_app().await;
+    let expires_at = filehub::db::unix_now() + 1;
+    let created = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/shares",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"root": app.root_id, "path": "pub/a.txt", "expires_at": expires_at}),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await;
+    let id = created["id"].as_i64().unwrap();
+    let token = created["token"].as_str().unwrap().to_owned();
+
+    let meta = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(meta.status(), StatusCode::OK);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(app.state.expire_shares().await >= 1);
+
+    let list = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/shares?limit=20",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = json_body(list).await;
+    let share = body["shares"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|share| share["id"].as_i64() == Some(id))
+        .unwrap();
+    assert_eq!(share["revoked"], json!(true));
+    assert_eq!(share["expired"], json!(true));
+
+    let meta = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(meta.status(), StatusCode::GONE);
+    assert_eq!(json_body(meta).await["error"]["code"], "SHARE_REVOKED");
+
+    let revived = send_json(
+        &app.router,
+        Method::PUT,
+        &format!("/api/v1/shares/{id}"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"revoked": false, "expires_at": filehub::db::unix_now() + 3600}),
+    )
+    .await;
+    assert_eq!(revived.status(), StatusCode::OK);
+    let meta = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/public/shares/{token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(meta.status(), StatusCode::OK);
 }

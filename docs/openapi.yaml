@@ -74,6 +74,7 @@ paths:
                 password: { type: string }
       responses:
         '200': { $ref: '#/components/responses/AuthResponse' }
+        '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
   /api/v1/logout:
@@ -107,6 +108,25 @@ paths:
         '204': { description: Password changed }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
+  /api/v1/me/password/forced:
+    post:
+      tags: [auth]
+      summary: 完成管理员要求的强制改密
+      description: 仅 session 认证可用；用户必须处于 `must_change_password` 状态。成功后清除标记，保留当前 session，撤销该用户的其他 session 和全部 API token。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_password]
+              properties:
+                new_password: { type: string, minLength: 8, maxLength: 128 }
+      responses:
+        '204': { description: Password changed }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/events:
     get:
       tags: [auth]
@@ -256,6 +276,8 @@ paths:
         - { name: sort, in: query, schema: { type: string, enum: [name, size, modified], default: name } }
         - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: asc } }
         - { name: focus, in: query, schema: { type: string }, description: 定位文件并返回其所在页，不能与 cursor 同时使用 }
+        - { name: sizes, in: query, schema: { type: boolean }, description: 附带目录大小缓存 }
+        - { name: hashes, in: query, schema: { type: boolean }, description: 只返回已缓存的 SHA-256；不触发计算 }
       responses:
         '200': { description: OK }
         '400': { $ref: '#/components/responses/Error' }
@@ -296,6 +318,44 @@ paths:
       responses:
         '200': { description: OK }
         '404': { $ref: '#/components/responses/Error' }
+  /api/v1/hash:
+    get:
+      tags: [files]
+      summary: 查询单文件 SHA-256（缓存命中直接返回，未命中 202 pending）
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: force, in: query, schema: { type: boolean, default: false } }
+        - { name: wait, in: query, schema: { type: boolean, default: false } }
+        - { name: timeout_ms, in: query, schema: { type: integer, minimum: 1, maximum: 5000 } }
+      responses:
+        '200': { description: 哈希已就绪 }
+        '202': { description: 计算中，返回 status=pending 和 retry_after_ms }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '501': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/v1/hashes:
+    post:
+      tags: [files]
+      summary: 批量查询 SHA-256（1–100 个路径，单路径失败不影响其他）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, paths]
+              properties:
+                root: { type: integer, format: int64 }
+                paths:
+                  { type: array, minItems: 1, maxItems: 100, items: { type: string } }
+                force: { type: boolean, default: false }
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+        '501': { $ref: '#/components/responses/Error' }
   /api/v1/fs/dir-size:
     get:
       tags: [files]
@@ -483,8 +543,23 @@ paths:
                     description: 允许为 0，用于上传空文件,
                   }
                 chunk_size: { type: integer, format: int64, nullable: true }
+                sha256:
+                  {
+                    type: string,
+                    pattern: '^[0-9a-f]{64}$',
+                    description: 可选，完成文件的 SHA-256（小写 hex）,
+                  }
+                verify:
+                  {
+                    type: string,
+                    enum: [auto, required, none],
+                    default: auto,
+                    description: auto 小文件同步校验，大文件只落盘；required 超阈值返回 413,
+                  }
       responses:
         '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+        '501': { $ref: '#/components/responses/Error' }
         '507': { $ref: '#/components/responses/Error' }
   /api/v1/uploads/{id}:
     get:
@@ -764,6 +839,57 @@ paths:
         - { name: path, in: query, schema: { type: string } }
       responses:
         '200': { description: OK }
+  /api/v1/index/policies:
+    get:
+      tags: [index]
+      summary: 查询路径的生效索引策略和显式覆盖
+      parameters:
+        - { name: root, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: path, in: query, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/index/policy:
+    put:
+      tags: [index]
+      summary: 设置路径索引策略（仅 admin）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, path, policy]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string }
+                policy: { type: string, enum: [normal, background, on_demand, ignore] }
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [index]
+      summary: 删除路径的显式策略，恢复继承（仅 admin）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [root, path]
+              properties:
+                root: { type: integer, format: int64 }
+                path: { type: string }
+      responses:
+        '200': { description: OK }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/v1/index/metrics:
+    get:
+      tags: [index]
+      summary: 索引门控/扫描/任务指标
+      responses:
+        '200': { description: OK }
   /api/v1/search:
     get:
       tags: [index]
@@ -1003,11 +1129,16 @@ paths:
               required: [username, password]
               properties:
                 username: { type: string }
-                password: { type: string }
+                password:
+                  type: string
+                  minLength: 6
+                  maxLength: 128
+                  description: 临时密码；用户首次登录必须修改。
                 role: { type: string, enum: [admin, user], default: user }
                 quota_bytes: { type: integer, format: int64, nullable: true }
       responses:
         '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
   /api/v1/admin/users/usage:
     get:
       tags: [admin]
@@ -1068,7 +1199,12 @@ paths:
             schema:
               type: object
               properties:
-                password: { type: string, nullable: true }
+                password:
+                  type: string
+                  minLength: 6
+                  maxLength: 128
+                  nullable: true
+                  description: 临时密码；设置后撤销该用户全部 session 和 API token，并要求下次登录改密。不能重置自己的密码。
                 role: { type: string, enum: [admin, user], nullable: true }
                 quota_bytes: { type: integer, format: int64, nullable: true }
                 clear_quota: { type: boolean, nullable: true }
@@ -1846,5 +1982,9 @@ components:
         role: { type: string, enum: [admin, user] }
         quota_bytes: { type: integer, format: int64, nullable: true }
         disabled: { type: boolean }
+        must_change_password:
+          type: boolean
+          description: 为 true 时除 /me、/logout、/me/password/forced 外的请求返回 403 PASSWORD_CHANGE_REQUIRED。
+        password_changed_at: { type: integer, format: int64, nullable: true }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
