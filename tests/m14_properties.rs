@@ -6,10 +6,16 @@ use tower::ServiceExt;
 
 struct TestApp {
     _dir: tempfile::TempDir,
-    home: std::path::PathBuf,
     router: Router,
     cookie: String,
     root_id: i64,
+}
+
+#[cfg(unix)]
+impl TestApp {
+    fn home(&self) -> std::path::PathBuf {
+        self._dir.path().join("users/admin")
+    }
 }
 
 async fn setup_app() -> TestApp {
@@ -41,7 +47,6 @@ async fn setup_app() -> TestApp {
     std::fs::create_dir(home.join("sub")).unwrap();
     TestApp {
         _dir: dir,
-        home,
         router,
         cookie,
         root_id,
@@ -154,7 +159,7 @@ async fn properties_handle_damaged_images_and_symlinks() {
 
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink("img.png", app.home.join("link.png")).unwrap();
+        std::os::unix::fs::symlink("img.png", app.home().join("link.png")).unwrap();
         let response = send(
             &app.router,
             Method::GET,
@@ -173,8 +178,8 @@ async fn properties_handle_damaged_images_and_symlinks() {
 #[cfg(unix)]
 async fn list_reports_symlink_state() {
     let app = setup_app().await;
-    std::os::unix::fs::symlink("img.png", app.home.join("good-link.png")).unwrap();
-    std::os::unix::fs::symlink("missing-target", app.home.join("bad-link")).unwrap();
+    std::os::unix::fs::symlink("img.png", app.home().join("good-link.png")).unwrap();
+    std::os::unix::fs::symlink("missing-target", app.home().join("bad-link")).unwrap();
     let response = send(
         &app.router,
         Method::GET,
