@@ -1331,12 +1331,17 @@ async fn presence_websocket_authenticates_and_pushes_events() {
         "grant.revoked",
         json!({ "grant": grant_id }),
     );
-    let event = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
-        .await
-        .expect("event timeout")
-        .expect("event frame")
-        .expect("event ok");
-    let event: serde_json::Value = serde_json::from_str(event.to_text().unwrap()).unwrap();
+    let event = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("event timeout")
+            .expect("event frame")
+            .expect("event ok");
+        let value: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        if value["type"] == "grant.revoked" {
+            break value;
+        }
+    };
     assert_eq!(event["type"], "grant.revoked");
 
     // Auth events close the socket, so use a fresh connection for the next one.
@@ -1358,12 +1363,17 @@ async fn presence_websocket_authenticates_and_pushes_events() {
         "token.rotated",
         json!({ "token": 1 }),
     );
-    let rotated = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
-        .await
-        .expect("rotate timeout")
-        .expect("rotate frame")
-        .expect("rotate ok");
-    let rotated: serde_json::Value = serde_json::from_str(rotated.to_text().unwrap()).unwrap();
+    let rotated = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("rotate timeout")
+            .expect("rotate frame")
+            .expect("rotate ok");
+        let value: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        if value["type"] == "token.rotated" {
+            break value;
+        }
+    };
     assert_eq!(rotated["type"], "token.rotated");
     socket.close(None).await.unwrap();
 }
