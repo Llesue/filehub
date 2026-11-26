@@ -113,7 +113,7 @@ impl WindowRateLimiter {
 type DirectorySizeCountsCache = (Instant, Vec<(String, i64)>);
 
 #[allow(clippy::type_complexity)]
-pub type FederationCacheKey = (i64, String, String, String);
+pub type FederationCacheKey = (i64, String, String, String, usize);
 #[allow(clippy::type_complexity)]
 pub type FederationCache = Mutex<HashMap<FederationCacheKey, (i64, serde_json::Value)>>;
 

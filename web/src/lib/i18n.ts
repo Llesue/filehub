@@ -496,6 +496,9 @@ const en: Record<string, string> = {
   缩放: 'Zoom',
   使用这张头像: 'Use this avatar',
   头像: 'Avatar',
+  更换头像: 'Change avatar',
+  头像已更新: 'Avatar updated',
+  '头像必须是 JPEG、PNG 或 WebP': 'Avatar must be JPEG, PNG or WebP',
 
   // Preferences page
   偏好保存失败: 'Failed to save preferences',

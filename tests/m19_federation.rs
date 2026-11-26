@@ -682,6 +682,51 @@ async fn federation_contract_round_trip() {
         "remote list missing hello.txt"
     );
 
+    let page_dir = peer_instance._dir.path().join("users/admin/shared/page");
+    std::fs::create_dir_all(&page_dir).unwrap();
+    for index in 0..5 {
+        std::fs::write(page_dir.join(format!("item-{index}.txt")), b"x").unwrap();
+    }
+    let first_page = send(
+        &mount_instance.router,
+        Method::GET,
+        &format!("/api/v1/list?root={remote_root}&path=page&limit=2"),
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_page = json_body(first_page).await;
+    let first_names: Vec<String> = first_page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
+        .collect();
+    let cursor = first_page["next_cursor"].as_str().unwrap().to_owned();
+    let second_page = send(
+        &mount_instance.router,
+        Method::GET,
+        &format!("/api/v1/list?root={remote_root}&path=page&limit=2&cursor={cursor}"),
+        Some(&mount_instance.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(second_page.status(), StatusCode::OK);
+    let second_page = json_body(second_page).await;
+    let second_names: Vec<String> = second_page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(first_names.len(), 2);
+    assert_eq!(second_names.len(), 2);
+    assert!(
+        first_names.iter().all(|name| !second_names.contains(name)),
+        "remote pagination repeated the first page: {first_names:?} vs {second_names:?}"
+    );
+
     let mkdir = send_json(
         &mount_instance.router,
         Method::POST,

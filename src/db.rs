@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
@@ -1293,6 +1293,21 @@ impl Db {
         .await
     }
 
+    pub async fn avatar_versions(&self) -> anyhow::Result<HashMap<i64, i64>> {
+        self.call(|connection| {
+            let mut statement =
+                connection.prepare("SELECT user_id, avatar_version FROM user_preferences")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let mut versions = HashMap::new();
+            for row in rows {
+                let (user_id, version) = row?;
+                versions.insert(user_id, version);
+            }
+            Ok(versions)
+        })
+        .await
+    }
+
     pub async fn save_user_preferences(
         &self,
         user_id: i64,
@@ -1860,7 +1875,8 @@ impl Db {
     pub async fn reorder_roots(&self, user_id: i64, ids: &[i64]) -> anyhow::Result<bool> {
         let ids = ids.to_vec();
         self.call(move |connection| {
-            let transaction = connection.transaction()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let roots: Vec<i64> = {
                 let mut statement = transaction.prepare(
                     "SELECT id FROM user_roots WHERE user_id = ?1 ORDER BY sort_order, id",
@@ -3843,7 +3859,8 @@ impl Db {
     ) -> anyhow::Result<Option<Vec<i64>>> {
         let alias = alias.to_owned();
         self.call(move |connection| {
-            let transaction = connection.transaction()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let real_path = transaction
                 .query_row(
                     "SELECT real_path FROM server_paths WHERE id = ?1",
@@ -4896,7 +4913,12 @@ impl Db {
         let _permit = self.write_lock.lock().await;
         let kind = kind.to_owned();
         self.call(move |connection| {
-            let transaction = connection.transaction()?;
+            // This is a read-then-write transaction. BEGIN DEFERRED would take
+            // a read snapshot first and fail with SQLITE_BUSY_SNAPSHOT when a
+            // writer commits in between; BEGIN IMMEDIATE takes the writer lock
+            // up front instead.
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let paths: Vec<String> = {
                 let mut statement = transaction.prepare(
                     "SELECT real_path FROM index_scan_frontier WHERE kind = ?1 \

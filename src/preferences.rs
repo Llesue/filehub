@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use serde::Deserialize;
@@ -129,14 +129,10 @@ pub async fn update_preferences(
     })))
 }
 
-pub async fn get_avatar(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let current = auth::current_user(&state, &headers).await?;
+async fn avatar_response(state: &Arc<AppState>, user_id: i64) -> Result<Response, AppError> {
     let preferences = state
         .db
-        .get_user_preferences(current.user.id)
+        .get_user_preferences(user_id)
         .await
         .map_err(AppError::internal)?;
     let Some(path) = preferences.avatar_path else {
@@ -152,13 +148,37 @@ pub async fn get_avatar(
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))
 }
 
-pub async fn upload_avatar(
+pub async fn get_avatar(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let current = auth::current_user(&state, &headers).await?;
-    auth::require_csrf(&current, &headers)?;
+    avatar_response(&state, current.user.id).await
+}
+
+pub async fn get_admin_avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(user_id): AxumPath<i64>,
+) -> Result<Response, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    let target = state
+        .db
+        .find_user_by_id(user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    avatar_response(&state, target.id).await
+}
+
+async fn save_avatar(
+    state: &Arc<AppState>,
+    user_id: i64,
+    username: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<UserPreferences, AppError> {
     if body.len() > 2 * 1024 * 1024 {
         return Err(AppError::too_large("avatar must be at most 2 MiB"));
     }
@@ -180,38 +200,85 @@ pub async fn upload_avatar(
         .write_to(&mut Cursor::new(&mut encoded), image::ImageFormat::Jpeg)
         .map_err(|_| AppError::UnsupportedMedia("could not encode avatar".to_owned()))?;
 
-    let avatars = avatar_directory(&state);
+    let avatars = avatar_directory(state);
     crate::platform::create_private_dir_all(&avatars)
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
-    let path = avatars.join(format!("{}.jpg", current.user.id));
+    let path = avatars.join(format!("{user_id}.jpg"));
     crate::platform::write_private_file(&path, &encoded)
         .map_err(|err| AppError::internal(anyhow::Error::from(err)))?;
 
     let mut preferences = state
         .db
-        .get_user_preferences(current.user.id)
+        .get_user_preferences(user_id)
         .await
         .map_err(AppError::internal)?;
     preferences.avatar_path = Some(path.to_string_lossy().to_string());
     preferences.avatar_version += 1;
     state
         .db
-        .save_user_preferences(current.user.id, &preferences)
+        .save_user_preferences(user_id, &preferences)
         .await
         .map_err(AppError::internal)?;
-    crate::federation::presence::notify_user(
+    let payload = json!({
+        "owner_name": username,
+        "avatar_version": preferences.avatar_version,
+    });
+    crate::federation::presence::notify_user(state, user_id, "owner.changed", payload.clone());
+    state
+        .events
+        .publish("owner.changed", Some(user_id), payload);
+    Ok(preferences)
+}
+
+pub async fn upload_avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_csrf(&current, &headers)?;
+    let preferences = save_avatar(
         &state,
         current.user.id,
-        "owner.changed",
-        json!({
-            "owner_name": current.user.username,
-            "avatar_version": preferences.avatar_version,
-        }),
-    );
+        &current.user.username,
+        &headers,
+        body,
+    )
+    .await?;
     Ok(Json(json!({
         "preferences": preferences_json(&preferences),
         "system": system_json(&state),
     })))
+}
+
+pub async fn upload_admin_avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(user_id): AxumPath<i64>,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    let current = auth::current_user(&state, &headers).await?;
+    auth::require_admin(&current)?;
+    auth::require_csrf(&current, &headers)?;
+    let target = state
+        .db
+        .find_user_by_id(user_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or(AppError::NotFound)?;
+    let preferences = save_avatar(&state, target.id, &target.username, &headers, body).await?;
+    crate::api::audit(
+        &state,
+        Some(current.user.id),
+        "admin_avatar_changed",
+        None,
+        Some(&format!("user_id={user_id}")),
+        &headers,
+    )
+    .await;
+    Ok(Json(
+        json!({ "avatar_version": preferences.avatar_version }),
+    ))
 }
 
 fn avatar_directory(state: &Arc<AppState>) -> PathBuf {

@@ -28,11 +28,15 @@ pub async fn list(
     let path_text = path.unwrap_or("");
     let sort_text = sort.unwrap_or("name");
     let order_text = order.unwrap_or("asc");
+    let limit_value = limit.unwrap_or(200);
+    // Only the first page is cached. A cursor identifies a later slice of the
+    // same directory, so serving a cached first page for it duplicates rows.
     let key = (
         root.id,
         path_text.to_owned(),
         sort_text.to_owned(),
         order_text.to_owned(),
+        limit_value,
     );
     let revalidate = state
         .settings()
@@ -41,15 +45,19 @@ pub async fn list(
         .revalidate_seconds
         .max(1);
     let now = crate::db::unix_now();
-    let cached = state.federation_cache.lock().get(&key).cloned();
-    // An empty cached page is worse than no cache: it flashes an empty folder
-    // until the background revalidation finishes. Always fetch empty pages.
-    let cached = cached.filter(|(_, value)| {
-        value
-            .get("entries")
-            .and_then(Value::as_array)
-            .is_some_and(|entries| !entries.is_empty())
-    });
+    let cached = if cursor.is_none() {
+        let cached = state.federation_cache.lock().get(&key).cloned();
+        // An empty cached page is worse than no cache: it flashes an empty
+        // folder until the background revalidation finishes.
+        cached.filter(|(_, value)| {
+            value
+                .get("entries")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| !entries.is_empty())
+        })
+    } else {
+        None
+    };
     if let Some((at, value)) = cached {
         if now.saturating_sub(at) < revalidate {
             sync_mode(state, &mount, &value).await;
@@ -62,14 +70,12 @@ pub async fn list(
         let path_owned = key.1.clone();
         let sort_owned = key.2.clone();
         let order_owned = key.3.clone();
-        let limit_value = limit.unwrap_or(200);
-        let cursor_owned = cursor.map(str::to_owned);
         tokio::spawn(async move {
             if let Ok(value) = client_clone
                 .list(
                     grant,
                     &path_owned,
-                    cursor_owned.as_deref(),
+                    None,
                     limit_value,
                     &sort_owned,
                     &order_owned,
@@ -88,7 +94,7 @@ pub async fn list(
             mount.grant_id,
             path_text,
             cursor,
-            limit.unwrap_or(200),
+            limit_value,
             sort_text,
             order_text,
         )
@@ -101,7 +107,9 @@ pub async fn list(
         }
     };
     sync_mode(state, &mount, &value).await;
-    store_cache(state, key, value.clone());
+    if cursor.is_none() {
+        store_cache(state, key, value.clone());
+    }
     Ok(render_list(root, &mount, &value, path_text))
 }
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.7 - 2026-11-26
+
+### Added
+
+- The admin user list shows each user's avatar, and admins can crop and replace another user's avatar; the change is audited, increments the avatar version and notifies the target user.
+
+### Fixed
+
+- Remote directories no longer repeat the first page when loading more; only the first page is cached and cursor requests bypass the cache, with `limit` included in the cache key.
+- Full index scans no longer fail with `database is locked`; read-then-write frontier and root-order transactions now start with `BEGIN IMMEDIATE`.
+- Text-file Tab now matches editor behavior: a partial same-line selection is replaced with a tab, full-line and multiline selections indent, and an empty selection inserts a tab.
+- Chinese text in the editor now occupies exactly two Latin cells without changing the Latin mono font, restoring space-padded column alignment.
+- Per-user federation mount and share toggles disappear immediately when their global feature is disabled.
+
 ## v0.2.6 - 2026-11-26
 
 ### Added

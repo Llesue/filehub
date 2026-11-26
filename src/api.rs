@@ -116,6 +116,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/auth/tokens/{id}", delete(delete_token))
         .route("/admin/users", get(list_users).post(create_user))
         .route("/admin/users/{id}", put(update_user).delete(delete_user))
+        .route(
+            "/admin/users/{id}/avatar",
+            get(crate::preferences::get_admin_avatar).post(crate::preferences::upload_admin_avatar),
+        )
         .route("/admin/users/usage", get(crate::usage::admin_batch))
         .route("/admin/users/{id}/usage", get(user_usage))
         .route("/admin/status", get(crate::admin_fs::status))
@@ -739,6 +743,11 @@ async fn list_users(
     auth::require_admin(&current)?;
 
     let users = state.db.list_users().await.map_err(AppError::internal)?;
+    let avatar_versions = state
+        .db
+        .avatar_versions()
+        .await
+        .map_err(AppError::internal)?;
     let now = unix_now();
     let online: std::collections::HashSet<i64> = state
         .db
@@ -753,6 +762,10 @@ async fn list_users(
             let mut value = user_json(user);
             if let Some(object) = value.as_object_mut() {
                 object.insert("online".to_owned(), json!(online.contains(&user.id)));
+                object.insert(
+                    "avatar_version".to_owned(),
+                    json!(avatar_versions.get(&user.id).copied().unwrap_or(0)),
+                );
             }
             value
         })

@@ -108,6 +108,7 @@ export interface User {
   last_login_at: number | null;
   must_change_password: boolean;
   password_changed_at?: number | null;
+  avatar_version?: number;
   online?: boolean;
 }
 
@@ -1073,6 +1074,28 @@ export const api = {
 
   listUsers(): Promise<{ users: User[] }> {
     return request<{ users: User[] }>('/admin/users');
+  },
+
+  adminAvatarUrl(userId: number, version: number): string {
+    return `${BASE}/admin/users/${userId}/avatar?v=${version}`;
+  },
+
+  async uploadAdminAvatar(
+    userId: number,
+    file: Blob,
+    csrf: string,
+  ): Promise<{ avatar_version: number }> {
+    const response = await fetch(`${BASE}/admin/users/${userId}/avatar`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': file.type,
+        'X-CSRF-Token': csrf,
+      },
+      body: await file.arrayBuffer(),
+    });
+    if (!response.ok) throw await apiErrorFromResponse(response);
+    return response.json() as Promise<{ avatar_version: number }>;
   },
 
   createUser(

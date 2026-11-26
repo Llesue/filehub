@@ -1,8 +1,26 @@
+@font-face {
+  font-family: 'FileHub CJK Mono';
+  src:
+    local('NSimSun'),
+    local('Noto Sans Mono CJK SC'),
+    local('Noto Sans CJK SC'),
+    local('PingFang SC'),
+    local('Microsoft YaHei');
+  size-adjust: 120%;
+  unicode-range:
+    U+2E80-9FFF,
+    U+3000-303F,
+    U+3040-30FF,
+    U+AC00-D7AF,
+    U+F900-FAFF,
+    U+FF00-FFEF;
+}
+
 :root {
   color-scheme: light;
 
   --font-ui: 'Noto Sans', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
-  --font-mono: 'Noto Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-mono: 'Noto Sans Mono', 'FileHub CJK Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   --bg: #f7f8fa;
   --surface: #ffffff;

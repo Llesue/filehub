@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,6 +102,31 @@ async fn send_json(
     }
     app.clone()
         .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn send_raw(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Response<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type);
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
         .await
         .unwrap()
 }
@@ -2098,4 +2124,87 @@ async fn password_policy_minimum_and_common_password() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(response).await["error"]["code"], "WEAK_PASSWORD");
+}
+
+#[tokio::test]
+async fn admin_can_change_user_avatar() {
+    let app = setup_app().await;
+    let created = send_json(
+        &app.router,
+        Method::POST,
+        "/api/v1/admin/users",
+        Some(&app.cookie),
+        Some(&app.csrf),
+        json!({"username": "avataruser", "password": "123456", "role": "user"}),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let user_id = json_body(created).await["user"]["id"].as_i64().unwrap();
+
+    let source = image::RgbImage::from_pixel(8, 8, image::Rgb([200, 10, 10]));
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(source)
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+
+    let uploaded = send_raw(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/admin/users/{user_id}/avatar"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        "image/png",
+        png.clone(),
+    )
+    .await;
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    let version = json_body(uploaded).await["avatar_version"]
+        .as_i64()
+        .unwrap();
+    assert!(version > 0);
+
+    let list = send(
+        &app.router,
+        Method::GET,
+        "/api/v1/admin/users",
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    let list = json_body(list).await;
+    let listed = list["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["id"].as_i64() == Some(user_id))
+        .unwrap();
+    assert_eq!(listed["avatar_version"], json!(version));
+
+    let fetched = send(
+        &app.router,
+        Method::GET,
+        &format!("/api/v1/admin/users/{user_id}/avatar"),
+        Some(&app.cookie),
+        None,
+    )
+    .await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(
+        fetched.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/jpeg"
+    );
+    let bytes = to_bytes(fetched.into_body(), 1024 * 1024).await.unwrap();
+    assert!(bytes.starts_with(&[0xff, 0xd8]));
+
+    let rejected = send_raw(
+        &app.router,
+        Method::POST,
+        &format!("/api/v1/admin/users/{user_id}/avatar"),
+        Some(&app.cookie),
+        Some(&app.csrf),
+        "text/plain",
+        png,
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }

@@ -8,6 +8,7 @@
   import { showToast } from '../toast';
   import { realtimeEvent } from '../events';
   import AssignPathDialog from './AssignPathDialog.svelte';
+  import AvatarCropper from './AvatarCropper.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import ExternalPathDialog from './ExternalPathDialog.svelte';
   import Icon from './Icon.svelte';
@@ -41,6 +42,10 @@
   let deleteUser = $state<User | null>(null);
   let removeRootTarget = $state<{ user: User; root: AdminRoot } | null>(null);
   let deletePathTarget = $state<ServerPath | null>(null);
+  let avatarInput = $state<HTMLInputElement | null>(null);
+  let avatarTarget = $state<User | null>(null);
+  let avatarCropSrc = $state('');
+  let avatarBusyId = $state<number | null>(null);
   let editingPathId = $state<number | null>(null);
   let editingPathAlias = $state('');
   let editingPathOriginal = $state('');
@@ -53,6 +58,46 @@
       crypto.getRandomValues(new Uint8Array(20)),
       (v) => alphabet[v % alphabet.length],
     ).join('');
+  }
+
+  function pickAvatar(user: User): void {
+    avatarTarget = user;
+    avatarInput?.click();
+  }
+
+  function chooseAvatarFile(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) {
+      avatarTarget = null;
+      return;
+    }
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      showNotice(t($language, '头像必须是 JPEG、PNG 或 WebP'));
+      avatarTarget = null;
+      return;
+    }
+    avatarCropSrc = URL.createObjectURL(file);
+  }
+
+  async function saveCroppedAvatar(blob: Blob): Promise<void> {
+    const target = avatarTarget;
+    if (!target) return;
+    avatarBusyId = target.id;
+    try {
+      const result = await api.uploadAdminAvatar(target.id, blob, csrf);
+      users = users.map((user) =>
+        user.id === target.id ? { ...user, avatar_version: result.avatar_version } : user,
+      );
+      showToast(t($language, '头像已更新'));
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : t($language, '头像上传失败'));
+    } finally {
+      avatarBusyId = null;
+      avatarCropSrc = '';
+      avatarTarget = null;
+    }
   }
 
   async function load(): Promise<void> {
@@ -1231,9 +1276,33 @@
           >{t($language, '+ 新建用户')}</button
         >
       </div>
+      <input
+        bind:this={avatarInput}
+        class="avatar-input"
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        onchange={chooseAvatarFile}
+      />
       {#each users as user (user.id)}
         <article class="user-card">
           <div class="user-line">
+            <button
+              type="button"
+              class="user-avatar"
+              title={t($language, '更换头像')}
+              aria-label={t($language, '更换头像')}
+              disabled={avatarBusyId === user.id}
+              onclick={() => pickAvatar(user)}
+            >
+              {#if (user.avatar_version ?? 0) > 0}
+                <img
+                  src={api.adminAvatarUrl(user.id, user.avatar_version ?? 0)}
+                  alt={t($language, '头像')}
+                />
+              {:else}
+                {user.username.slice(0, 1).toUpperCase()}
+              {/if}
+            </button>
             <strong>{user.username}</strong>
             {#if user.online}
               <span class="online-dot" title={t($language, '在线')}></span>
@@ -1282,24 +1351,28 @@
               />
               {t($language, '允许解压')}
             </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={user.features.federation_mount ?? false}
-                onchange={(event) =>
-                  void toggleFeature(user, 'federation_mount', event.currentTarget.checked)}
-              />
-              {t($language, '允许挂载远程')}
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={user.features.federation_share ?? false}
-                onchange={(event) =>
-                  void toggleFeature(user, 'federation_share', event.currentTarget.checked)}
-              />
-              {t($language, '允许对外授权')}
-            </label>
+            {#if setting('federation.enabled_outbound') !== false}
+              <label>
+                <input
+                  type="checkbox"
+                  checked={user.features.federation_mount ?? false}
+                  onchange={(event) =>
+                    void toggleFeature(user, 'federation_mount', event.currentTarget.checked)}
+                />
+                {t($language, '允许挂载远程')}
+              </label>
+            {/if}
+            {#if setting('federation.enabled_inbound') !== false}
+              <label>
+                <input
+                  type="checkbox"
+                  checked={user.features.federation_share ?? false}
+                  onchange={(event) =>
+                    void toggleFeature(user, 'federation_share', event.currentTarget.checked)}
+                />
+                {t($language, '允许对外授权')}
+              </label>
+            {/if}
           </div>
           <div class="user-meta">
             <span>{t($language, '创建')} {formatDate(user.created_at)}</span>
@@ -1826,6 +1899,17 @@
   {/if}
 </section>
 
+{#if avatarCropSrc}
+  <AvatarCropper
+    src={avatarCropSrc}
+    onConfirm={(blob) => void saveCroppedAvatar(blob)}
+    onClose={() => {
+      avatarCropSrc = '';
+      avatarTarget = null;
+    }}
+  />
+{/if}
+
 {#if createOpen}
   <NewUserDialog
     defaultQuotaBytes={Number(setting('default_quota_bytes') ?? 15 * 1024 ** 3)}
@@ -2116,6 +2200,37 @@
   }
   .user-line strong {
     font-size: 16px;
+  }
+  .avatar-input {
+    display: none;
+  }
+  .user-avatar {
+    display: grid;
+    width: 34px;
+    height: 34px;
+    flex: none;
+    place-items: center;
+    overflow: hidden;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .user-avatar:hover {
+    border-color: var(--accent);
+  }
+  .user-avatar:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .user-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
   }
   .meta,
   .user-meta,

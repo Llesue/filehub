@@ -83,7 +83,14 @@
         const { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, dropCursor } =
           viewModule;
         const { EditorState, Compartment } = stateModule;
-        const { defaultKeymap, history, historyKeymap, indentWithTab } = commandsModule;
+        const {
+          defaultKeymap,
+          history,
+          historyKeymap,
+          indentMore,
+          indentWithTab,
+          indentLess,
+        } = commandsModule;
         const { syntaxHighlighting, defaultHighlightStyle, bracketMatching, indentOnInput } =
           languageModule;
         readOnlyCompartment = new Compartment();
@@ -91,6 +98,24 @@
           EditorView.editable.of(!locked),
           EditorState.readOnly.of(locked),
         ];
+        const textFile = /\.(txt|tsv)$/i.test(filename);
+        const insertTabText: import('@codemirror/state').StateCommand = ({ state, dispatch }) => {
+          const shouldIndent = state.selection.ranges.some((range) => {
+            if (range.empty) return false;
+            const fromLine = state.doc.lineAt(range.from);
+            const toLine = state.doc.lineAt(range.to);
+            if (fromLine.number !== toLine.number) return true;
+            return range.from === fromLine.from && range.to === toLine.to;
+          });
+          if (shouldIndent) return indentMore({ state, dispatch });
+          dispatch(
+            state.update(state.replaceSelection('\t'), {
+              scrollIntoView: true,
+              userEvent: 'input',
+            }),
+          );
+          return true;
+        };
         const extensions = [
           lineNumbers(),
           history(),
@@ -100,7 +125,16 @@
           bracketMatching(),
           highlightActiveLine(),
           syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-          keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+          keymap.of([
+            ...defaultKeymap,
+            ...historyKeymap,
+            ...(textFile
+              ? [
+                  { key: 'Tab', run: insertTabText },
+                  { key: 'Shift-Tab', run: indentLess },
+                ]
+              : [indentWithTab]),
+          ]),
           readOnlyCompartment.of([
             EditorView.editable.of(!readonly),
             EditorState.readOnly.of(readonly),

@@ -1218,6 +1218,41 @@ paths:
         - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
       responses:
         '204': { description: Disabled }
+  /api/v1/admin/users/{id}/avatar:
+    get:
+      tags: [admin]
+      summary: 读取用户头像（仅管理员）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: JPEG avatar
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+    post:
+      tags: [admin]
+      summary: 更换用户头像（仅管理员）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          image/jpeg:
+            schema: { type: string, format: binary }
+          image/png:
+            schema: { type: string, format: binary }
+          image/webp:
+            schema: { type: string, format: binary }
+      responses:
+        '200': { description: OK }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
   /api/v1/admin/users/{id}/roots:
     get:
       tags: [admin]
@@ -1982,6 +2017,7 @@ components:
         role: { type: string, enum: [admin, user] }
         quota_bytes: { type: integer, format: int64, nullable: true }
         disabled: { type: boolean }
+        avatar_version: { type: integer, format: int64 }
         must_change_password:
           type: boolean
           description: 为 true 时除 /me、/logout、/me/password/forced 外的请求返回 403 PASSWORD_CHANGE_REQUIRED。
