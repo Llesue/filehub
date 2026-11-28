@@ -427,6 +427,10 @@ async fn setup(
         .initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
+    if let Some(parent) = settings.settings.db_path.parent() {
+        let _ = std::fs::remove_file(parent.join("setup-token.txt"));
+    }
+
     let user = state
         .db
         .find_user_by_id(user_id)

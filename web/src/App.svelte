@@ -36,7 +36,7 @@
   import { branding, brandMark, loadBranding } from './lib/branding';
   import { playAudio, type AudioTrack } from './lib/audio';
   import { uploadManager } from './lib/uploads.svelte';
-  import { resolveViewPreference } from './lib/viewPref';
+  import { resolveViewPreference, type FileView } from './lib/viewPref';
   import { connectEvents, disconnectEvents, realtimeActive, realtimeEvent } from './lib/events';
   import {
     addNotification,
@@ -73,21 +73,34 @@
   import { classifyFile } from './lib/fileKind';
 
   let theme = $state<Theme>('light');
-  function storedView(): 'list' | 'thumb' | 'tile' {
-    try {
-      return resolveViewPreference(localStorage.getItem('filehub.view'), null) ?? 'list';
-    } catch {
-      return 'list';
+  type SortField = 'name' | 'size' | 'modified';
+  type SortOrder = 'asc' | 'desc';
+
+  const DEFAULT_VIEW: FileView = 'tile';
+  const DEFAULT_SORT: { field: SortField; order: SortOrder } = {
+    field: 'modified',
+    order: 'desc',
+  };
+
+  /// Parse a per-directory `sort:<root>:<path>` value. Directories without a
+  /// saved preference always start on modification time, newest first.
+  function parseSortPreference(saved: string | null): { field: SortField; order: SortOrder } {
+    if (saved) {
+      const [field, order] = saved.split(':');
+      if (field === 'name' || field === 'size' || field === 'modified') {
+        return { field, order: order === 'desc' ? 'desc' : 'asc' };
+      }
     }
+    return { ...DEFAULT_SORT };
   }
 
-  let view = $state<'list' | 'thumb' | 'tile'>(storedView());
+  let view = $state<FileView>(DEFAULT_VIEW);
   let compactMobile = $state(false);
-  let compactPreviousView: 'list' | 'thumb' | 'tile' | null = null;
+  let compactPreviousView: FileView | null = null;
   let searchModalOpen = $state(false);
   let searchModalInput = $state<HTMLInputElement | null>(null);
-  let sortField = $state<'name' | 'size' | 'modified'>('name');
-  let sortOrder = $state<'asc' | 'desc'>('asc');
+  let sortField = $state<SortField>(DEFAULT_SORT.field);
+  let sortOrder = $state<SortOrder>(DEFAULT_SORT.order);
   let sidebarOpen = $state(false);
   let accountOpen = $state(false);
   let loading = $state(true);
@@ -625,7 +638,7 @@
         view = 'tile';
       } else {
         compactMobile = false;
-        view = compactPreviousView ?? storedView();
+        view = compactPreviousView ?? DEFAULT_VIEW;
         compactPreviousView = null;
       }
       updateVirtualRange();
@@ -1288,6 +1301,7 @@
     try {
       const result = await api.roots();
       roots = result.roots;
+      seedRootStates(result.roots);
       const next = roots.find((root) => root.id === activeRootId) ?? roots[0] ?? null;
       if (!next) {
         activeRootId = null;
@@ -1315,6 +1329,17 @@
   /// current browse position unless the root disappeared.
   const rootNoticeAt: Record<string, number> = {};
   const rootOnlineSeen: Record<number, boolean> = {};
+
+  /// Seed the first observed state for roots the browser has not seen yet.
+  /// The initial value is a baseline, not a transition, so it must not toast.
+  function seedRootStates(items: Root[]): void {
+    for (const root of items) {
+      if (typeof root.online === 'boolean' && rootOnlineSeen[root.id] === undefined) {
+        rootOnlineSeen[root.id] = root.online;
+      }
+    }
+  }
+
   let draggingRootId = $state<number | null>(null);
   let dragOverRootId = $state<number | null>(null);
   let reorderingRoots = $state(false);
@@ -1433,6 +1458,7 @@
     try {
       const result = await api.roots();
       roots = result.roots;
+      seedRootStates(result.roots);
       const next = roots.find((root) => root.id === activeRootId) ?? roots[0] ?? null;
       if (!next) {
         activeRootId = null;
@@ -1468,7 +1494,9 @@
   /// Used for `roots.changed` so an offline root cannot trigger a 503 loop.
   async function refreshRootState(): Promise<void> {
     try {
-      roots = (await api.roots()).roots;
+      const items = (await api.roots()).roots;
+      roots = items;
+      seedRootStates(items);
       void refreshRemoteCaps();
       if (activeRootId !== null && !roots.some((root) => root.id === activeRootId)) {
         await refreshRoots();
@@ -1482,7 +1510,9 @@
   /// the badge updates without re-triggering the request that just failed.
   async function refreshRootStatus(): Promise<void> {
     try {
-      roots = (await api.roots()).roots;
+      const items = (await api.roots()).roots;
+      roots = items;
+      seedRootStates(items);
     } catch (error) {
       console.debug('root status refresh failed', error);
     }
@@ -1560,25 +1590,12 @@
     clearDrag();
     startFilesSlowHint();
     try {
-      const storedView = compactMobile
+      view = compactMobile
         ? 'tile'
-        : resolveViewPreference(
-            localStorage.getItem('filehub.view'),
-            localStorage.getItem(`view:${rootId}:${path}`),
-          );
-      if (storedView) view = storedView;
-      const savedSort =
-        localStorage.getItem(`sort:${rootId}:${path}`) ?? localStorage.getItem('filehub.sort');
-      if (savedSort) {
-        const [field, order] = savedSort.split(':');
-        if (field === 'name' || field === 'size' || field === 'modified') {
-          sortField = field;
-          sortOrder = order === 'desc' ? 'desc' : 'asc';
-        }
-      } else {
-        sortField = 'name';
-        sortOrder = 'asc';
-      }
+        : (resolveViewPreference(localStorage.getItem(`view:${rootId}:${path}`)) ?? DEFAULT_VIEW);
+      const savedSort = parseSortPreference(localStorage.getItem(`sort:${rootId}:${path}`));
+      sortField = savedSort.field;
+      sortOrder = savedSort.order;
       const result = await api.list(
         rootId,
         path,
@@ -1626,30 +1643,18 @@
       const viewKey = `view:${result.root.id}:${result.path}`;
       const sortKey = `sort:${result.root.id}:${result.path}`;
       try {
-        const remembered = resolveViewPreference(
-          localStorage.getItem('filehub.view'),
-          localStorage.getItem(viewKey),
-        );
-        if (remembered) {
-          view = remembered;
-          // Pin the first resolved view to this directory so a later change
-          // in another directory cannot leak back through the global default.
+        if (!compactMobile) {
+          view = resolveViewPreference(localStorage.getItem(viewKey)) ?? DEFAULT_VIEW;
+          // Pin the first resolved view to this directory so other directories
+          // do not inherit it.
           if (!localStorage.getItem(viewKey)) {
-            localStorage.setItem(viewKey, remembered);
-          }
-          if (!localStorage.getItem('filehub.view')) {
-            localStorage.setItem('filehub.view', remembered);
+            localStorage.setItem(viewKey, view);
           }
         }
 
-        const savedSort = localStorage.getItem(sortKey) ?? localStorage.getItem('filehub.sort');
-        if (savedSort) {
-          const [field, order] = savedSort.split(':');
-          if (field === 'name' || field === 'size' || field === 'modified') {
-            sortField = field;
-            sortOrder = order === 'desc' ? 'desc' : 'asc';
-          }
-        }
+        const savedSort = parseSortPreference(localStorage.getItem(sortKey));
+        sortField = savedSort.field;
+        sortOrder = savedSort.order;
         if (!localStorage.getItem(sortKey)) {
           localStorage.setItem(sortKey, `${sortField}:${sortOrder}`);
         }
@@ -3764,7 +3769,7 @@
     await requestDelete(entries.filter((entry) => selected.includes(entry.name)));
   }
 
-  function setSort(field: 'name' | 'size' | 'modified'): void {
+  function setSort(field: SortField): void {
     if (sortField === field) {
       sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
     } else {
@@ -3773,19 +3778,17 @@
     }
     if (activeRootId !== null) {
       localStorage.setItem(`sort:${activeRootId}:${currentPath}`, `${sortField}:${sortOrder}`);
-      localStorage.setItem('filehub.sort', `${sortField}:${sortOrder}`);
       void loadList(activeRootId, currentPath);
     }
   }
 
-  function setView(next: 'list' | 'thumb' | 'tile'): void {
+  function setView(next: FileView): void {
     if (compactMobile) {
       view = 'tile';
       return;
     }
     view = next;
     try {
-      localStorage.setItem('filehub.view', next);
       if (activeRootId !== null) {
         localStorage.setItem(`view:${activeRootId}:${currentPath}`, next);
       }

@@ -124,6 +124,33 @@ pub fn set_private_mode(options: &mut OpenOptions) {
     let _ = options;
 }
 
+/// Restrict a file to SYSTEM and Administrators on Windows.
+///
+/// The first-run token must not be readable by other local users. `icacls` is
+/// a fixed system tool and the SIDs are well-known, so no shell is involved.
+/// Failures are ignored; the token is still printed to the service log and
+/// normal foreground runs inherit the user's own directory ACL.
+pub fn restrict_file_to_admins(path: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:F",
+                "*S-1-5-32-544:F",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
+}
+
 pub fn metadata_identity(metadata: &Metadata) -> (i64, i64) {
     #[cfg(unix)]
     {
@@ -143,6 +170,52 @@ pub fn metadata_identity(metadata: &Metadata) -> (i64, i64) {
         let _ = metadata;
         (0, 0)
     }
+}
+
+/// Stable identity shared by every hard link to the same file.
+///
+/// Returns `None` for files with a single link, and on platforms where the
+/// identity cannot be obtained. Callers then count the path normally.
+#[cfg(unix)]
+pub fn link_identity(_path: &Path, metadata: &Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() <= 1 {
+        return None;
+    }
+    Some((metadata.dev(), metadata.ino()))
+}
+
+/// Stable identity shared by every hard link to the same file.
+///
+/// `MetadataExt::file_index` is still nightly-only, so the file is opened and
+/// queried through `GetFileInformationByHandle`. Any failure (permissions,
+/// unsupported filesystem) returns `None` and the path is counted normally.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn link_identity(path: &Path, _metadata: &Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` is plain integer fields, all-zero is valid.
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    // SAFETY: the handle belongs to `file` and stays valid for the call; `info`
+    // is a valid writable pointer.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 || info.nNumberOfLinks <= 1 {
+        return None;
+    }
+    Some((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn link_identity(_path: &Path, _metadata: &Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 pub fn metadata_mtime(metadata: &Metadata) -> i64 {

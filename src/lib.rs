@@ -51,6 +51,8 @@ pub mod search;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub mod service;
+#[cfg(windows)]
+pub mod setup;
 pub mod shares;
 pub mod state;
 pub mod terminal_ws;

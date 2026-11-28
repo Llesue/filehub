@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.8 - 2026-11-28
+
+### Added
+
+- Windows first-run wizard: asks for the port, listen address, data directory, and whether to install the service, then writes the config, copies the executable to `C:\Program Files\FileHub`, installs and starts the service, adds a firewall rule when listening on `0.0.0.0`, and opens the browser.
+- On first start the setup token is written to `<data dir>\setup-token.txt` (readable only by the service account and administrators); the wizard copies it to the clipboard and removes the file after setup.
+- `filehub service install --start` installs and starts the service in one step; the wizard and CLI share the same installation path.
+
+### Changed
+
+- Directory listings default to the tile view sorted by modification time, newest first; view and sort preferences are stored per directory in localStorage and no longer leak across directories.
+- Roots already offline when the page loads are treated as a baseline, so long-offline remote directories no longer toast "offline" on every visit; real online/offline transitions still notify.
+- The user-home usage scan now counts each directory entry once.
+
+### Fixed
+
+- When several hard links point at one file, used space counts its bytes once; the entry count still counts every path.
+- Windows file IDs deduplicate hard links when available; if the ID cannot be obtained, usage falls back to per-path counting.
+
 ## v0.2.7 - 2026-11-26
 
 ### Added

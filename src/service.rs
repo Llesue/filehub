@@ -26,7 +26,21 @@ pub fn run_dispatcher() -> anyhow::Result<()> {
 }
 
 #[allow(clippy::print_stdout)]
-pub fn install(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+pub fn install(config_path: Option<&std::path::Path>, start: bool) -> anyhow::Result<()> {
+    let executable = std::env::current_exe().context("failed to locate FileHub executable")?;
+    install_at(&executable, config_path, start)
+}
+
+/// Install the service for a specific executable path.
+///
+/// The wizard copies `filehub.exe` to a stable location first, so the service
+/// must not point at the executable it happened to be launched from.
+#[allow(clippy::print_stdout)]
+pub fn install_at(
+    executable: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+    start: bool,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(platform::default_data_dir())
         .context("failed to create ProgramData directory")?;
     let manager = ServiceManager::local_computer(
@@ -34,7 +48,23 @@ pub fn install(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )
     .map_err(|err| anyhow::anyhow!("failed to connect service manager: {err}"))?;
-    let executable = std::env::current_exe().context("failed to locate FileHub executable")?;
+    if let Ok(service) = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+    ) {
+        if service
+            .query_status()
+            .map_err(|err| anyhow::anyhow!("failed to query existing service: {err}"))?
+            .current_state
+            != ServiceState::Stopped
+        {
+            anyhow::bail!("FileHub service is running; stop it before reinstalling");
+        }
+        service
+            .delete()
+            .map_err(|err| anyhow::anyhow!("failed to replace existing service: {err}"))?;
+        std::thread::sleep(Duration::from_millis(300));
+    }
     let mut launch_arguments = vec![OsString::from("--service")];
     if let Some(path) = config_path {
         launch_arguments.push(OsString::from("--config"));
@@ -46,20 +76,108 @@ pub fn install(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         service_type: SERVICE_TYPE,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: executable,
+        executable_path: executable.to_path_buf(),
         launch_arguments,
         dependencies: vec![],
         account_name: None,
         account_password: None,
     };
-    let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
-        .map_err(|err| anyhow::anyhow!("failed to create service: {err}"))?;
+    let access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS;
+    let mut created = None;
+    let mut last_error = None;
+    for attempt in 0..5 {
+        match manager.create_service(&info, access) {
+            Ok(service) => {
+                created = Some(service);
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+    }
+    let service = match created {
+        Some(service) => service,
+        None => {
+            let detail = last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown error".to_owned());
+            anyhow::bail!("failed to create service: {detail}");
+        }
+    };
     service
         .set_description("FileHub self-hosted file manager")
         .map_err(|err| anyhow::anyhow!("failed to set service description: {err}"))?;
-    println!("FileHub service installed. Start it with: sc.exe start FileHub");
+    if start {
+        service
+            .start::<&str>(&[])
+            .map_err(|err| anyhow::anyhow!("failed to start service: {err}"))?;
+        wait_for_state(&service, ServiceState::Running)?;
+        println!("FileHub service installed and started.");
+    } else {
+        println!("FileHub service installed. Start it with: sc.exe start FileHub");
+    }
     Ok(())
+}
+
+/// Current service state, or `None` when the service is not installed.
+pub fn query() -> anyhow::Result<Option<ServiceState>> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|err| anyhow::anyhow!("failed to connect service manager: {err}"))?;
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => Ok(Some(
+            service
+                .query_status()
+                .map_err(|err| anyhow::anyhow!("failed to query service: {err}"))?
+                .current_state,
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Start an installed service and wait until it reports running.
+pub fn start_existing() -> anyhow::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|err| anyhow::anyhow!("failed to connect service manager: {err}"))?;
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::START,
+        )
+        .map_err(|err| anyhow::anyhow!("failed to open FileHub service: {err}"))?;
+    if service
+        .query_status()
+        .map_err(|err| anyhow::anyhow!("failed to query FileHub service: {err}"))?
+        .current_state
+        != ServiceState::Running
+    {
+        service
+            .start::<&str>(&[])
+            .map_err(|err| anyhow::anyhow!("failed to start service: {err}"))?;
+        wait_for_state(&service, ServiceState::Running)?;
+    }
+    Ok(())
+}
+
+fn wait_for_state(
+    service: &windows_service::service::Service,
+    target: ServiceState,
+) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        if service
+            .query_status()
+            .map_err(|err| anyhow::anyhow!("failed to query service status: {err}"))?
+            .current_state
+            == target
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    anyhow::bail!("service did not reach {target:?}");
 }
 
 #[allow(clippy::print_stdout)]

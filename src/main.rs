@@ -26,16 +26,29 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Install or remove the Windows service
+    /// Install or remove the service
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+    /// First-run setup wizard (Windows)
+    Setup {
+        /// Accept the defaults without prompting
+        #[arg(long)]
+        yes: bool,
+        /// Internal: elevated child process request file
+        #[arg(long, hide = true)]
+        elevated: Option<PathBuf>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum ServiceAction {
-    Install,
+    Install {
+        /// Start the service after installing it
+        #[arg(long)]
+        start: bool,
+    },
     Uninstall,
 }
 
@@ -47,19 +60,54 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(windows))]
         anyhow::bail!("Windows service mode is only available on Windows");
     }
+
+    #[cfg(windows)]
+    match first_run_wizard() {
+        FirstRun::Continue => {}
+        FirstRun::Exit => return Ok(()),
+        FirstRun::Foreground(path) => {
+            let state = AppState::new(Some(&path)).await?;
+            return app::run(state).await;
+        }
+    }
+
     let cli = Cli::parse();
     if let Some(Command::Service { action }) = &cli.command {
         #[cfg(windows)]
         {
             return match action {
-                ServiceAction::Install => filehub::service::install(cli.config.as_deref()),
+                ServiceAction::Install { start } => {
+                    filehub::service::install(cli.config.as_deref(), *start)
+                }
                 ServiceAction::Uninstall => filehub::service::uninstall(),
             };
         }
         #[cfg(not(windows))]
         {
             let _ = action;
-            anyhow::bail!("Windows service management is only available on Windows");
+            anyhow::bail!("Service management is only available on Windows");
+        }
+    }
+    if let Some(Command::Setup { yes, elevated }) = &cli.command {
+        #[cfg(windows)]
+        {
+            match filehub::setup::run_wizard(*yes, elevated.as_deref()) {
+                Ok(filehub::setup::Outcome::Exit) => return Ok(()),
+                Ok(filehub::setup::Outcome::Foreground(path)) => {
+                    let state = AppState::new(Some(&path)).await?;
+                    return app::run(state).await;
+                }
+                Err(error) => {
+                    eprintln!("{error:#}");
+                    filehub::setup::pause();
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (yes, elevated);
+            anyhow::bail!("The setup wizard is only available on Windows");
         }
     }
     let config_file = config::load_config_file(cli.config.as_deref())?;
@@ -74,6 +122,45 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(cli.config.as_deref()).await?;
     app::run(state).await
+}
+
+#[cfg(windows)]
+enum FirstRun {
+    Continue,
+    Exit,
+    Foreground(PathBuf),
+}
+
+/// Double-clicking an unconfigured `filehub.exe` starts the wizard. With an
+/// existing config, an already running service opens the browser; otherwise
+/// the previous foreground behaviour is preserved.
+#[cfg(windows)]
+fn first_run_wizard() -> FirstRun {
+    use std::io::IsTerminal;
+
+    if std::env::args_os().len() != 1
+        || std::env::var_os("FILEHUB_CONFIG").is_some()
+        || !std::io::stdin().is_terminal()
+    {
+        return FirstRun::Continue;
+    }
+
+    if filehub::platform::default_config_path().exists() {
+        if filehub::setup::open_existing_if_running() {
+            return FirstRun::Exit;
+        }
+        return FirstRun::Continue;
+    }
+
+    match filehub::setup::run_wizard(false, None) {
+        Ok(filehub::setup::Outcome::Exit) => FirstRun::Exit,
+        Ok(filehub::setup::Outcome::Foreground(path)) => FirstRun::Foreground(path),
+        Err(error) => {
+            eprintln!("{error:#}");
+            filehub::setup::pause();
+            std::process::exit(1);
+        }
+    }
 }
 
 fn init_tracing(level: &str) -> anyhow::Result<()> {

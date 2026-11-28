@@ -119,7 +119,27 @@ WantedBy=multi-user.target
 
 ### Windows
 
-推荐从 [GitHub Releases](https://github.com/Llesue/filehub/releases) 下载 Windows 可执行文件（`filehub-<version>-x86_64-pc-windows-msvc.exe`），校验对应的 `.sha256` 后复制到 `C:\Program Files\FileHub\filehub.exe`。
+推荐从 [GitHub Releases](https://github.com/Llesue/filehub/releases) 下载 Windows 可执行文件（`filehub-<version>-x86_64-pc-windows-msvc.exe`），校验对应的 `.sha256` 后直接双击运行。首次启动会进入向导，询问端口、监听地址、数据目录和是否安装为 Windows 服务；全部按默认值回车即可。
+
+向导会：
+
+- 生成 `<数据目录>\config.json`；
+- 把 `filehub.exe` 复制到 `C:\Program Files\FileHub\filehub.exe`；
+- 安装并启动 `FileHub` 服务（开机自启）；监听 `0.0.0.0` 时添加防火墙入站规则；
+- 打开浏览器，首次初始化时把 setup token 复制到剪贴板；
+- 30 秒后自动关闭，按回车立即关闭。
+
+非交互安装可以使用 `--yes`：
+
+```powershell
+& "C:\Program Files\FileHub\filehub.exe" setup --yes
+```
+
+也可以显式进入向导：
+
+```powershell
+filehub.exe setup
+```
 
 如需在 Linux 上交叉编译：
 
@@ -128,16 +148,15 @@ cargo install cargo-xwin --locked
 make build-windows
 ```
 
-产物是 `target/x86_64-pc-windows-msvc/release/filehub.exe`。复制到 Windows 后，用管理员 PowerShell 安装服务：
+产物是 `target/x86_64-pc-windows-msvc/release/filehub.exe`。手动安装服务仍可用：
 
 ```powershell
-& "C:\Program Files\FileHub\filehub.exe" service install
-sc.exe start FileHub
+& "C:\Program Files\FileHub\filehub.exe" service install --start
 ```
 
 服务以 `LocalSystem` 运行，开机自启；数据库、用户目录、缓存和日志默认在 `C:\ProgramData\FileHub`。服务日志按天写入 `%ProgramData%\FileHub\filehub.log.<date>`（例如 `filehub.log.2026-11-16`）。`log.retention_days` 控制保留天数：默认 `14`，`0` 表示不清理，最大 `3650`；过期日志会在启动时和每小时维护任务中删除。
 
-读取服务日志和首次初始化 token：
+服务首次启动且尚未初始化时，会把 setup token 写到 `<数据目录>\setup-token.txt`（仅服务账号和管理员可读），向导读取后复制到剪贴板；首次设置完成后文件自动删除。也可以从服务日志查看：
 
 ```powershell
 Get-ChildItem C:\ProgramData\FileHub\filehub.log.* |
@@ -170,7 +189,7 @@ Windows 索引优先使用 NTFS MFT，之后通过 USN Journal 做增量更新�
 }
 ```
 
-完整配置见 [`config.example.json`](config.example.json)。Windows 默认使用 `C:\ProgramData\FileHub`；安装服务时可以显式指定配置：
+完整配置见 [`config.example.json`](config.example.json)。Windows 默认使用 `C:\ProgramData\FileHub`，向导会把配置写到 `<数据目录>\config.json`；手动安装服务时可以显式指定配置路径：
 
 ```powershell
 & "C:\Program Files\FileHub\filehub.exe" --config "C:\ProgramData\FileHub\config.json" service install

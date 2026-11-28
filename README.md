@@ -119,7 +119,27 @@ The default address is `http://<host>:8080/`. On first start, FileHub prints a s
 
 ### Windows
 
-Download the Windows executable from [GitHub Releases](https://github.com/Llesue/filehub/releases) (`filehub-<version>-x86_64-pc-windows-msvc.exe`), verify it with the matching `.sha256`, and copy it to `C:\Program Files\FileHub\filehub.exe`.
+Download the Windows executable from [GitHub Releases](https://github.com/Llesue/filehub/releases) (`filehub-<version>-x86_64-pc-windows-msvc.exe`), verify it with the matching `.sha256`, and double-click it. The first start opens a wizard that asks for the port, listen address, data directory, and whether to install the Windows service; pressing Enter accepts every default.
+
+The wizard:
+
+- writes `<data dir>\config.json`;
+- copies `filehub.exe` to `C:\Program Files\FileHub\filehub.exe`;
+- installs and starts the `FileHub` service (automatic startup), adding a firewall rule when listening on `0.0.0.0`;
+- opens the browser and copies the first-run setup token to the clipboard;
+- closes after 30 seconds, or immediately when Enter is pressed.
+
+For a non-interactive install use `--yes`:
+
+```powershell
+& "C:\Program Files\FileHub\filehub.exe" setup --yes
+```
+
+The wizard can also be started explicitly:
+
+```powershell
+filehub.exe setup
+```
 
 To cross-compile from Linux instead:
 
@@ -128,16 +148,15 @@ cargo install cargo-xwin --locked
 make build-windows
 ```
 
-This produces `target/x86_64-pc-windows-msvc/release/filehub.exe`. Copy it to the Windows machine and, in an elevated PowerShell, install the service:
+This produces `target/x86_64-pc-windows-msvc/release/filehub.exe`. Manual service installation still works:
 
 ```powershell
-& "C:\Program Files\FileHub\filehub.exe" service install
-sc.exe start FileHub
+& "C:\Program Files\FileHub\filehub.exe" service install --start
 ```
 
 The service runs as `LocalSystem`, starts automatically, and stores its database, users, cache, and logs under `C:\ProgramData\FileHub`. Service logs rotate daily to `%ProgramData%\FileHub\filehub.log.<date>` (for example `filehub.log.2026-11-16`). `log.retention_days` controls cleanup: the default is `14`, `0` disables cleanup, and the maximum is `3650`. Expired files are removed at startup and during the hourly maintenance pass.
 
-To read the service log and retrieve the first-run setup token:
+On first start, before setup is complete, the service writes the setup token to `<data dir>\setup-token.txt` (readable only by the service account and administrators). The wizard copies it to the clipboard and deletes the file once setup completes. The token is also available in the service log:
 
 ```powershell
 Get-ChildItem C:\ProgramData\FileHub\filehub.log.* |
@@ -170,7 +189,7 @@ The most important fields are:
 }
 ```
 
-See [`config.example.json`](config.example.json) for all options. On Windows the defaults are under `C:\ProgramData\FileHub`; an explicit config path can be passed at installation time:
+See [`config.example.json`](config.example.json) for all options. On Windows the defaults are under `C:\ProgramData\FileHub`, and the wizard writes `<data dir>\config.json`. An explicit config path can be passed when installing the service manually:
 
 ```powershell
 & "C:\Program Files\FileHub\filehub.exe" --config "C:\ProgramData\FileHub\config.json" service install

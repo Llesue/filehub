@@ -1,14 +1,10 @@
 export type FileView = 'list' | 'thumb' | 'tile';
 
 /**
- * Resolve the view for a directory. A per-directory value wins; the global
- * value is only a default for directories that do not have one yet.
+ * Resolve a per-directory view preference. Directories without a saved value
+ * fall back to the caller's default (tile in the browser).
  */
-export function resolveViewPreference(
-  globalValue: string | null,
-  pathValue: string | null,
-): FileView | null {
-  const value = pathValue ?? globalValue;
+export function resolveViewPreference(value: string | null): FileView | null {
   if (value === 'list' || value === 'thumb' || value === 'tile') return value;
   if (value === 'grid') return 'thumb';
   return null;

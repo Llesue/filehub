@@ -228,6 +228,29 @@ impl AppState {
             tracing::info!("users already present; setup is disabled");
         }
 
+        // The wizard cannot read the service process stdout. Write the token
+        // next to the database so an elevated setup process can pick it up,
+        // and remove it as soon as setup completes.
+        let setup_token_path = snapshot
+            .settings
+            .db_path
+            .parent()
+            .map(|parent| parent.join("setup-token.txt"))
+            .unwrap_or_else(|| crate::platform::default_data_dir().join("setup-token.txt"));
+        if initialized {
+            let _ = std::fs::remove_file(&setup_token_path);
+        } else if let Err(error) =
+            crate::platform::write_private_file(&setup_token_path, token.as_bytes())
+        {
+            tracing::warn!(
+                path = %setup_token_path.display(),
+                %error,
+                "failed to write first-run setup token file"
+            );
+        } else {
+            crate::platform::restrict_file_to_admins(&setup_token_path);
+        }
+
         let thumb_workers = snapshot.settings.thumbnails.workers.max(1);
         // Keep a reserved lane for full-size previews. With workers=1 the two
         // lanes oversubscribe by one, but a preview can still make progress.

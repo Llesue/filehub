@@ -2,17 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { resolveViewPreference } from './viewPref';
 
 describe('resolveViewPreference', () => {
-  it('prefers the per-directory view', () => {
-    expect(resolveViewPreference('thumb', 'list')).toBe('list');
+  it('returns the saved per-directory view', () => {
+    expect(resolveViewPreference('list')).toBe('list');
+    expect(resolveViewPreference('thumb')).toBe('thumb');
+    expect(resolveViewPreference('tile')).toBe('tile');
   });
 
-  it('falls back to the global default', () => {
-    expect(resolveViewPreference('thumb', null)).toBe('thumb');
-    expect(resolveViewPreference(null, 'grid')).toBe('thumb');
+  it('maps the legacy grid value to thumbnails', () => {
+    expect(resolveViewPreference('grid')).toBe('thumb');
   });
 
-  it('ignores unknown values', () => {
-    expect(resolveViewPreference('masonry', 'columns')).toBeNull();
-    expect(resolveViewPreference(null, null)).toBeNull();
+  it('ignores missing or unknown values', () => {
+    expect(resolveViewPreference(null)).toBeNull();
+    expect(resolveViewPreference('masonry')).toBeNull();
+    expect(resolveViewPreference('columns')).toBeNull();
   });
 });

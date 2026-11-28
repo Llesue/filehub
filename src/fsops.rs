@@ -804,14 +804,30 @@ pub fn path_size(path: &Path) -> Result<u64, AppError> {
 
 /// Total bytes and entry count (files + directories, symlinks excluded).
 pub fn path_usage(path: &Path) -> Result<(u64, u64), AppError> {
-    fn walk(path: &Path, bytes: &mut u64, entries: &mut u64) -> Result<(), AppError> {
+    fn walk(
+        path: &Path,
+        bytes: &mut u64,
+        entries: &mut u64,
+        seen: &mut HashSet<(u64, u64)>,
+        count_self: bool,
+    ) -> Result<(), AppError> {
         let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
+        if count_self {
+            *entries = entries.saturating_add(1);
+        }
         if metadata.file_type().is_symlink() {
             return Ok(());
         }
         if metadata.is_file() {
-            *bytes = bytes.saturating_add(metadata.len());
-            *entries = entries.saturating_add(1);
+            // Hard links are separate directory entries but share one inode.
+            // Count every path in `entries`, but bill the bytes only once.
+            let count_bytes = match crate::platform::link_identity(path, &metadata) {
+                Some(identity) => seen.insert(identity),
+                None => true,
+            };
+            if count_bytes {
+                *bytes = bytes.saturating_add(metadata.len());
+            }
             return Ok(());
         }
         if !metadata.is_dir() {
@@ -819,16 +835,16 @@ pub fn path_usage(path: &Path) -> Result<(u64, u64), AppError> {
         }
         for entry in std::fs::read_dir(path).map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
-            *entries = entries.saturating_add(1);
-            walk(&entry.path(), bytes, entries)?;
+            walk(&entry.path(), bytes, entries, seen, true)?;
         }
         Ok(())
     }
 
     let mut bytes = 0_u64;
     let mut entries = 0_u64;
+    let mut seen = HashSet::new();
     if std::fs::symlink_metadata(path).is_ok() {
-        walk(path, &mut bytes, &mut entries)?;
+        walk(path, &mut bytes, &mut entries, &mut seen, false)?;
     }
     Ok((bytes, entries))
 }
